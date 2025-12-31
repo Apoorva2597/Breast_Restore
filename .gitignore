@@ -1,0 +1,27 @@
+# environments / caches
+.venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# outputs and generated artifacts
+outputs/
+**/outputs/
+*.log
+*.pkl
+*.joblib
+
+# data / notes (IMPORTANT)
+Example Notes/
+**/Example Notes/
+*.txt
+*.csv
+*.json
+*.jsonl
+
+# local configs / secrets
+config_local.py
+.env
+*.key
+*.pem
