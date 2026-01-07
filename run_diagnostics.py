@@ -115,8 +115,13 @@ def diagnose_one_notes_file(data_dir, out_dir, kind, chunksize=200000):
     usecols = BASE_USECOLS + [anchor_col]
 
     # Stream in chunks
-    for chunk in pd.read_csv(csv_path, usecols=usecols, chunksize=chunksize):
-        total_rows += len(chunk)
+    for chunk in pd.read_csv(
+    csv_path,
+    usecols=usecols,
+    chunksize=chunksize,
+    encoding="cp1252",
+    errors="replace"     # replaces bad bytes instead of erroring
+):
 
         # Missingness (PHI-safe)
         missing_note_text += int(chunk["NOTE_TEXT"].isna().sum())
