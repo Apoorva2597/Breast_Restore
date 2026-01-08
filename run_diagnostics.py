@@ -120,7 +120,6 @@ def diagnose_one_notes_file(data_dir, out_dir, kind, chunksize=200000):
     usecols=usecols,
     chunksize=chunksize,
     encoding="cp1252",
-    errors="replace"     # replaces bad bytes instead of erroring
 ):
 
         # Missingness (PHI-safe)
