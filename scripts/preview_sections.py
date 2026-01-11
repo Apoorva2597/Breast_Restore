@@ -1,8 +1,8 @@
 import argparse
 from pathlib import Path
 
-from Breast_Restore.ingest.csv_notes import load_notes_from_csv
-from Breast_Restore.normalize.sectionizer import sectionize
+from ingest.csv_notes import load_notes_from_csv
+from normalize.sectionizer import sectionize
 
 
 def preview_sections(
