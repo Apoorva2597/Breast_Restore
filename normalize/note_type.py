@@ -1,4 +1,3 @@
-from __future__ import annotations
 import re
 
 def guess_note_type(note_id: str, text: str) -> str:
