@@ -2,7 +2,7 @@ import re
 from typing import Dict, List
 
 # -------------------------------------------------------------------
-# Canonical sections: keep ONLY what is useful for your labels/pipeline
+# Canonical sections: tuned for Breast RESTORE clinic + op notes
 # -------------------------------------------------------------------
 HEADER_CANON = {
     # Clinic / Epic headings
@@ -42,31 +42,55 @@ HEADER_CANON = {
     "PLAN OF CARE": "ASSESSMENT/PLAN",
     "ONCOLOGY CARE MODEL DOCUMENTATION REQUIREMENT": "ASSESSMENT/PLAN",
 
-    # NOTE 5
-    "LABS/STUDIES": "LABS/STUDIES",
-
-    # Op note headings: bucketed only (you can ignore downstream)
+    # Op note headings – keep as distinct sections
     "OP NOTE": "OP NOTE",
     "OPERATIVE REPORT": "OP NOTE",
-    "PREOP DIAGNOSES": "OP NOTE",
-    "POSTOP DIAGNOSES": "OP NOTE",
-    "PROCEDURES PERFORMED": "OP NOTE",
-    "DETAILS OF THE PROCEDURE": "OP NOTE",
-    "MICROSURGICAL DETAILS": "OP NOTE",
-    "DISPOSITION": "OP NOTE",
+
+    "PREOPERATIVE DIAGNOSIS": "PREOPERATIVE DIAGNOSIS",
+    "POSTOPERATIVE DIAGNOSIS": "POSTOPERATIVE DIAGNOSIS",
+    "PROCEDURE": "PROCEDURE",
+    "ATTENDING SURGEON": "ATTENDING SURGEON",
+    "ASSISTANT": "ASSISTANT",
+    "ANESTHESIA": "ANESTHESIA",
+    "IV FLUIDS": "IV FLUIDS",
+    "ESTIMATED BLOOD LOSS": "ESTIMATED BLOOD LOSS",
+    "URINE OUTPUT": "URINE OUTPUT",
+    "MICRO SURGICAL DETAILS": "MICRO SURGICAL DETAILS",
+    "COMPLICATIONS": "COMPLICATIONS",
+    "CONDITION AT THE END OF THE PROCEDURE": "CONDITION AT THE END OF THE PROCEDURE",
+    "DISPOSITION": "DISPOSITION",
+    "INDICATIONS FOR OPERATION": "INDICATIONS FOR OPERATION",
+    "DETAILS OF OPERATION": "DETAILS OF OPERATION",
 }
 
 # Allow ALL-CAPS + colon headings only if on this strict list (prevents junk splits)
 STRICT_ALLCAPS_COLON = {
+    # Legacy op-note patterns from earlier samples (harmless to keep)
     "PREOP DIAGNOSES",
     "POSTOP DIAGNOSES",
     "PROCEDURES PERFORMED",
     "DETAILS OF THE PROCEDURE",
     "MICROSURGICAL DETAILS",
     "DISPOSITION",
+
+    # Breast RESTORE op-note headings (all caps with colon)
+    "PREOPERATIVE DIAGNOSIS",
+    "POSTOPERATIVE DIAGNOSIS",
+    "PROCEDURE",
+    "ATTENDING SURGEON",
+    "ASSISTANT",
+    "ANESTHESIA",
+    "IV FLUIDS",
+    "ESTIMATED BLOOD LOSS",
+    "URINE OUTPUT",
+    "MICRO SURGICAL DETAILS",
+    "COMPLICATIONS",
+    "CONDITION AT THE END OF THE PROCEDURE",
+    "INDICATIONS FOR OPERATION",
+    "DETAILS OF OPERATION",
 }
 
-# Epic sometimes uses title-case headings without colon; allow only safest ones we saw
+# Epic sometimes uses title-case headings without colon; keep only safest ones
 TITLECASE_ALLOW = {"REASON FOR VISIT", "OP NOTE"}
 
 # -------------------------------------------------------------------
@@ -99,15 +123,19 @@ CLINIC_EXAM_CUES_RE = re.compile(
     re.IGNORECASE,
 )
 
+
 def _clean_spaces(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
+
 
 def _strip_trailing_colon(s: str) -> str:
     s = s.strip()
     return s[:-1].strip() if s.endswith(":") else s
 
+
 def _key(line: str) -> str:
     return _clean_spaces(_strip_trailing_colon(line)).upper()
+
 
 def _canon(line: str) -> str:
     """
@@ -122,6 +150,7 @@ def _canon(line: str) -> str:
             return HEADER_CANON.get(left, left)
     k = _key(line)
     return HEADER_CANON.get(k, _clean_spaces(_strip_trailing_colon(line)))
+
 
 def _looks_like_heading(raw_line: str) -> bool:
     raw = raw_line.strip()
@@ -166,6 +195,7 @@ def _looks_like_heading(raw_line: str) -> bool:
 
     return False
 
+
 def _disambiguate_heading(canon_heading: str, lookahead_text: str) -> str:
     """
     Fix known ambiguity:
@@ -177,6 +207,7 @@ def _disambiguate_heading(canon_heading: str, lookahead_text: str) -> str:
             return "IMAGING"
     return canon_heading
 
+
 def sectionize(text: str, lookahead_lines: int = 12) -> Dict[str, str]:
     """
     Split note text into sections.
@@ -185,7 +216,7 @@ def sectionize(text: str, lookahead_lines: int = 12) -> Dict[str, str]:
     """
     lines = text.splitlines()
 
-    sections: Dict[str, List[str]] = {}
+    sections = {}  # type: Dict[str, List[str]]
     current = "__PREAMBLE__"
     sections[current] = []
 
@@ -222,7 +253,7 @@ def sectionize(text: str, lookahead_lines: int = 12) -> Dict[str, str]:
         i += 1
 
     # Join and drop empties
-    out: Dict[str, str] = {}
+    out = {}  # type: Dict[str, str]
     for k, chunk_lines in sections.items():
         body = "\n".join(chunk_lines).strip()
         if body:
