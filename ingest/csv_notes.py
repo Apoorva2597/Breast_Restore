@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 import pandas as pd
 
@@ -49,7 +49,7 @@ def clean_encoding_artifacts(text: str) -> str:
 
 
 def load_notes_from_csv(
-    path: str | Path,
+    path: Union[str, Path],
     *,
     note_source: str = "unknown",  # e.g., "operation", "clinic", "inpatient"
     colmap: Optional[Dict[str, str]] = None,
@@ -89,11 +89,15 @@ def load_notes_from_csv(
     # Drop rows without NOTE_ID; NOTE_TEXT missing becomes empty string
     df = df.dropna(subset=[note_id_col])
     if text_col not in df.columns:
-        raise ValueError(f"Expected text column '{text_col}' not found in {csv_path}")
+        raise ValueError(
+            "Expected text column '{}' not found in {}".format(text_col, csv_path)
+        )
     df[text_col] = df[text_col].fillna("")
 
     if line_col not in df.columns:
-        raise ValueError(f"Expected line column '{line_col}' not found in {csv_path}")
+        raise ValueError(
+            "Expected line column '{}' not found in {}".format(line_col, csv_path)
+        )
     df = df.sort_values([note_id_col, line_col])
 
     notes: List[NoteDocument] = []
@@ -110,10 +114,11 @@ def load_notes_from_csv(
             short_count += 1
 
         # Metadata is strictly pseudonymous here
-        metadata: Dict[str, object] = {
+        metadata = {
             "source_path": str(csv_path),
             "source_kind": note_source,
-        }
+        }  # type: Dict[str, object]
+
         if patient_col and patient_col in group.columns:
             metadata["patient_id"] = first[patient_col]          # encrypted
         if enc_col and enc_col in group.columns:
@@ -134,9 +139,9 @@ def load_notes_from_csv(
     total = len(notes)
     # Log only counts, not IDs or text → avoids leaking PHI in logs
     print(
-        f"[csv_notes] Loaded {total} notes from {csv_path.name} "
-        f"(short notes with < {min_short_chars} chars: {short_count})"
+        "[csv_notes] Loaded {} notes from {} (short notes with < {} chars: {})".format(
+            total, csv_path.name, min_short_chars, short_count
+        )
     )
 
     return notes
-
