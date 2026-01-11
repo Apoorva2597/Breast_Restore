@@ -3,7 +3,7 @@ from typing import Dict, List, Optional
 
 import pandas as pd
 
-from ..models import NoteDocument
+from models import NoteDocument
 
 
 # We intentionally ONLY map encrypted IDs here.
