@@ -1,4 +1,4 @@
-mport re
+import re
 from typing import List
 
 from ..models import Candidate, SectionedNote
