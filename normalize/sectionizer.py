@@ -25,13 +25,13 @@ HEADER_CANON = {
     "DIAGNOSTIC IMAGING": "IMAGING",
     "PATHOLOGY": "PATHOLOGY",
     "PATHOLOGY REVIEW": "PATHOLOGY",
-    "PATHOLOY": "PATHOLOGY",  # typo form mapped to PATHOLOGY
+    "PATHOLOY": "PATHOLOGY",  # common typo
 
     # PMH / PSH / family / social history
     "PAST MEDICAL HISTORY": "PAST MEDICAL HISTORY",
     "PAST SURGICAL HISTORY": "PAST SURGICAL HISTORY",
     "FAMILY HISTORY": "FAMILY HISTORY",
-    "FAMILY HSTORY": "FAMILY HISTORY",  # typo form
+    "FAMILY HSTORY": "FAMILY HISTORY",  # common typo
 
     "SOCIAL HISTORY": "SOCIAL HISTORY",
 
@@ -72,12 +72,10 @@ HEADER_CANON = {
     "SUBJECTIVE": "SUBJECTIVE",
     "INTERVAL HISTORY": "INTERVAL HISTORY",
     "HISTORY": "HISTORY",
-    "OBJECTIVE": "PHYSICAL EXAM",  # reuse objective → exam bucket
-    # PHYSICAL EXAM handled above
-    # ASSESSMENT/PLAN and DIAGNOSIS already defined above
+    # OBJECTIVE / PHYSICAL EXAM share the same canonical bucket above
 
     # ---------------------------------------------------------------
-    # Op note headings – keep as distinct sections
+    # Op note headings – kept as distinct sections
     # ---------------------------------------------------------------
     "OP NOTE": "OP NOTE",
     "OPERATIVE REPORT": "OP NOTE",
@@ -132,9 +130,9 @@ TITLECASE_ALLOW = {"REASON FOR VISIT", "OP NOTE"}
 # -------------------------------------------------------------------
 # Guardrails: prevent false headings from tables/lists
 # -------------------------------------------------------------------
-TABLEISH_RE = re.compile(r".+\|.+")                 # "A | B | C"
-NUMBERED_ITEM_RE = re.compile(r"^\s*\d+\.\s+\w+")   # "1. ..."
-BULLET_RE = re.compile(r"^\s*[•\-\*]\s+")           # bullet lines
+TABLEISH_RE = re.compile(r".+\|.+")               # "A | B | C"
+NUMBERED_ITEM_RE = re.compile(r"^\s*\d+\.\s+\w+") # "1. ..."
+BULLET_RE = re.compile(r"^\s*[•\-\*]\s+")         # bullet lines
 
 # -------------------------------------------------------------------
 # Disambiguation: Radiology "PHYSICAL EXAM:" sometimes appears inside IMAGING blocks
@@ -179,11 +177,13 @@ def _canon(line: str) -> str:
     Supports inline headings like "HPI: blah" / "CC: blah".
     """
     if ":" in line:
-        left = _clean_spaces(line.split(":", 1)[0]).upper()
+        left, right = line.split(":", 1)
+        left = _clean_spaces(left).upper()
         if left in HEADER_CANON:
             return HEADER_CANON[left]
         if left in {"CC", "HPI"}:
             return HEADER_CANON.get(left, left)
+
     k = _key(line)
     return HEADER_CANON.get(k, _clean_spaces(_strip_trailing_colon(line)))
 
