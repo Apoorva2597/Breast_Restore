@@ -69,6 +69,8 @@ HEADER_CANON = {
     # Inpatient headings
     # ---------------------------------------------------------------
     "S/P PROCEDURE(S)": "S/P PROCEDURES",
+    "S/P PROCEDURES(S)": "S/P PROCEDURES",  # extra-safe variant
+    "S/P PROCEDURES": "S/P PROCEDURES",
     "SUBJECTIVE": "SUBJECTIVE",
     "INTERVAL HISTORY": "INTERVAL HISTORY",
     "HISTORY": "HISTORY",
@@ -239,7 +241,9 @@ def _disambiguate_heading(canon_heading: str, lookahead_text: str) -> str:
     If we see imaging cues soon after PHYSICAL EXAM, treat as IMAGING.
     """
     if canon_heading == "PHYSICAL EXAM":
-        if IMAGING_CUES_RE.search(lookahead_text) and not CLINIC_EXAM_CUES_RE.search(lookahead_text):
+        if IMAGING_CUES_RE.search(lookahead_text) and not CLINIC_EXAM_CUES_RE.search(
+            lookahead_text
+        ):
             return "IMAGING"
     return canon_heading
 
@@ -289,9 +293,17 @@ def sectionize(text: str, lookahead_lines: int = 12) -> Dict[str, str]:
         i += 1
 
     # Join and drop empties
-    out = {}  # type: Dict[str, str]
+    out: Dict[str, str] = {}
     for k, chunk_lines in sections.items():
         body = "\n".join(chunk_lines).strip()
         if body:
             out[k] = body
+
+    # Fallback: if nothing survived but the note has text,
+    # treat the whole thing as a single PREAMBLE section.
+    if not out:
+        stripped = text.strip()
+        if stripped:
+            return {"__PREAMBLE__": stripped}
+
     return out
