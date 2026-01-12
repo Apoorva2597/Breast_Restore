@@ -2,39 +2,60 @@ import re
 from typing import Dict, List
 
 # -------------------------------------------------------------------
-# Canonical sections: tuned for Breast RESTORE clinic + op notes
+# Canonical sections: tuned for Breast RESTORE clinic + inpatient + op notes
 # -------------------------------------------------------------------
 HEADER_CANON = {
+    # ---------------------------------------------------------------
     # Clinic / Epic headings
+    # ---------------------------------------------------------------
     "REASON FOR VISIT": "REASON FOR VISIT",
+
     "CHIEF COMPLAINT": "CHIEF COMPLAINT",
     "CC": "CHIEF COMPLAINT",
 
     "HPI": "HPI",
     "HISTORY OF PRESENT ILLNESS": "HPI",
     "HISTORY OF PRESENT ILLNESS (HPI)": "HPI",
+    "INTERVAL HISTORY AND REVIEW OF SYSTEMS": "HPI",
 
     "DIAGNOSIS": "DIAGNOSIS",
+
+    # Imaging / pathology
     "IMAGING": "IMAGING",
     "DIAGNOSTIC IMAGING": "IMAGING",
     "PATHOLOGY": "PATHOLOGY",
     "PATHOLOGY REVIEW": "PATHOLOGY",
+    "PATHOLOY": "PATHOLOGY",  # typo form mapped to PATHOLOGY
 
+    # PMH / PSH / family / social history
     "PAST MEDICAL HISTORY": "PAST MEDICAL HISTORY",
     "PAST SURGICAL HISTORY": "PAST SURGICAL HISTORY",
     "FAMILY HISTORY": "FAMILY HISTORY",
+    "FAMILY HSTORY": "FAMILY HISTORY",  # typo form
 
+    "SOCIAL HISTORY": "SOCIAL HISTORY",
+
+    # Medications
     "MEDICATIONS": "MEDICATIONS",
     "CURRENT MEDICATIONS": "MEDICATIONS",
     "OUTPATIENT MEDICATIONS PRIOR TO VISIT": "MEDICATIONS",
 
+    # Allergies
     "ALLERGIES": "ALLERGIES",
-    "SOCIAL HISTORY": "SOCIAL HISTORY",
-    "REVIEW OF SYSTEMS": "REVIEW OF SYSTEMS",
 
+    # ROS
+    "REVIEW OF SYSTEMS": "REVIEW OF SYSTEMS",
+    "ROS": "REVIEW OF SYSTEMS",
+
+    # Physical exam / objective
     "PHYSICAL EXAM": "PHYSICAL EXAM",
     "OBJECTIVE": "PHYSICAL EXAM",
 
+    # Labs / radiology
+    "RADIOLOGY": "RADIOLOGY",
+    "LABS": "LABS",
+
+    # Assessment / plan / treatment
     "ASSESSMENT": "ASSESSMENT/PLAN",
     "ASSESSMENT/PLAN": "ASSESSMENT/PLAN",
     "ASSESSMENT AND PLAN": "ASSESSMENT/PLAN",
@@ -42,7 +63,22 @@ HEADER_CANON = {
     "PLAN OF CARE": "ASSESSMENT/PLAN",
     "ONCOLOGY CARE MODEL DOCUMENTATION REQUIREMENT": "ASSESSMENT/PLAN",
 
+    "TREATMENT": "TREATMENT",
+
+    # ---------------------------------------------------------------
+    # Inpatient headings
+    # ---------------------------------------------------------------
+    "S/P PROCEDURES(S)": "S/P PROCEDURES",
+    "SUBJECTIVE": "SUBJECTIVE",
+    "INTERVAL HISTORY": "INTERVAL HISTORY",
+    "HISTORY": "HISTORY",
+    "OBJECTIVE": "PHYSICAL EXAM",  # reuse objective → exam bucket
+    # PHYSICAL EXAM handled above
+    # ASSESSMENT/PLAN and DIAGNOSIS already defined above
+
+    # ---------------------------------------------------------------
     # Op note headings – keep as distinct sections
+    # ---------------------------------------------------------------
     "OP NOTE": "OP NOTE",
     "OPERATIVE REPORT": "OP NOTE",
 
