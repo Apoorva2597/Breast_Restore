@@ -1,6 +1,6 @@
 import re
 from typing import List
-from ..models import Candidate, SectionedNote
+from models import Candidate, SectionedNote
 from .utils import window_around
 
 BMI_RX = re.compile(r"\bBMI\b\s*[:=]?\s*(\d{1,2}(?:\.\d)?)\b", re.IGNORECASE)
