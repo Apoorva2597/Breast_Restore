@@ -1,5 +1,6 @@
 from pathlib import Path
 from typing import Dict, List, Optional, Union
+import re
 
 import pandas as pd
 
@@ -48,6 +49,92 @@ def clean_encoding_artifacts(text: str) -> str:
     return text
 
 
+def insert_heading_newlines(text: str) -> str:
+    """
+    Insert line breaks before and after known headings so that the sectionizer
+    can see them even when the original CSV flattened everything onto one line.
+
+    This does NOT change clinical content – it only adds '\n' around headings
+    that you have confirmed exist in Breast RESTORE notes.
+    """
+    if not text:
+        return text
+
+    # Headings actually observed in Breast RESTORE data (clinic + inpatient + op).
+    # We include both ALL-CAPS and Title Case variants where you reported them.
+    headings = [
+        # Clinic / outpatient
+        "REASON FOR VISIT:",
+        "CHIEF COMPLAINT:",
+        "CC:",
+        "HPI:",
+        "HISTORY OF PRESENT ILLNESS:",
+        "INTERVAL HISTORY AND REVIEW OF SYSTEMS:",
+        "ROS:",
+        "REVIEW OF SYSTEMS:",
+        "Past Medical History:",
+        "PAST MEDICAL HISTORY:",
+        "Past Surgical History:",
+        "PAST SURGICAL HISTORY:",
+        "FAMILY HSTORY:",
+        "FAMILY HISTORY:",
+        "Social History:",
+        "SOCIAL HISTORY:",
+        "Physical Exam:",
+        "PHYSICAL EXAM:",
+        "PATHOLOY:",
+        "PATHOLOGY:",
+        "RADIOLOGY:",
+        "LABS:",
+        "ASSESSMENT:",
+        "ASSESSMENT AND PLAN:",
+        "Assessment and Plan:",
+        "ASSESSMENT/PLAN:",
+        "PLAN:",
+        "TREATMENT:",
+
+        # Inpatient
+        "S/P Procedures(s):",
+        "Subjective:",
+        "Interval History:",
+        "Objective:",
+        "Diagnosis:",
+        "History:",
+        "Assessment/Plan:",
+        # Physical exam appears in both clinic + inpatient
+        # so we reuse "Physical Exam:" / "PHYSICAL EXAM:" above.
+
+        # Op notes
+        "OP NOTE:",
+        "OPERATIVE REPORT:",
+        "PREOPERATIVE DIAGNOSIS:",
+        "POSTOPERATIVE DIAGNOSIS:",
+        "PROCEDURE:",
+        "ATTENDING SURGEON:",
+        "ASSISTANT:",
+        "ANESTHESIA:",
+        "IV FLUIDS:",
+        "ESTIMATED BLOOD LOSS:",
+        "URINE OUTPUT:",
+        "MICRO SURGICAL DETAILS:",
+        "COMPLICATIONS:",
+        "CONDITION AT THE END OF THE PROCEDURE:",
+        "DISPOSITION:",
+        "INDICATIONS FOR OPERATION:",
+        "DETAILS OF OPERATION:",
+    ]
+
+    for h in headings:
+        # Allow extra spaces immediately before the heading.
+        # We replace that whitespace + the heading with:
+        #   '\nHEADING:\n'
+        pattern = r"\s*" + re.escape(h)
+        replacement = "\n" + h + "\n"
+        text = re.sub(pattern, replacement, text)
+
+    return text
+
+
 def load_notes_from_csv(
     path: Union[str, Path],
     *,
@@ -69,6 +156,7 @@ def load_notes_from_csv(
       - Sort by LINE
       - Concatenate NOTE_TEXT into a single string per note
       - Clean encoding artifacts
+      - Insert line breaks around known headings so the sectionizer can work
       - Log count of very short notes (< min_short_chars) but do NOT drop them.
     """
     csv_path = Path(path)
@@ -108,7 +196,11 @@ def load_notes_from_csv(
 
         parts = [t for t in group[text_col].tolist() if isinstance(t, str)]
         raw_text = "\n".join(parts).strip()
+
+        # 1) Clean encoding artifacts
         clean_text = clean_encoding_artifacts(raw_text).strip()
+        # 2) Restore structure by putting headings onto their own lines
+        clean_text = insert_heading_newlines(clean_text)
 
         if len(clean_text) < min_short_chars:
             short_count += 1
