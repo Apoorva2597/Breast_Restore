@@ -1,7 +1,7 @@
 import re
 from typing import List, Optional
-from ..models import Candidate, SectionedNote
-from ..config import SMOKING_NORMALIZE
+from models import Candidate, SectionedNote
+from config import SMOKING_NORMALIZE
 from .utils import window_around
 
 SMOKE_LINE = re.compile(r"(smoking\s+status|tobacco\s+use|tobacco)\s*[:=]?\s*([^\n]+)", re.IGNORECASE)
