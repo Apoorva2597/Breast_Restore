@@ -1,8 +1,8 @@
 import re
 from typing import List
 
-from ..models import Candidate, SectionedNote
-from ..config import NEGATION_CUES, PLANNED_CUES, PERFORMED_CUES
+from models import Candidate, SectionedNote
+from config import NEGATION_CUES, PLANNED_CUES, PERFORMED_CUES
 from .utils import window_around, classify_status
 
 RECON_PATTERNS = [
