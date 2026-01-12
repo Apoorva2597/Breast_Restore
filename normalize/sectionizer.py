@@ -68,7 +68,7 @@ HEADER_CANON = {
     # ---------------------------------------------------------------
     # Inpatient headings
     # ---------------------------------------------------------------
-    "S/P PROCEDURES(S)": "S/P PROCEDURES",
+    "S/P PROCEDURE(S)": "S/P PROCEDURES",
     "SUBJECTIVE": "SUBJECTIVE",
     "INTERVAL HISTORY": "INTERVAL HISTORY",
     "HISTORY": "HISTORY",
