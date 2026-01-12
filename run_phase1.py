@@ -1,89 +1,124 @@
-from __future__ import annotations
-
 import argparse
+import csv
 from pathlib import Path
+from typing import List
 
-from phase1_pipeline.ingest.docx_reader import read_docx
-from phase1_pipeline.normalize.sectionizer import sectionize
-from phase1_pipeline.normalize.note_type import guess_note_type
-from phase1_pipeline.extractors import extract_all
-from phase1_pipeline.aggregate.rules import aggregate_patient
-from phase1_pipeline.outputs.json_writer import write_note_json, write_patient_json
-from phase1_pipeline.models import SectionedNote
+from ingest.csv_notes import load_notes_from_csv
+from normalize.sectionizer import sectionize
+from normalize.note_type import guess_note_type
+from models import SectionedNote, Candidate
+from extractors import extract_all
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser(
-        description="Phase 1 rule-based extraction (note-level -> patient-level)."
+def build_sectioned_note(doc):
+    """
+    Convert a NoteDocument (from ingest) into a SectionedNote
+    using the sectionizer and note-type guesser.
+    """
+    sections = sectionize(doc.text)
+
+    raw_type = doc.metadata.get("note_type_raw", "") or ""
+    guessed_type = guess_note_type(raw_type, doc.text)
+    note_date = doc.metadata.get("note_date_raw")
+
+    return SectionedNote(
+        note_id=doc.note_id,
+        note_type=guessed_type,
+        sections=sections,
+        note_date=str(note_date) if note_date is not None else None,
     )
-    ap.add_argument(
-        "--input_dir",
-        required=True,
-        help="Directory containing DOCX notes for ONE patient (pilot).",
+
+
+def write_candidates_to_csv(candidates, out_path):
+    """
+    Write candidates to CSV.
+
+    IMPORTANT: This writes only structured fields and short evidence
+    snippets. No full note text is written.
+    """
+    fieldnames = [
+        "note_id",
+        "note_type",
+        "note_date",
+        "field",
+        "value",
+        "status",
+        "section",
+        "confidence",
+        "evidence",
+    ]
+
+    with out_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for c in candidates:  # type: Candidate
+            writer.writerow(
+                {
+                    "note_id": c.note_id,
+                    "note_type": c.note_type,
+                    "note_date": c.note_date,
+                    "field": c.field,
+                    "value": c.value,
+                    "status": c.status,
+                    "section": c.section,
+                    "confidence": c.confidence,
+                    "evidence": c.evidence,
+                }
+            )
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Run Phase 1 abstraction (BMI, smoking, comorbidities, recon, lymph nodes) from CSV notes."
     )
-    ap.add_argument(
-        "--out_dir",
-        required=True,
-        help="Output directory for JSON artifacts.",
+    parser.add_argument(
+        "csv_path",
+        help="Path to the notes CSV (e.g. HPI11526 Operation Notes.csv)",
     )
-    ap.add_argument(
-        "--patient_id",
-        default="patient_001",
-        help="Non-PHI patient id for output.",
+    parser.add_argument(
+        "--note_source",
+        default="unknown",
+        help='Source kind label, e.g. "operation", "clinic", "inpatient".',
     )
-    args = ap.parse_args()
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Optional limit on number of notes to process (0 = all).",
+    )
+    parser.add_argument(
+        "--output",
+        default="phase1_candidates.csv",
+        help="Output CSV file path (default: phase1_candidates.csv).",
+    )
 
-    in_dir = Path(args.input_dir)
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    args = parser.parse_args()
 
-    docx_files = sorted(in_dir.glob("*.docx"))
-    if not docx_files:
-        raise SystemExit(f"No .docx files found in {in_dir}")
+    csv_path = Path(args.csv_path)
 
-    all_candidates = []
+    notes = load_notes_from_csv(
+        csv_path,
+        note_source=args.note_source,
+        min_short_chars=10,
+    )
 
-    for f in docx_files:
-        # Read raw note text (NoteDocument)
-        raw_note = read_docx(str(f), note_id=f.stem)
+    if args.limit and args.limit > 0:
+        notes = notes[: args.limit]
 
-        # Sectionize -> Dict[str, str]
-        sec_dict = sectionize(raw_note.text)
+    all_candidates = []  # type: List[Candidate]
 
-        # Infer note type from note_id + full text
-        note_type = guess_note_type(raw_note.note_id, raw_note.text)
-
-        # Note date (None unless you set it in metadata later)
-        note_date = None
-
-        # Build SectionedNote for extractors
-        sec_note = SectionedNote(
-            note_id=raw_note.note_id,
-            note_type=note_type,
-            sections=sec_dict,
-            note_date=note_date,
-        )
-
-        # Extract + write note-level output
-        cands = extract_all(sec_note)
+    for doc in notes:
+        sn = build_sectioned_note(doc)
+        cands = extract_all(sn)
         all_candidates.extend(cands)
 
-        write_note_json(
-            str(out_dir / f"{f.stem}.note_level.json"),
-            f.stem,
-            cands,
-        )
-
-    # Aggregate across all notes for the patient
-    final = aggregate_patient(all_candidates)
-    write_patient_json(
-        str(out_dir / f"{args.patient_id}.patient_level.json"),
-        args.patient_id,
-        final,
-    )
+    out_path = Path(args.output)
+    write_candidates_to_csv(all_candidates, out_path)
 
     print(
-        f"Wrote {len(docx_files)} note-level JSON files + patient-level JSON to: {out_dir}"
+        "Phase 1: wrote {} candidates from {} notes to {}".format(
+            len(all_candidates), len(notes), out_path
+        )
     )
 
 
