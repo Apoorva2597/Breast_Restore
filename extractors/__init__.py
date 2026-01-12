@@ -1,6 +1,6 @@
 from typing import List
 
-from ..models import SectionedNote, Candidate
+from models import SectionedNote, Candidate
 
 from .bmi import extract_bmi
 from .smoking import extract_smoking
