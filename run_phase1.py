@@ -1,6 +1,15 @@
+import os
+import sys
+from pathlib import Path
+
+# Make the Breast_Restore repo root importable (Python 3.6-safe)
+ROOT = Path(__file__).resolve().parent
+root_str = str(ROOT)
+if root_str not in sys.path:
+    sys.path.insert(0, root_str)
+
 import argparse
 import csv
-from pathlib import Path
 from typing import List
 
 from ingest.csv_notes import load_notes_from_csv
