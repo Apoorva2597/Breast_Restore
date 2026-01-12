@@ -1,7 +1,7 @@
 from typing import List
 
-from ..models import Candidate, SectionedNote
-from ..config import (
+from models import Candidate, SectionedNote
+from config import (
     NEGATION_CUES, PLANNED_CUES, PERFORMED_CUES,
     DM_POS, DM_EXCLUDE,
     HTN_POS, HTN_EXCLUDE,
