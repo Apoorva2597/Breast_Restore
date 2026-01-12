@@ -1,5 +1,4 @@
-from __future__ import annotations
-import re
+mport re
 from typing import List
 
 from ..models import Candidate, SectionedNote
