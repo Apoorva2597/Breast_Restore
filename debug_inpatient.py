@@ -4,7 +4,7 @@ import pandas as pd
 from pathlib import Path
 
 # CHANGE THIS PATH IF NEEDED
-csv_path = Path("/home/apokol/my_data_Breast/HPI11526/HPI11526 Inpatient Notes.csv")
+csv_path = Path("/home/apokol/my_data_Breast/HPI-11526/HPI11256/HPI11526 Inpatient Notes.csv")
 
 print("\n=== Reading CSV ===")
 df = pd.read_csv(str(csv_path), encoding="cp1252")
