@@ -1,5 +1,4 @@
 # debug_inpatient.py
-# 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
 
 import pandas as pd
 from pathlib import Path
