@@ -7,6 +7,10 @@ Input  : one or more *_phase1_candidates.csv files
 Output : one CSV with final fields (one row per note_id + field)
 
 Compatible with Python 3.6.x.
+
+NOTE:
+- If Phase 1 included 'patient_id' (encrypted), it is preserved here
+  and written as a column in the output.
 """
 
 import argparse
@@ -47,6 +51,9 @@ def _resolve_group(candidates):
     """
     Given a list of candidate rows (dicts) for the same (note_id, field),
     pick the single best one and tag it with a rule label.
+
+    All other columns (e.g., patient_id, note_type, note_date, section)
+    are preserved from the winning row.
     """
     best = None
     best_score = None
@@ -71,8 +78,8 @@ def run_phase2(input_paths, output_path):
         with open(path, newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                # Normalize keys a bit, in case future scripts change order
-                # We assume Phase 1 wrote at least:
+                # Phase 1 should have at least:
+                # patient_id (optional but preferred),
                 # note_id, note_type, note_date, field, value, status,
                 # section, confidence, evidence
                 all_rows.append(row)
@@ -105,6 +112,7 @@ def run_phase2(input_paths, output_path):
 
     # Preferred column order (others go at the end)
     preferred = [
+        "patient_id",   # encrypted; may or may not be present
         "note_id",
         "note_type",
         "note_date",
@@ -139,8 +147,10 @@ def run_phase2(input_paths, output_path):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Resolve Phase 1 candidates into final fields "
-                    "(one row per note_id + field)."
+        description=(
+            "Resolve Phase 1 candidates into final fields "
+            "(one row per note_id + field)."
+        )
     )
     parser.add_argument(
         "--input",
