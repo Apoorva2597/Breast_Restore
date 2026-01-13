@@ -13,9 +13,9 @@ EXTRACTED_FILE = "age_bmi_for_linking.csv"
 OUTPUT_FILE = "gold_extracted_links.csv"
 
 # --- COLUMN NAMES in GOLD FILE ---
-GOLD_ID_COL = "PatientID"   # your team’s synthetic patient ID
-GOLD_AGE_COL = "Age"        # integer ages in the gold sheet
-GOLD_BMI_COL = "BMI"        # numeric BMI in the gold sheet
+GOLD_ID_COL = "1. PatientID"   # your team’s synthetic patient ID
+GOLD_AGE_COL = "4. Age"        # integer ages in the gold sheet
+GOLD_BMI_COL = "5. BMI"        # numeric BMI in the gold sheet
 
 # --- COLUMN NAMES in EXTRACTED FILE ---
 EXT_NOTE_ID_COL = "note_id"
