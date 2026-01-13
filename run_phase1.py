@@ -10,7 +10,7 @@ if root_str not in sys.path:
 
 import argparse
 import csv
-from typing import List
+from typing import List, Dict
 
 from ingest.csv_notes import load_notes_from_csv
 from normalize.sectionizer import sectionize
@@ -38,14 +38,17 @@ def build_sectioned_note(doc):
     )
 
 
-def write_candidates_to_csv(candidates, out_path):
+def write_candidates_to_csv(candidates, out_path, note_to_patient_id):
     """
     Write candidates to CSV.
 
-    IMPORTANT: This writes only structured fields and short evidence
-    snippets. No full note text is written.
+    IMPORTANT:
+    - Writes only structured fields and short evidence snippets.
+    - Includes patient_id (encrypted) derived from ingest metadata.
+    - No full note text or MRN is written.
     """
     fieldnames = [
+        "patient_id",
         "note_id",
         "note_type",
         "note_date",
@@ -63,6 +66,7 @@ def write_candidates_to_csv(candidates, out_path):
         for c in candidates:  # type: Candidate
             writer.writerow(
                 {
+                    "patient_id": note_to_patient_id.get(c.note_id, ""),
                     "note_id": c.note_id,
                     "note_type": c.note_type,
                     "note_date": c.note_date,
@@ -78,7 +82,10 @@ def write_candidates_to_csv(candidates, out_path):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Run Phase 1 abstraction (BMI, smoking, comorbidities, recon, lymph nodes) from CSV notes."
+        description=(
+            "Run Phase 1 abstraction (BMI, Age_DOS, smoking, comorbidities, "
+            "reconstruction, lymph nodes, PBS, mastectomy) from CSV notes."
+        )
     )
     parser.add_argument(
         "csv_path",
@@ -114,6 +121,13 @@ def main():
     if args.limit and args.limit > 0:
         notes = notes[: args.limit]
 
+    # Build note_id → patient_id map from ingest metadata
+    note_to_patient_id = {}  # type: Dict[str, str]
+    for doc in notes:
+        pid = doc.metadata.get("patient_id")
+        if pid is not None:
+            note_to_patient_id[str(doc.note_id)] = str(pid)
+
     all_candidates = []  # type: List[Candidate]
 
     for doc in notes:
@@ -122,7 +136,7 @@ def main():
         all_candidates.extend(cands)
 
     out_path = Path(args.output)
-    write_candidates_to_csv(all_candidates, out_path)
+    write_candidates_to_csv(all_candidates, out_path, note_to_patient_id)
 
     print(
         "Phase 1: wrote {} candidates from {} notes to {}".format(
