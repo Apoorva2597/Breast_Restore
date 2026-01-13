@@ -1,187 +1,199 @@
-# match_gold_to_extracted.py
+# match_age_bmi_gold_and_extracted.py
 #
-# Link gold_variables.csv (per patient) to our extracted notes
-# via exact match on (Age, BMI), and print debugging stats.
+# Link gold chart-review rows to extracted rows by exact (Age,BMI) match.
+# Now robust to headers like "4. Age", "5. BMI", "1. PatientID".
 #
-# Output: gold_extracted_links.csv
+# Inputs:
+#   - gold_variables.csv        (manual abstraction; per-patient)
+#   - age_bmi_for_linking.csv   (from make_age_bmi_link_file.py; per-note)
+#
+# Output:
+#   - gold_extracted_links.csv  (rows where Age+BMI match exactly)
 
 import csv
 
-# Input files
-GOLD_FILE = "gold_variables.csv"
-EXTRACTED_FILE = "age_bmi_for_linking.csv"
-OUTPUT_FILE = "gold_extracted_links.csv"
-
-# --- COLUMN NAMES in GOLD FILE ---
-GOLD_ID_COL = "1. PatientID"   # your team’s synthetic patient ID
-GOLD_AGE_COL = "4. Age"        # integer ages in the gold sheet
-GOLD_BMI_COL = "5. BMI"        # numeric BMI in the gold sheet
-
-# --- COLUMN NAMES in EXTRACTED FILE ---
-EXT_NOTE_ID_COL = "note_id"
-EXT_TYPE_COL = "note_type"
-EXT_DATE_COL = "note_date"
-EXT_AGE_COL = "Age_DOS"
-EXT_BMI_COL = "BMI"
+GOLD_CSV = "gold_variables.csv"
+EXTRACTED_CSV = "age_bmi_for_linking.csv"
+OUTPUT_CSV = "gold_extracted_links.csv"
 
 
-def normalize_age(raw):
+def _pick_col(fieldnames, keywords):
     """
-    Convert age to a stable integer string.
-
-    Examples:
-      "49"   -> "49"
-      "49.0" -> "49"
+    Choose the first column whose lowercase name contains *all* keywords.
+    e.g. ["age"] will match "4. Age", ["patient","id"] will match "1. PatientID".
     """
-    if raw is None:
-        return None
-    s = str(raw).strip()
-    if not s:
-        return None
+    names = list(fieldnames)  # ensure indexable
+    for name in names:
+        norm = name.lower().replace(" ", "")
+        ok = True
+        for kw in keywords:
+            if kw not in norm:
+                ok = False
+                break
+        if ok:
+            return name
+    return None
+
+
+def _safe_float(s):
     try:
-        return str(int(float(s)))
-    except ValueError:
+        return float(str(s).strip())
+    except Exception:
         return None
 
 
-def normalize_bmi(raw):
-    """
-    Convert BMI to a 1-decimal string for exact matching.
-
-    Examples:
-      "33.8"   -> "33.8"
-      "33.75"  -> "33.8"
-      " 33 "   -> "33.0"
-    """
-    if raw is None:
-        return None
-    s = str(raw).strip()
-    if not s:
-        return None
+def _safe_int(s):
     try:
-        v = float(s)
-        return "{:.1f}".format(v)
-    except ValueError:
+        return int(round(float(str(s).strip())))
+    except Exception:
         return None
+
+
+def _normalize_pair(age_val, bmi_val):
+    """
+    Normalize (age, bmi) for matching:
+      - age as integer (years)
+      - bmi rounded to 1 decimal
+    Returns (age_int, bmi_1dp) or (None, None) if invalid.
+    """
+    age = _safe_int(age_val)
+    bmi_f = _safe_float(bmi_val)
+    if age is None or bmi_f is None:
+        return None, None
+    bmi = round(bmi_f, 1)
+    return age, bmi
 
 
 def main():
-    # -------------------------------------------------
-    # 1. Load GOLD dataset and build (Age, BMI) index
-    # -------------------------------------------------
-    gold_index = {}   # key = (age_norm, bmi_norm) -> list of gold rows
-    gold_pairs = set()
-    total_gold_rows = 0
-    usable_gold_rows = 0
+    # ------------------- 1) Read GOLD -------------------
+    with open(GOLD_CSV, "r", newline="") as f:
+        gold_reader = csv.DictReader(f)
+        gold_fieldnames = gold_reader.fieldnames or []
 
-    with open(GOLD_FILE, "r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            total_gold_rows += 1
-            age_norm = normalize_age(row.get(GOLD_AGE_COL))
-            bmi_norm = normalize_bmi(row.get(GOLD_BMI_COL))
+        # Auto-detect columns
+        gold_pid_col = _pick_col(gold_fieldnames, ["patient"])
+        gold_age_col = _pick_col(gold_fieldnames, ["age"])
+        gold_bmi_col = _pick_col(gold_fieldnames, ["bmi"])
 
-            if age_norm is None or bmi_norm is None:
-                continue
+        print("GOLD header columns:")
+        print("  PatientID col:", gold_pid_col)
+        print("  Age col      :", gold_age_col)
+        print("  BMI col      :", gold_bmi_col)
 
-            usable_gold_rows += 1
-            key = (age_norm, bmi_norm)
-            gold_pairs.add(key)
-            gold_index.setdefault(key, []).append(row)
+        if not (gold_age_col and gold_bmi_col):
+            print("ERROR: Could not find Age/BMI columns in gold file; "
+                  "check header names.")
+            return
+
+        gold_rows = list(gold_reader)
+
+    gold_pairs = {}  # (age,bmi) -> list of gold rows
+    gold_usable = 0
+
+    for row in gold_rows:
+        age_raw = row.get(gold_age_col, "")
+        bmi_raw = row.get(gold_bmi_col, "")
+        age, bmi = _normalize_pair(age_raw, bmi_raw)
+        if age is None or bmi is None:
+            continue
+        gold_usable += 1
+        key = (age, bmi)
+        gold_pairs.setdefault(key, []).append(row)
 
     print("GOLD: total rows = {}, usable Age+BMI = {}".format(
-        total_gold_rows, usable_gold_rows
-    ))
+        len(gold_rows), gold_usable))
     print("GOLD: distinct (Age,BMI) pairs = {}".format(len(gold_pairs)))
 
-    # -------------------------------------------------
-    # 2. Load EXTRACTED note-level file
-    # -------------------------------------------------
-    extracted_rows = []
-    extracted_pairs = set()
-    total_extracted_rows = 0
-    usable_extracted_rows = 0
+    # ------------------- 2) Read EXTRACTED -------------------
+    with open(EXTRACTED_CSV, "r", newline="") as f:
+        ext_reader = csv.DictReader(f)
+        ext_fieldnames = ext_reader.fieldnames or []
 
-    with open(EXTRACTED_FILE, "r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            total_extracted_rows += 1
-            age_norm = normalize_age(row.get(EXT_AGE_COL))
-            bmi_norm = normalize_bmi(row.get(EXT_BMI_COL))
+        # Expected columns from make_age_bmi_link_file.py
+        note_id_col = "note_id"
+        note_type_col = "note_type"
+        note_date_col = "note_date"
+        age_col = "Age_DOS"
+        bmi_col = "BMI"
 
-            if age_norm is not None and bmi_norm is not None:
-                usable_extracted_rows += 1
-                extracted_pairs.add((age_norm, bmi_norm))
+        extracted_rows = list(ext_reader)
 
-            extracted_rows.append(row)
-
-    print("EXTRACTED: total rows = {}, usable Age+BMI = {}".format(
-        total_extracted_rows, usable_extracted_rows
-    ))
-    print("EXTRACTED: distinct (Age,BMI) pairs = {}".format(len(extracted_pairs)))
-
-    # -------------------------------------------------
-    # 3. Check overlap of (Age,BMI) keys
-    # -------------------------------------------------
-    overlap_pairs = gold_pairs.intersection(extracted_pairs)
-    print("Overlap: distinct (Age,BMI) pairs in common = {}".format(
-        len(overlap_pairs)
-    ))
-
-    # If there is no overlap at all, matching will produce 0 rows.
-    if not overlap_pairs:
-        print("WARNING: No shared (Age,BMI) pairs between gold and extracted.")
-        print("         0 matches is expected with exact matching.")
-        # We still continue and run matching anyway, just in case.
-
-    # -------------------------------------------------
-    # 4. Do the actual matching (exact Age,BMI)
-    # -------------------------------------------------
-    matches = []
+    ext_pairs = {}  # (age,bmi) -> list of extracted rows
+    ext_usable = 0
 
     for row in extracted_rows:
-        age_norm = normalize_age(row.get(EXT_AGE_COL))
-        bmi_norm = normalize_bmi(row.get(EXT_BMI_COL))
-
-        if age_norm is None or bmi_norm is None:
+        age_raw = row.get(age_col, "")
+        bmi_raw = row.get(bmi_col, "")
+        age, bmi = _normalize_pair(age_raw, bmi_raw)
+        if age is None or bmi is None:
             continue
+        ext_usable += 1
+        key = (age, bmi)
+        ext_pairs.setdefault(key, []).append(row)
 
-        key = (age_norm, bmi_norm)
-        gold_candidates = gold_index.get(key, [])
+    print("EXTRACTED: total rows = {}, usable Age+BMI = {}".format(
+        len(extracted_rows), ext_usable))
+    print("EXTRACTED: distinct (Age,BMI) pairs = {}".format(len(ext_pairs)))
 
-        for g in gold_candidates:
-            matches.append({
-                "gold_patient_id": g.get(GOLD_ID_COL, ""),
-                "gold_age": g.get(GOLD_AGE_COL, ""),
-                "gold_bmi": g.get(GOLD_BMI_COL, ""),
-                "note_id": row.get(EXT_NOTE_ID_COL, ""),
-                "note_type": row.get(EXT_TYPE_COL, ""),
-                "note_date": row.get(EXT_DATE_COL, ""),
-                "extracted_age": row.get(EXT_AGE_COL, ""),
-                "extracted_bmi": row.get(EXT_BMI_COL, ""),
-            })
+    # ------------------- 3) Find overlaps -------------------
+    gold_keys = set(gold_pairs.keys())
+    ext_keys = set(ext_pairs.keys())
+    overlap_keys = sorted(gold_keys & ext_keys)
 
-    # -------------------------------------------------
-    # 5. Write matches out
-    # -------------------------------------------------
-    fieldnames = [
-        "gold_patient_id",
-        "gold_age",
-        "gold_bmi",
+    print("Overlap: distinct (Age,BMI) pairs in common = {}".format(
+        len(overlap_keys)))
+    if not overlap_keys:
+        print("WARNING: No shared (Age,BMI) pairs between gold and extracted.")
+        print("         0 matches is expected with strict exact matching.")
+        # Still write an empty file with header for convenience.
+
+    # ------------------- 4) Write matched rows -------------------
+    out_fieldnames = [
+        # identifying info
+        "PatientID_gold",
+        "Age_gold",
+        "BMI_gold",
         "note_id",
         "note_type",
         "note_date",
-        "extracted_age",
-        "extracted_bmi",
+        "Age_extracted",
+        "BMI_extracted",
+        # Optional: keep the exact pair used for matching
+        "Age_match",
+        "BMI_match",
     ]
 
-    with open(OUTPUT_FILE, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+    written = 0
+    with open(OUTPUT_CSV, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=out_fieldnames)
         writer.writeheader()
-        for m in matches:
-            writer.writerow(m)
 
-    print("Wrote {} matched rows → {}".format(len(matches), OUTPUT_FILE))
+        for key in overlap_keys:
+            age, bmi = key
+            g_list = gold_pairs.get(key, [])
+            e_list = ext_pairs.get(key, [])
+
+            for g in g_list:
+                pid = g.get(gold_pid_col, "")
+                g_age_raw = g.get(gold_age_col, "")
+                g_bmi_raw = g.get(gold_bmi_col, "")
+                for e in e_list:
+                    row_out = {
+                        "PatientID_gold": pid,
+                        "Age_gold": g_age_raw,
+                        "BMI_gold": g_bmi_raw,
+                        "note_id": e.get(note_id_col, ""),
+                        "note_type": e.get(note_type_col, ""),
+                        "note_date": e.get(note_date_col, ""),
+                        "Age_extracted": e.get("Age_DOS", ""),
+                        "BMI_extracted": e.get("BMI", ""),
+                        "Age_match": age,
+                        "BMI_match": bmi,
+                    }
+                    writer.writerow(row_out)
+                    written += 1
+
+    print("Wrote {} matched rows → {}".format(written, OUTPUT_CSV))
 
 
 if __name__ == "__main__":
