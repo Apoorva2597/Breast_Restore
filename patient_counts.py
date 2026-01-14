@@ -10,9 +10,9 @@ Reports:
 import csv
 
 # ===== EDIT THESE PATHS TO MATCH YOUR SYSTEM =====
-INPATIENT_CSV = "/home/apokol/my_data_Breast/HPI-11526/HPI11526/HPI11526 Inpatient Notes.csv"
-CLINIC_CSV    = "/home/apokol/my_data_Breast/HPI-11526/HPI11526/HPI11526 Clinic Notes.csv"
-OP_CSV        = "/home/apokol/my_data_Breast/HPI-11526/HPI11526/HPI11526 Operation Notes.csv"
+INPATIENT_CSV = "/home/apokol/my_data_Breast/HPI-11526/HPI11256/HPI11526 Inpatient Notes.csv"
+CLINIC_CSV    = "/home/apokol/my_data_Breast/HPI-11526/HPI11256/HPI11526 Clinic Notes.csv"
+OP_CSV        = "/home/apokol/my_data_Breast/HPI-11526/HPI11256/HPI11526 Operation Notes.csv"
 
 # Column name for the (encrypted) patient ID in those CSVs
 PATIENT_ID_COL = "ENCRYPTED_PAT_ID"
