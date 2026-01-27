@@ -27,36 +27,13 @@ for f in note_files:
 print("\nAll files found.\n")
 
 # --------------------------------------------------
-# LOAD AND STANDARDIZE
+# LOAD AND STANDARDIZE (CP1252 ENCODING)
 # --------------------------------------------------
 dfs = []
 
 for f in note_files:
     print("Loading:", f)
-    df = pd.read_csv(f)
+    df = pd.read_csv(f, encoding="cp1252")   # ← FIXED HERE
 
     df = df.rename(columns={
-        "ENCRYPTED_PAT_ID": "patient_id",
-        "NOTE_ID": "note_id",
-        "NOTE DATE OF SERVICE": "note_date",
-        "NOTE TYPE": "note_type",
-        "NOTE TEXT": "note_text"
-    })
-
-    df["source_file"] = os.path.basename(f)
-
-    dfs.append(df[["patient_id", "note_id", "note_date", "note_type", "note_text", "source_file"]])
-
-# --------------------------------------------------
-# COMBINE ALL NOTES
-# --------------------------------------------------
-all_notes = pd.concat(dfs, ignore_index=True)
-
-print("Total notes:", len(all_notes))
-print("Total unique patients:", all_notes["patient_id"].nunique())
-
-# --------------------------------------------------
-# SAVE MASTER PATIENT-NOTE INDEX
-# --------------------------------------------------
-all_notes.to_csv("patient_note_index.csv", index=False)
-print("\nSaved patient_note_index.csv")
+        "ENCRYPTED_PAT_ID":
