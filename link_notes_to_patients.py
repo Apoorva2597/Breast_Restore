@@ -1,17 +1,23 @@
 import pandas as pd
-from glob import glob
+import glob
+import os
 
-# Files containing notes
-note_files = [
-    "HPI11526 Clinic Notes.csv",
-    "HPI11526 Inpatient Notes.csv",
-    "HPI11526 Operation Notes.csv"
-]
+BASE_DIR = "my_data_Breast/HPI-11526/HPI11256"
+
+note_files = glob.glob(os.path.join(BASE_DIR, "*Notes*.csv"))
+
+# Keep only the note tables (not encounters)
+note_files = [f for f in note_files if ("Clinic Notes" in f or "Inpatient Notes" in f or "Operation Notes" in f)]
+
+if not note_files:
+    raise RuntimeError("No note CSV files found in {}".format(BASE_DIR))
+
+print("Using note files:")
+for f in note_files:
+    print(" -", f)
 
 dfs = []
-
 for f in note_files:
-    print("Loading:", f)
     df = pd.read_csv(f)
 
     df = df.rename(columns={
@@ -21,8 +27,7 @@ for f in note_files:
         "NOTE TYPE": "note_type",
         "NOTE TEXT": "note_text"
     })
-
-    df["source_file"] = f
+    df["source_file"] = os.path.basename(f)
 
     dfs.append(df[["patient_id", "note_id", "note_date", "note_type", "note_text", "source_file"]])
 
