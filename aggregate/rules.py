@@ -1,6 +1,6 @@
 from typing import Dict, List, Optional
-from ..models import Candidate, FinalField
-from ..config import STATUS_PRECEDENCE, NOTE_TYPE_PRECEDENCE, SECTION_PRECEDENCE, PHASE1_FIELDS
+from models import Candidate, FinalField
+from config import STATUS_PRECEDENCE, NOTE_TYPE_PRECEDENCE, SECTION_PRECEDENCE, PHASE1_FIELDS
 
 def _rank(value: str, order: List[str], default: int = 10_000) -> int:
     try:
