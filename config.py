@@ -144,3 +144,82 @@ CANCER_OTHER_POS = [
     r"\blymphoma\b",
     r"\bleukemia\b",
 ]
+
+# ------------------------------------------------------------
+# Aggregation precedence + field lists
+# Used by aggregate/rules.py
+# ------------------------------------------------------------
+
+# Lower index = higher priority
+STATUS_PRECEDENCE = [
+    "performed",
+    "measured",
+    "present",
+    "history",
+    "unknown",
+    "planned",
+    "negated",
+]
+
+# NOTE: these must match the note_type strings you feed into SectionedNote.note_type.
+# Put the most reliable note sources first.
+NOTE_TYPE_PRECEDENCE = [
+    "Operation Notes",
+    "Operative Note",
+    "OP NOTE",
+    "Operative Report",
+
+    "Inpatient Notes",
+    "Inpatient Progress Note",
+
+    "Clinic Notes",
+    "Clinic Note",
+    "Office Visit",
+]
+
+# Prefer sections that are typically high-signal for structured facts
+SECTION_PRECEDENCE = [
+    "OP NOTE",
+    "PROCEDURE",
+    "DETAILS OF OPERATION",
+    "PREOPERATIVE DIAGNOSIS",
+    "POSTOPERATIVE DIAGNOSIS",
+    "INDICATIONS FOR OPERATION",
+    "S/P PROCEDURES",
+    "ASSESSMENT/PLAN",
+    "DIAGNOSIS",
+    "PAST MEDICAL HISTORY",
+    "PAST SURGICAL HISTORY",
+    "MEDICATIONS",
+    "SOCIAL HISTORY",
+    "HPI",
+    "REVIEW OF SYSTEMS",
+    "PHYSICAL EXAM",
+    "__PREAMBLE__",
+]
+
+# Fields we expect to output in "Phase 1" patient-level file.
+# Start with what your extractors already cover in extractors/__init__.py.
+PHASE1_FIELDS = [
+    # Demographics
+    "Age",
+    "BMI",
+    "SmokingStatus",
+
+    # Comorbidities (adjust to match exact field names your comorbidities extractor emits)
+    "Diabetes",
+    "Hypertension",
+    "Obesity",
+    "CardiacDisease",
+    "VenousThromboembolism",
+    "Steroid",
+
+    # Reconstruction / lymph nodes (adjust to match exact emitted field names)
+    "Recon_Planned",
+    "Recon_Performed",
+    "Recon_Type",
+    "Recon_Laterality",
+    "Recon_Timing",
+    "Recon_Classification",
+    "LymphNodeMgmt_Performed",
+]
