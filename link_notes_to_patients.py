@@ -2,7 +2,7 @@ import pandas as pd
 import glob
 import os
 
-BASE_DIR = "my_data_Breast/HPI-11526/HPI11256"
+BASE_DIR = "/home/apoko/my_data_Breast/HPI-11526/HPI11256"
 
 note_files = glob.glob(os.path.join(BASE_DIR, "*Notes*.csv"))
 
