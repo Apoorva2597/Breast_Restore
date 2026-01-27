@@ -1,23 +1,38 @@
 import pandas as pd
-import glob
 import os
 
-BASE_DIR = "/home/apoko/my_data_Breast/HPI-11526/HPI11256"
+# --------------------------------------------------
+# BASE DIRECTORY (sibling of Breast_Restore)
+# --------------------------------------------------
+BASE_DIR = os.path.join("..", "my_data_Breast", "HPI-11526", "HPI11256")
 
-note_files = glob.glob(os.path.join(BASE_DIR, "*Notes*.csv"))
+# --------------------------------------------------
+# HARD-CODED NOTE FILES
+# --------------------------------------------------
+note_files = [
+    os.path.join(BASE_DIR, "HPI11526 Clinic Notes.csv"),
+    os.path.join(BASE_DIR, "HPI11526 Inpatient Notes.csv"),
+    os.path.join(BASE_DIR, "HPI11526 Operation Notes.csv"),
+]
 
-# Keep only the note tables (not encounters)
-note_files = [f for f in note_files if ("Clinic Notes" in f or "Inpatient Notes" in f or "Operation Notes" in f)]
-
-if not note_files:
-    raise RuntimeError("No note CSV files found in {}".format(BASE_DIR))
-
-print("Using note files:")
+# --------------------------------------------------
+# CHECK FILES EXIST
+# --------------------------------------------------
+print("Checking files...")
 for f in note_files:
-    print(" -", f)
+    print(" -", f, "exists?", os.path.exists(f))
+    if not os.path.exists(f):
+        raise RuntimeError("File not found: {}".format(f))
 
+print("\nAll files found.\n")
+
+# --------------------------------------------------
+# LOAD AND STANDARDIZE
+# --------------------------------------------------
 dfs = []
+
 for f in note_files:
+    print("Loading:", f)
     df = pd.read_csv(f)
 
     df = df.rename(columns={
@@ -27,14 +42,21 @@ for f in note_files:
         "NOTE TYPE": "note_type",
         "NOTE TEXT": "note_text"
     })
+
     df["source_file"] = os.path.basename(f)
 
     dfs.append(df[["patient_id", "note_id", "note_date", "note_type", "note_text", "source_file"]])
 
+# --------------------------------------------------
+# COMBINE ALL NOTES
+# --------------------------------------------------
 all_notes = pd.concat(dfs, ignore_index=True)
 
 print("Total notes:", len(all_notes))
-print("Total patients:", all_notes["patient_id"].nunique())
+print("Total unique patients:", all_notes["patient_id"].nunique())
 
+# --------------------------------------------------
+# SAVE MASTER PATIENT-NOTE INDEX
+# --------------------------------------------------
 all_notes.to_csv("patient_note_index.csv", index=False)
-print("Saved patient_note_index.csv")
+print("\nSaved patient_note_index.csv")
