@@ -163,19 +163,14 @@ STATUS_PRECEDENCE = [
 ]
 
 # NOTE: these must match the note_type strings you feed into SectionedNote.note_type.
-# Put the most reliable note sources first.
+# In your current pipeline, note_type_norms look like:
+#   "progress notes", "h&p", "op note", "brief op notes"
+# So we set precedence to those normalized values (lowercase).
 NOTE_TYPE_PRECEDENCE = [
-    "Operation Notes",
-    "Operative Note",
-    "OP NOTE",
-    "Operative Report",
-
-    "Inpatient Notes",
-    "Inpatient Progress Note",
-
-    "Clinic Notes",
-    "Clinic Note",
-    "Office Visit",
+    "op note",
+    "brief op notes",
+    "h&p",
+    "progress notes",
 ]
 
 # Prefer sections that are typically high-signal for structured facts
@@ -200,7 +195,6 @@ SECTION_PRECEDENCE = [
 ]
 
 # Fields we expect to output in "Phase 1" patient-level file.
-# Start with what your extractors already cover in extractors/__init__.py.
 PHASE1_FIELDS = [
     "Age",
     "BMI",
@@ -226,7 +220,9 @@ PHASE1_FIELDS = [
     "Mastectomy_Type",
     "Mastectomy_Performed",
 
+    # Updated LN outputs (we want both a yes/no and a type)
     "LymphNodeMgmt_Performed",
+    "LymphNodeMgmt_Type",
 
     "Radiation",
     "Chemo"
