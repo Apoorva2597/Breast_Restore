@@ -227,4 +227,7 @@ PHASE1_FIELDS = [
     "Mastectomy_Performed",
 
     "LymphNodeMgmt_Performed",
+
+    "Radiation",
+    "Chemo"
 ]
