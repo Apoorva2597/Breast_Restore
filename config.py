@@ -226,6 +226,11 @@ PHASE1_FIELDS = [
 
     "Radiation",
     "Chemo"
+
+    "Stage1_Reoperation",
+"Stage1_Rehospitalization",
+"Stage1_Failure",
+
 ]
 
 # ------------------------------------------------------------
