@@ -54,6 +54,18 @@ CHEMO_POS = [
 
     # TC regimen
     r"\bTC\b",
+
+    # TCH / TCHP regimen shorthand
+    r"\bTCH\b",
+    r"\bTCHP\b",
+
+    # Common regimen components & brand names
+    r"\btaxotere\b",      # docetaxel brand
+    r"\bherceptin\b",     # trastuzumab brand
+    r"\btrastuzumab\b",
+    r"\bperjeta\b",       # pertuzumab brand
+    r"\bpertuzumab\b",
+
 ]
 
 # Endocrine therapy is NOT chemotherapy (per your spec)
