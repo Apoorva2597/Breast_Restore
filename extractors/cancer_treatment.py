@@ -29,17 +29,30 @@ RADIATION_POS = [
 CHEMO_POS = [
     r"\bchemotherapy\b",
     r"\bchemo\b",
-    r"\btaxol\b",
-    r"\bpaclitaxel\b",
-    r"\bdocetaxel\b",
+
+    # AC family
+    r"\bAC\b",
+    r"\badriamycin\s*/\s*cyclophosphamide\b",
+    r"\badriamycin\s+\+\s+cyclophosphamide\b",
+    r"\bdoxorubicin\s*/\s*cyclophosphamide\b",
+    r"\bdoxorubicin\s+\+\s+cyclophosphamide\b",
+
+    # individual agents
     r"\badriamycin\b",
     r"\bdoxorubicin\b",
     r"\bcyclophosphamide\b",
     r"\bcytoxan\b",
+
+    # taxanes
+    r"\btaxol\b",
+    r"\bpaclitaxel\b",
+    r"\bdocetaxel\b",
+
+    # platinum
     r"\bcarboplatin\b",
     r"\bcisplatin\b",
-    # Short regimens are risky; keep them, but filtered by consideration/NA rules below
-    r"\bAC\b",
+
+    # TC regimen
     r"\bTC\b",
 ]
 
