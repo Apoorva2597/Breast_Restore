@@ -231,3 +231,55 @@ PHASE1_FIELDS = [
     "Radiation",
     "Chemo"
 ]
+
+# ------------------------------------------------------------
+# Cancer treatment QA / filtering (Chemo, Radiation)
+# ------------------------------------------------------------
+
+# Common “plan/consider” language that should NOT count as received therapy
+TREATMENT_CONSIDERATION_EXCLUDE = [
+    r"\bcandidate for\b",
+    r"\bconsider(ing|ed)?\b",
+    r"\bdiscuss(ed|ing)?\b",
+    r"\bdetermin(e|ed|ing)\b",
+    r"\bif\b.*\bnecessary\b",
+    r"\bmay\b",
+    r"\bcould\b",
+    r"\bpossible\b",
+    r"\bplan(ned)?\b",
+    r"\bwill\b",
+    r"\bscheduled\b",
+    r"\bto start\b",
+    r"\bto receive\b",
+]
+
+# Template-style “n/a” lines
+TREATMENT_NA_EXCLUDE = [
+    r"\bchemo\b\s*[-:]\s*n/?a\b",
+    r"\bradiation\b\s*[-:]\s*n/?a\b",
+    r"\bchemotherapy\b\s*[-:]\s*n/?a\b",
+]
+
+# Radiation sometimes appears in non-treatment contexts (genetics/syndromes)
+RADIATION_CONTEXT_EXCLUDE = [
+    r"\bradiation sensitivity\b",
+    r"\bsensitivity to radiation\b",
+    r"\bradiation syndrome\b",
+    r"\bfeatures of this syndrome\b",
+    r"\bmicrocephaly\b",
+    r"\bataxia\b",
+    r"\bdevelopmental\b",
+]
+
+# Mention of other primary cancers (flag for QA rather than exclude)
+NON_BREAST_CANCER_CUES = [
+    r"\bendometrial\b",
+    r"\buterine\b",
+    r"\bovarian\b",
+    r"\bcolon\b",
+    r"\blung\b",
+    r"\bprostate\b",
+    r"\bmelanoma\b",
+    r"\blymphoma\b",
+    r"\bleukemia\b",
+]
