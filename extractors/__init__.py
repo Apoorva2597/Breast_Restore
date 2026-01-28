@@ -11,6 +11,7 @@ from .pbs import extract_pbs
 from .mastectomy import extract_mastectomy
 from .age import extract_age
 from .cancer_treatment import extract_cancer_treatment
+from .complications import extract_stage1_outcomes
 
 
 
@@ -34,5 +35,6 @@ def extract_all(sec: SectionedNote) -> List[Candidate]:
     cands.extend(extract_pbs(sec))
     cands.extend(extract_mastectomy(sec))
     cands.extend(extract_cancer_treatment(sec))
+    cands.extend(extract_stage1_outcomes(sec))
 
     return cands
