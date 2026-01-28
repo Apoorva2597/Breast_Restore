@@ -1,6 +1,6 @@
 import pandas as pd
 
-from sectionizer import sectionize
+from normalize.sectionizer import sectionize
 from models import SectionedNote
 from extractors import extract_all
 from aggregate.rules import aggregate_patient
