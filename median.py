@@ -1,3 +1,4 @@
 import pandas as pd
-df = pd.read_csv("patient_note_index.csv", encoding="utf-8", engine="python")
-print(sorted(df["note_type"].dropna().unique()))
+df = pd.read_csv("evidence_log_phase1_p50.csv", encoding="utf-8", engine="python")
+print("Distinct extracted fields:")
+print(sorted(df["field"].dropna().unique().tolist()))
