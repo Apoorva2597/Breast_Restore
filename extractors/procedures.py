@@ -137,16 +137,39 @@ def extract_reconstruction(note: SectionedNote) -> List[Candidate]:
 
 def extract_lymph_node_mgmt(note: SectionedNote) -> List[Candidate]:
     cands = []  # type: List[Candidate]
+
     patterns = [
-        (r"\bsentinel\s+lymph\s+node\b|\bsln\b|\bslnb\b", "SLNB"),
-        (r"\baxillary\s+lymph\s+node\s+dissection\b|\balnd\b", "ALND"),
-        (r"\binternal\s+mammary\s+lymph\s+node\b", "InternalMammaryLN"),
+        # SLNB variants
+        (r"\bsentinel\s+(lymph\s+)?node\b|\bsln\b|\bslnb\b|\bsln\s+biops(y|ies)\b|\bsentinel\s+node\s+biops(y|ies)\b", "SLNB"),
+
+        # ALND variants
+        (r"\baxillary\s+(lymph\s+node\s+)?dissection\b|\balnd\b|\baxillary\s+dissection\b", "ALND"),
+
+        # Internal mammary
+        (r"\binternal\s+mammary\s+(lymph\s+)?node\b", "InternalMammaryLN"),
     ]
+
+    # Clinical/imaging “nodes” ≠ nodal surgery
+    NON_SURGICAL_NODE_EXCLUDE = [
+        r"\bno\b.*\b(lymphadenopathy|adenopathy)\b",
+        r"\bno\b.*\baxillary\b.*\b(adenopathy|nodes?)\b",
+        r"\bnegative\b.*\baxillary\b.*\bnodes?\b",
+        r"\bpalpable\b.*\bnode\b",
+    ]
+
     for section, text in note.sections.items():
         t = text.lower()
+
         for pat, val in patterns:
             m = re.search(pat, t, re.IGNORECASE)
             if not m:
+                continue
+
+            evid = window_around(text, m.start(), m.end(), 140)
+            evid_lower = evid.lower()
+
+            # Skip non-surgical mentions (PE/imaging)
+            if any(re.search(x, evid_lower) for x in NON_SURGICAL_NODE_EXCLUDE):
                 continue
 
             status = classify_status(
@@ -154,27 +177,53 @@ def extract_lymph_node_mgmt(note: SectionedNote) -> List[Candidate]:
                 PERFORMED_CUES, PLANNED_CUES, NEGATION_CUES
             )
 
-            # Operative note default: if mentioned and not negated/planned, treat as performed
-            if note.note_type == "op_note" and status not in {"denied", "planned"}:
+            # Operative note default
+            if note.note_type in {"op_note", "brief_op_note"} and status not in {"denied", "planned"}:
                 status = "performed"
 
-            # Non-op note: performed language often indicates planned (consult note)
-            if note.note_type != "op_note" and status == "performed":
-                status = "planned"
+            # Non-op: only downgrade "performed" if there's explicit future intent
+            if note.note_type not in {"op_note", "brief_op_note"} and status == "performed":
+                if any(re.search(p, evid_lower) for p in PLANNED_CUES):
+                    status = "planned"
+                else:
+                    status = "history"
+
+            # Boolean performed flag
+            if status == "denied":
+                performed_val = False
+            else:
+                performed_val = True
 
             cands.append(Candidate(
-                field="LymphNodeMgmt",
-                value=val,
+                field="LymphNodeMgmt_Performed",
+                value=performed_val,
                 status=status,
-                evidence=window_around(text, m.start(), m.end(), 140),
+                evidence=evid,
                 section=section,
                 note_type=note.note_type,
                 note_id=note.note_id,
                 note_date=note.note_date,
-                confidence=0.8 if note.note_type == "op_note" else 0.55
+                confidence=0.85 if note.note_type in {"op_note", "brief_op_note"} else 0.65
             ))
+
+            # Type field only if not denied
+            if status != "denied":
+                cands.append(Candidate(
+                    field="LymphNodeMgmt_Type",
+                    value=val,
+                    status=status,
+                    evidence=evid,
+                    section=section,
+                    note_type=note.note_type,
+                    note_id=note.note_id,
+                    note_date=note.note_date,
+                    confidence=0.85 if note.note_type in {"op_note", "brief_op_note"} else 0.65
+                ))
+
             break
+
     return cands
+
 
 
 # ---------------------------------------------------------
