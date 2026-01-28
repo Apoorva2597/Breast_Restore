@@ -23,9 +23,16 @@ RADIATION_POS = [
 CHEMO_POS = [
     r"\bchemotherapy\b",
     r"\bchemo\b",
-    r"\bneoadjuvant\s+chemo\b",
-    r"\badjuvant\s+chemo\b",
-    r"\bchemo\s+therapy\b",
+    r"\btaxol\b",
+    r"\bpaclitaxel\b",
+    r"\bdocetaxel\b",
+    r"\badriamycin\b",
+    r"\bdoxorubicin\b",
+    r"\bcyclophosphamide\b",
+    r"\bcarboplatin\b",
+    r"\bcisplatin\b",
+    r"\bAC\b",   # regimen
+    r"\bTC\b",   # regimen
 ]
 
 # Endocrine therapy is NOT chemotherapy (per your spec)
