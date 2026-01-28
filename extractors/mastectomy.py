@@ -53,7 +53,7 @@ def extract_mastectomy(note: SectionedNote) -> List[Candidate]:
             )
 
             # op-note default
-            if note.note_type == "op_note" and status not in {"denied", "planned"}:
+            if note.note_type in {"OP NOTE", "BRIEF OP NOTES"} and status not in {"denied", "planned"}:
                 status = "performed"
 
             # Laterality
