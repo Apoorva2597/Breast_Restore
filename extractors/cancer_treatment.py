@@ -3,6 +3,12 @@ from typing import List
 
 from models import Candidate, SectionedNote
 from config import NEGATION_CUES, PLANNED_CUES, PERFORMED_CUES
+from config import (
+    TREATMENT_CONSIDERATION_EXCLUDE,
+    TREATMENT_NA_EXCLUDE,
+    RADIATION_CONTEXT_EXCLUDE,
+    NON_BREAST_CANCER_CUES,
+)
 from .utils import window_around, classify_status, find_first, should_skip_block
 
 # ----------------------------
@@ -13,12 +19,12 @@ RADIATION_POS = [
     r"\bradiation\s+therapy\b",
     r"\bradiotherapy\b",
     r"\bxrt\b",
-    r"\bRT\b",  # beware: also "RT breast" etc. We'll validate via evidence review
-    r"\bPMRT\b",  # post-mastectomy RT (still indicates radiation history)
+    # r"\bRT\b",   # too ambiguous (respiratory therapy / right); leave out for now
+    r"\bPMRT\b",
 ]
 
 # ----------------------------
-# Chemo patterns (include regimen words later after grep pass)
+# Chemo patterns
 # ----------------------------
 CHEMO_POS = [
     r"\bchemotherapy\b",
@@ -31,8 +37,9 @@ CHEMO_POS = [
     r"\bcyclophosphamide\b",
     r"\bcarboplatin\b",
     r"\bcisplatin\b",
-    r"\bAC\b",   # regimen
-    r"\bTC\b",   # regimen
+    # Short regimens are risky; keep them, but filtered by consideration/NA rules below
+    r"\bAC\b",
+    r"\bTC\b",
 ]
 
 # Endocrine therapy is NOT chemotherapy (per your spec)
@@ -46,6 +53,13 @@ ENDOCRINE_EXCLUDE = [
     r"\bfemara\b",
     r"\baromasin\b",
 ]
+
+def _has_any(patterns, text_lower):
+    for p in patterns:
+        if re.search(p, text_lower, re.IGNORECASE):
+            return True
+    return False
+
 
 def _extract_flag(field, pos_patterns, note, exclude_patterns=None):
     cands = []  # type: List[Candidate]
@@ -62,13 +76,26 @@ def _extract_flag(field, pos_patterns, note, exclude_patterns=None):
         if should_skip_block(section, evid):
             continue
 
-        # endocrine exclusion for chemo: if the only signal is endocrine meds, suppress
         evid_lower = evid.lower()
-        if exclude_patterns:
-            # If endocrine words present AND no "chemo/chemotherapy" anchor besides them, suppress.
-            # (Keeps it conservative for your study definition.)
-            if any(re.search(pat, evid_lower) for pat in exclude_patterns):
-                # If chemo anchor not present strongly, skip
+
+        # Suppress template-like "Chemo: n/a" / "Radiation: n/a"
+        if _has_any(TREATMENT_NA_EXCLUDE, evid_lower):
+            continue
+
+        # Suppress “consideration/planning” statements (for now we only want received therapy)
+        # This directly fixes: "Systemic chemo - Candidate..." / "determine if chemo..."
+        if _has_any(TREATMENT_CONSIDERATION_EXCLUDE, evid_lower):
+            continue
+
+        # Radiation-specific non-treatment context (e.g., syndromes)
+        if field == "Radiation":
+            if _has_any(RADIATION_CONTEXT_EXCLUDE, evid_lower):
+                continue
+
+        # endocrine exclusion for chemo: don't infer chemo from endocrine therapy language
+        if field == "Chemo":
+            if _has_any(ENDOCRINE_EXCLUDE, evid_lower):
+                # allow if explicit chemo word is present too (mixed sentence)
                 if not re.search(r"\bchemo\b|\bchemotherapy\b", evid_lower):
                     continue
 
@@ -89,6 +116,20 @@ def _extract_flag(field, pos_patterns, note, exclude_patterns=None):
             note_date=note.note_date,
             confidence=0.75
         ))
+
+        # QA flag: possible non-breast cancer indication (do not exclude yet)
+        if value and _has_any(NON_BREAST_CANCER_CUES, evid_lower):
+            cands.append(Candidate(
+                field=field + "_NonBreastContext",
+                value=True,
+                status=status,
+                evidence=evid,
+                section=section,
+                note_type=note.note_type,
+                note_id=note.note_id,
+                note_date=note.note_date,
+                confidence=0.60
+            ))
 
     return cands
 
