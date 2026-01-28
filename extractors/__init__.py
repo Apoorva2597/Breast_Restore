@@ -9,7 +9,9 @@ from .comorbidities import extract_comorbidities
 from .procedures import extract_reconstruction, extract_lymph_node_mgmt
 from .pbs import extract_pbs
 from .mastectomy import extract_mastectomy
-from .age import extract_age   # ← NEW
+from .age import extract_age
+from .cancer_treatment import extract_cancer_treatment
+
 
 
 def extract_all(sec: SectionedNote) -> List[Candidate]:
@@ -31,5 +33,6 @@ def extract_all(sec: SectionedNote) -> List[Candidate]:
     # Tier 2
     cands.extend(extract_pbs(sec))
     cands.extend(extract_mastectomy(sec))
+    cands.extend(extract_cancer_treatment(sec))
 
     return cands
