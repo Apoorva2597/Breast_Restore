@@ -158,6 +158,7 @@ STATUS_PRECEDENCE = [
     "history",
     "unknown",
     "planned",
+    "denied",
     "negated",
 ]
 
