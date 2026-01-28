@@ -35,6 +35,7 @@ CHEMO_POS = [
     r"\badriamycin\b",
     r"\bdoxorubicin\b",
     r"\bcyclophosphamide\b",
+    r"\bcytoxan\b",
     r"\bcarboplatin\b",
     r"\bcisplatin\b",
     # Short regimens are risky; keep them, but filtered by consideration/NA rules below
