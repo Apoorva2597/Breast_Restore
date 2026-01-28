@@ -201,25 +201,29 @@ SECTION_PRECEDENCE = [
 # Fields we expect to output in "Phase 1" patient-level file.
 # Start with what your extractors already cover in extractors/__init__.py.
 PHASE1_FIELDS = [
-    # Demographics
     "Age",
     "BMI",
     "SmokingStatus",
 
-    # Comorbidities (adjust to match exact field names your comorbidities extractor emits)
-    "Diabetes",
+    "DiabetesMellitus",
     "Hypertension",
-    "Obesity",
     "CardiacDisease",
-    "VenousThromboembolism",
-    "Steroid",
+    "VTE",
+    "SteroidUse",
+    "CancerHistoryOther",
 
-    # Reconstruction / lymph nodes (adjust to match exact emitted field names)
-    "Recon_Planned",
     "Recon_Performed",
     "Recon_Type",
     "Recon_Laterality",
     "Recon_Timing",
     "Recon_Classification",
+
+    "PBS_Lumpectomy",
+    "PBS_Other",
+
+    "Mastectomy_Laterality",
+    "Mastectomy_Type",
+    "Mastectomy_Performed",
+
     "LymphNodeMgmt_Performed",
 ]
