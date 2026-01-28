@@ -7,7 +7,7 @@ def read_csv_safely(path):
         return pd.read_csv(path, encoding="cp1252", engine="python")
 
 def main():
-    base = read_csv_safely("patient_level_phase1_p50_plus_demo.csv")
+    base = read_csv_safely("patient_level_phase1_p50.csv")
     recon = read_csv_safely("patient_recon_structured.csv")
 
     out = base.merge(recon, on="patient_id", how="left")
