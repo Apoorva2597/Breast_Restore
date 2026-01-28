@@ -1,52 +1,45 @@
-import re
 import pandas as pd
 
 FILE = "evidence_log_phase1_p50.csv"
 
-print("Loading evidence file...")
-df = pd.read_csv(FILE, encoding="utf-8", engine="python")
+def read_csv_safely(path):
+    try:
+        return pd.read_csv(path, encoding="utf-8", engine="python")
+    except UnicodeDecodeError:
+        return pd.read_csv(path, encoding="cp1252", engine="python")
 
-# Combine all evidence text
-texts = df["evidence"].dropna().astype(str).str.lower()
+def main():
+    df = read_csv_safely(FILE)
+    df["evidence"] = df["evidence"].fillna("").astype(str)
+    df["section"] = df["section"].fillna("").astype(str)
 
-print("Total evidence rows:", len(texts))
+    treat = df[df["field"].isin(["Chemo", "Radiation"])].copy()
+    print("Total treatment evidence rows:", len(treat))
 
-# ---------------------------------------
-# TERMS WE ALREADY COVER
-# ---------------------------------------
-base_patterns = [
-    "radiation", "radiotherapy", "xrt", "pmrt",
-    "chemo", "chemotherapy"
-]
+    # (1) Quick sample for human review
+    print("\n=== SAMPLE (10 Chemo + 10 Radiation) ===")
+    for f in ["Chemo", "Radiation"]:
+        sub = treat[treat["field"] == f].head(10)
+        print("\n--", f, "sample rows:", len(sub))
+        for i, row in sub.iterrows():
+            ev = row["evidence"].replace("\n", " ")
+            print("section=", row.get("section", ""), "| note_type=", row.get("note_type", ""), "|", ev[:200])
 
-# ---------------------------------------
-# POSSIBLE ADDITIONAL TERMS TO DISCOVER
-# (regimens, drug names, abbreviations)
-# ---------------------------------------
-candidate_patterns = [
-    "taxol", "paclitaxel", "docetaxel",
-    "adriamycin", "doxorubicin",
-    "cyclophosphamide", "carboplatin", "cisplatin",
-    "ac ", "tc ", "tch", "ddac",
-    "trastuzumab", "herceptin",
-    "pertuzumab", "perjeta",
-    "capecitabine", "xeloda",
-    "femara", "arimidex", "tamoxifen",  # to confirm endocrine appears
-]
+    # (2) Endocrine exclusion check
+    tam = treat[treat["evidence"].str.lower().str.contains("tamoxifen")]
+    print("\nTamoxifen present in treatment-labeled evidence rows:", len(tam))
+    if len(tam) > 0:
+        print("WARNING: tamoxifen appears inside Chemo/Radiation-labeled evidence. Review below:")
+        print(tam[["field","status","section","note_type","evidence"]].head(5).to_string(index=False))
 
-def search_patterns(patterns, label):
-    print("\n=== Checking:", label, "===")
-    for pat in patterns:
-        rx = re.compile(r"\b" + re.escape(pat.strip()) + r"\b", re.IGNORECASE)
-        matches = texts[texts.str.contains(rx)]
-        if len(matches) > 0:
-            print("\nTerm:", pat, "| hits:", len(matches))
-            print(matches.head(3).to_string(index=False))
+    # (3) Section suppression check
+    bad_sections = treat[treat["section"].str.upper().isin(["FAMILY HISTORY", "ALLERGIES"])]
+    print("\nTreatment hits from FAMILY HISTORY / ALLERGIES:", len(bad_sections))
+    if len(bad_sections) > 0:
+        print("WARNING: treatment extracted from suppressed sections. Review below:")
+        print(bad_sections[["field","status","section","note_type","evidence"]].head(5).to_string(index=False))
 
-# 1️⃣ What we already detect
-search_patterns(base_patterns, "BASE TREATMENT TERMS")
+    print("\nDone.")
 
-# 2️⃣ What might exist but we don't yet capture
-search_patterns(candidate_patterns, "POTENTIAL NEW TERMS")
-
-print("\nDone.")
+if __name__ == "__main__":
+    main()
