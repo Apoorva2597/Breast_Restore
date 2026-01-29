@@ -28,7 +28,7 @@ import pandas as pd
 # -----------------------
 # CONFIG
 # -----------------------
-INPUT_CSV = "HPI11526 Operation Encounters.csv"  
+INPUT_CSV = "/home/apokol/my_data_Breast/HPI-11526/HPI11256/HPI11526 Operation Encounters.csv" 
 TOP_N_PRINT = 40
 
 OUT_PROCEDURE = "qa_op_enc_procedure_counts.csv"
