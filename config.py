@@ -220,17 +220,26 @@ PHASE1_FIELDS = [
     "Mastectomy_Type",
     "Mastectomy_Performed",
 
-    # Updated LN outputs (we want both a yes/no and a type)
     "LymphNodeMgmt_Performed",
     "LymphNodeMgmt_Type",
 
     "Radiation",
-    "Chemo"
+    "Chemo",
+]
 
+OUTCOME_FIELDS = [
+    "Stage1_MinorComp",
     "Stage1_Reoperation",
-"Stage1_Rehospitalization",
-"Stage1_Failure",
-
+    "Stage1_Rehospitalization",
+    "Stage1_MajorComp",
+    "Stage1_Failure",
+    "Stage1_Revision",
+    "Stage2_MinorComp",
+    "Stage2_Reoperation",
+    "Stage2_Rehospitalization",
+    "Stage2_MajorComp",
+    "Stage2_Failure",
+    "Stage2_Revision",
 ]
 
 # ------------------------------------------------------------
