@@ -1,59 +1,72 @@
+# extract_unique_procedures.py
+# Python 3.6 compatible
+# PURPOSE: Explore procedure vocabulary for staging logic
+
 import pandas as pd
+import re
 
-EVIDENCE_FILE = "evidence_log_phase1_p50.csv"
+FILE_PATH = "/home/apokol/my_data_Breast/HPI-11526/HPI11256/HPI11526 Operation Encounters.csv"
 
-FIELDS = [
-    "Stage1_Reoperation",
-    "Stage1_Rehospitalization",
-    "Stage1_Failure"
-]
-
+def normalize_proc(text):
+    if pd.isnull(text):
+        return ""
+    t = text.lower().strip()
+    t = re.sub(r"\s+", " ", t)
+    return t
 
 def main():
-    print("Loading evidence log...")
-    df = pd.read_csv(EVIDENCE_FILE)
+    print("Reading file...")
+    try:
+        df = pd.read_csv(FILE_PATH, encoding="utf-8", engine="python")
+    except UnicodeDecodeError:
+        df = pd.read_csv(FILE_PATH, encoding="cp1252", engine="python")
 
-    df = df[df["field"].isin(FIELDS)]
+    required_cols = ["ENCRYPTED_PAT_ID", "OPERATION_DATE", "PROCEDURE"]
+    for c in required_cols:
+        if c not in df.columns:
+            raise RuntimeError("Missing column: {}".format(c))
 
-    if df.empty:
-        print("No Stage1 outcome rows found in evidence log.")
-        return
+    print("Rows:", df.shape[0])
 
-    print("\nTotal evidence rows (Stage1 outcomes):", df.shape[0])
+    df["proc_norm"] = df["PROCEDURE"].apply(normalize_proc)
 
-    for field in FIELDS:
-        sub = df[df["field"] == field]
+    # Count unique procedure names
+    proc_counts = (
+        df.groupby("proc_norm")
+        .size()
+        .reset_index(name="encounter_rows")
+        .sort_values("encounter_rows", ascending=False)
+    )
 
-        print("\n==============================")
-        print("FIELD:", field)
-        print("==============================")
+    print("\n=== TOP 30 PROCEDURE NAMES ===")
+    print(proc_counts.head(30).to_string(index=False))
 
-        if sub.empty:
-            print("No rows.")
-            continue
+    # Focus on likely Stage 2 / revision-related words
+    keywords = [
+        "revision",
+        "exchange",
+        "expander",
+        "implant",
+        "flap",
+        "takeback",
+        "removal",
+        "explant",
+        "re-exploration",
+        "washout"
+    ]
 
-        # Status distribution
-        print("\nStatus distribution:")
-        print(sub["status"].value_counts())
+    mask = df["proc_norm"].str.contains("|".join(keywords), regex=True)
+    subset = df[mask]["proc_norm"].value_counts().reset_index()
+    subset.columns = ["proc_norm", "count"]
 
-        # Count by note type
-        print("\nNote type distribution:")
-        print(sub["note_type"].value_counts())
+    print("\n=== PROCEDURES WITH STAGING-RELEVANT WORDS ===")
+    print(subset.head(40).to_string(index=False))
 
-        # Show sample evidence lines
-        print("\n--- Sample evidence (first 5) ---")
-        samples = sub.head(5)
-        for i, row in samples.iterrows():
-            print("\nPatient:", row["patient_id"])
-            print("Status:", row["status"])
-            print("Note type:", row["note_type"])
-            print("Section:", row["section"])
-            print("Evidence:")
-            print(row["evidence"])
-            print("-" * 60)
+    # Save full list for review
+    proc_counts.to_csv("qa_unique_procedures.csv", index=False)
+    print("\nSaved: qa_unique_procedures.csv")
 
     print("\nDone.")
-
 
 if __name__ == "__main__":
     main()
