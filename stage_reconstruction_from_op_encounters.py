@@ -12,11 +12,11 @@
 # - IMPORTANT (based on your observed OP encounter procedure strings):
 #     "tissue expandr placmnt in breast reconst inc subseq expansions"
 #   is a billing-style description that typically refers to the *initial TE placement*
-#   (it often includes the plan for subsequent expansions). We should treat it as Stage 1.
+#   (it often includes the plan for subsequent expansions). We treat it as Stage 1.
 #
 # Outputs:
-#   1) patient_recon_staging.csv  (patient-level staging)
-#   2) qa_recon_staging_summary.txt (quick QA counts)
+#   1) patient_recon_staging.csv        (patient-level staging)
+#   2) qa_recon_staging_summary.txt     (quick QA counts)
 
 import re
 import sys
@@ -43,22 +43,22 @@ COL_ALT_DATE = "DISCHARGE_DATE_DT"
 # Regex patterns on PROCEDURE text (normalized)
 # -------------------------
 PAT = {
-    # oncologic (not used for recon staging directly; QA only)
+    # oncologic (QA only)
     "MASTECTOMY": re.compile(r"\bmastectomy\b", re.I),
 
     # ---- Expander signals ----
-    # Many systems use abbreviations: expandr / plcmnt / placmnt / implnt, etc.
-    # We treat these as Stage 1 expander placement.
+    # TE placement in your feed uses abbreviations (expandr/placmnt/plcmnt/implnt).
+    # Treat as Stage 1 expander placement.
     "EXPANDER_PLACEMENT": re.compile(
         r"\b(tissue\s*expander|tissue\s*expand|tiss\s*expand|expandr|expander)\b"
-        r".{0,80}\b(plac(e|m)(ent|mnt|mt)|plcmnt|placmnt|placement|insert(ion)?|impla?n?t)\b"
+        r".{0,80}\b(plac(e|m)(ent|mnt|mt)|plcmnt|placmnt|placement|insert(ion)?|impla?n?t|implnt)\b"
         r"|"
-        r"\b(plac(e|m)(ent|mnt|mt)|plcmnt|placmnt|placement|insert(ion)?|impla?n?t)\b"
+        r"\b(plac(e|m)(ent|mnt|mt)|plcmnt|placmnt|placement|insert(ion)?|impla?n?t|implnt)\b"
         r".{0,80}\b(tissue\s*expander|tissue\s*expand|tiss\s*expand|expandr|expander)\b",
         re.I
     ),
 
-    # QA-only flag: the phrase "subseq expansions" shows up inside the Stage 1 description a lot
+    # QA-only: "subseq expansions" appears inside the Stage 1 TE placement description in your feed
     "EXPANDER_INCLUDES_SUBSEQ_EXPANSIONS": re.compile(
         r"\bsubseq(uent)?\b.{0,40}\bexpansions?\b|\binc\b.{0,20}\bsubseq\b.{0,40}\bexpansions?\b",
         re.I
@@ -66,27 +66,31 @@ PAT = {
 
     # ---- Implant signals ----
     "IMPLANT_IMMEDIATE": re.compile(
-        r"\binsertion\b.*\bimplant\b.*\bsame\s+day\b.*\bmastectomy\b|"
-        r"\bimplant\b.*\bsame\s+day\b.*\bmastectomy\b|"
-        r"\bimmediate\b.*\bimplant\b",
+        r"\binsertion\b.*\b(implant|implnt)\b.*\bsame\s+day\b.*\bmastectomy\b|"
+        r"\b(implant|implnt)\b.*\bsame\s+day\b.*\bmastectomy\b|"
+        r"\bimmediate\b.*\b(implant|implnt)\b",
         re.I
     ),
 
     # Stage 2 / delayed implant:
+    # Your feed includes "insert or replcmnt breast implnt on sep day from mastectomy"
     "IMPLANT_SEP_DAY": re.compile(
-        r"\bimplant\b.*\bsep(arate)?\s+day\b|"
-        r"\bsep\s+day\b.*\bimplant\b|"
-        r"\bon\s+sep(arate)?\s+day\b.*\bimplant\b|"
-        r"\bdelayed\b.*\bimplant\b",
+        r"\b(implant|implnt)\b.*\bsep(arate)?\s+day\b|"
+        r"\bsep\s+day\b.*\b(implant|implnt)\b|"
+        r"\bon\s+sep(arate)?\s+day\b.*\b(implant|implnt)\b|"
+        r"\bdelayed\b.*\b(implant|implnt)\b",
         re.I
     ),
 
-    # Exchange language (higher specificity for Stage 2 when expander pathway exists)
+    # Exchange / replacement language (Stage 2-ish when expander pathway exists)
+    # Includes common abbreviations: replcmnt
     "EXCHANGE_OR_REPLACEMENT": re.compile(
-        r"\bexchange\b.*\b(implant|expander)\b|"
-        r"\b(implant|expander)\b.*\bexchange\b|"
-        r"\bremove(d)?\b.*\b(tissue\s*expander|expander)\b.*\bimplant\b|"
-        r"\bexpander\b.*\bexchange\b.*\bimplant\b",
+        r"\bexchange\b.*\b(implant|implnt|expander|expandr)\b|"
+        r"\b(implant|implnt|expander|expandr)\b.*\bexchange\b|"
+        r"\brepl(a)?cmnt\b.*\b(implant|implnt)\b|"
+        r"\b(implant|implnt)\b.*\brepl(a)?cmnt\b|"
+        r"\bremove(d)?\b.*\b(tissue\s*expander|expander|expandr)\b.*\b(implant|implnt)\b|"
+        r"\bexplant\b.*\b(tissue\s*expander|expander|expandr)\b.*\b(implant|implnt)\b",
         re.I
     ),
 
@@ -117,10 +121,17 @@ def read_csv_fallback(path):
 
 
 def norm_text(x):
+    """
+    Normalize procedure text for regex stability.
+
+    CRITICAL: Replace underscores with spaces so \b word-boundary patterns match
+    tokens like 'expansions_rvw' -> 'expansions rvw'.
+    """
     if x is None:
         return ""
     s = str(x)
     s = s.replace("\n", " ").replace("\r", " ")
+    s = s.replace("_", " ")
     s = re.sub(r"\s+", " ", s)
     return s.strip()
 
@@ -144,7 +155,6 @@ def classify_row(proc_text, cpt_code):
     # Stage 1: expander placement
     if PAT["EXPANDER_PLACEMENT"].search(t):
         tags.add("STAGE1_EXPANDER")
-        # QA-only: does this string also mention subseq expansions?
         if PAT["EXPANDER_INCLUDES_SUBSEQ_EXPANSIONS"].search(t):
             tags.add("EXPANDER_DESC_INCLUDES_SUBSEQ_EXPANSIONS")
 
@@ -190,6 +200,13 @@ def derive_patient_staging(sub):
 
     has_expander = s["tags"].apply(lambda z: "STAGE1_EXPANDER" in z).any()
     has_expander_desc_subseq = s["tags"].apply(lambda z: "EXPANDER_DESC_INCLUDES_SUBSEQ_EXPANSIONS" in z).any()
+
+    # QA: do we even see stage2-tag rows for this patient (ignoring date filter)?
+    has_any_stage2_tag = s["tags"].apply(lambda z: any(k in z for k in [
+        "STAGE2_IMPLANT_SEP_DAY",
+        "STAGE2_EXCHANGE_REPLACEMENT",
+        "STAGE2_CPT_HINT",
+    ])).any()
 
     # ----------------
     # Stage 1 selection
@@ -268,6 +285,7 @@ def derive_patient_staging(sub):
         "mrn": str(sub["mrn"].iloc[0]) if "mrn" in sub.columns else "",
         "has_expander": bool(has_expander),
         "has_expander_desc_subseq": bool(has_expander_desc_subseq),
+        "has_any_stage2_tag": bool(has_any_stage2_tag),
         "pathway": pathway,
         "stage1_date": stage1_date.strftime("%Y-%m-%d") if pd.notnull(stage1_date) else None,
         "stage1_proc": stage1_proc,
@@ -305,6 +323,8 @@ def main():
     total_patients = int(out.shape[0])
     with_stage1 = int(out["stage1_date"].notnull().sum())
     with_stage2 = int(out["stage2_date"].notnull().sum())
+    any_stage2_tag = int(out["has_any_stage2_tag"].sum())
+
     two_stage = int((out["pathway"] == "two_stage_expander_implant").sum())
     single_implant = int((out["pathway"] == "single_stage_implant").sum())
     single_auto = int((out["pathway"] == "single_stage_autologous").sum())
@@ -321,6 +341,9 @@ def main():
     ))
     lines.append("Patients with Stage 2 identified: {} ({:.1f}%)".format(
         with_stage2, (100.0 * with_stage2 / total_patients) if total_patients else 0.0
+    ))
+    lines.append("Patients with ANY Stage2-tagged encounter row (pre-date filter): {} ({:.1f}%)".format(
+        any_stage2_tag, (100.0 * any_stage2_tag / total_patients) if total_patients else 0.0
     ))
     lines.append("")
     lines.append("Pathway counts:")
