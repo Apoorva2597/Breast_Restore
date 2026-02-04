@@ -4,13 +4,14 @@
 # Goal:
 #   Use OPERATION_ENCOUNTERS.csv (structured encounters) to derive:
 #     - Stage 1 reconstruction date (index recon)
-#     - Stage 2 reconstruction date (if expander->implant exchange / delayed implant)
+#     - Stage 2 reconstruction date (if TE->implant exchange / delayed implant)
 #     - Reconstruction pathway classification (2-stage vs single-stage implant vs autologous)
 #
 # Notes:
 # - We stage using *procedure strings + dates*, NOT note NLP.
-# - Stage 2 for TE pathway is usually "implant on separate day" or expander/implant exchange,
-#   NOT "revision of reconstructed breast" (revision is a different outcome concept).
+# - IMPORTANT FIX:
+#     "tissue expandr placmnt in breast reconst inc subseq expansions"
+#   is NOT Stage 1 placement; it indicates expander follow-up/expansion management.
 #
 # Outputs:
 #   1) patient_recon_staging.csv  (patient-level staging)
@@ -28,14 +29,12 @@ OP_ENCOUNTERS_CSV = "/home/apokol/my_data_Breast/HPI-11526/HPI11256/HPI11526 Ope
 OUT_PATIENT_CSV = "patient_recon_staging.csv"
 OUT_QA_TXT = "qa_recon_staging_summary.txt"
 
-# Column names seen in your headers (adjust here if needed)
-COL_PATIENT = "ENCRYPTED_PAT_ID"     # patient identifier
+# Column names
+COL_PATIENT = "ENCRYPTED_PAT_ID"
 COL_MRN = "MRN"
 COL_OP_DATE = "OPERATION_DATE"
 COL_CPT = "CPT_CODE"
 COL_PROC = "PROCEDURE"
-
-# If OPERATION_DATE is sometimes blank, you can fall back to DISCHARGE_DATE_DT
 COL_ALT_DATE = "DISCHARGE_DATE_DT"
 
 
@@ -43,50 +42,68 @@ COL_ALT_DATE = "DISCHARGE_DATE_DT"
 # Regex patterns on PROCEDURE text (normalized)
 # -------------------------
 PAT = {
-    # oncologic surgery (not recon staging)
+    # oncologic
     "MASTECTOMY": re.compile(r"\bmastectomy\b", re.I),
 
-    # Stage 1 recon signals
-    # (TE placement / immediate implant / autologous flaps)
-    "EXPANDER_PLACEMENT": re.compile(r"\btissue\s*expand", re.I),  # "tissue expandr placmnt..."
-    "IMPLANT_IMMEDIATE": re.compile(
-        r"\binsertion\b.*\bimplant\b.*\bsame\s+day\b.*\bmastectomy\b|"
-        r"\bimplant\b.*\bsame\s+day\b.*\bmastectomy\b",
+    # ---- Expander signals ----
+    # Follow-up expansion management / subseq expansions (NOT Stage 1)
+    "EXPANDER_SUBSEQ": re.compile(
+        r"\bsubseq(uent|)\b.*\bexpansions?\b|\binc\b.*\bsubseq\b.*\bexpansions?\b|\bsubse? q\b.*\bexpans",
         re.I
     ),
 
-    # Stage 2 / exchange / delayed implant signals
-    # This is what your data actually contains (e.g., "insert or replcmnt breast implnt on sep day from mastectomy")
+    # True Stage 1 TE placement: require placement/insert language
+    # (we keep it high-recall but avoid catching "subseq expansions")
+    "EXPANDER_PLACEMENT": re.compile(
+        r"\b(tissue\s*expand|tiss\s*expand|tissue\s*expander|expandr)\b.*\b(plac(e|m)(ent|t)|insert|insertion|placement)\b|"
+        r"\b(plac(e|m)(ent|t)|insert|insertion|placement)\b.*\b(tissue\s*expand|tiss\s*expand|tissue\s*expander|expandr)\b",
+        re.I
+    ),
+
+    # ---- Implant signals ----
+    "IMPLANT_IMMEDIATE": re.compile(
+        r"\binsertion\b.*\bimplant\b.*\bsame\s+day\b.*\bmastectomy\b|"
+        r"\bimplant\b.*\bsame\s+day\b.*\bmastectomy\b|"
+        r"\bimmediate\b.*\bimplant\b",
+        re.I
+    ),
+
+    # Stage 2 / delayed implant / exchange:
     "IMPLANT_SEP_DAY": re.compile(
         r"\bimplant\b.*\bsep(arate)?\s+day\b|"
         r"\bsep\s+day\b.*\bimplant\b|"
-        r"\bon\s+sep(arate)?\s+day\b.*\bimplant\b",
-        re.I
-    ),
-    "EXCHANGE_OR_REPLACEMENT": re.compile(
-        r"\bexchange\b.*\bimplant\b|"
-        r"\breplac(e|ement)\b.*\bimplant\b|"
-        r"\bimplant\b.*\breplac(e|ement)\b",
+        r"\bon\s+sep(arate)?\s+day\b.*\bimplant\b|"
+        r"\bdelayed\b.*\bimplant\b",
         re.I
     ),
 
-    # autologous (single-stage recon)
+    # Exchange language: expander-to-implant exchange, implant exchange, etc.
+    "EXCHANGE_OR_REPLACEMENT": re.compile(
+        r"\bexchange\b.*\b(implant|expander)\b|"
+        r"\b(implant|expander)\b.*\bexchange\b|"
+        r"\breplac(e|ement)\b.*\bimplant\b|"
+        r"\bimplant\b.*\breplac(e|ement)\b|"
+        r"\bremove\b.*\bexpander\b.*\bimplant\b|\bremove\b.*\btissue\s*expander\b.*\bimplant\b",
+        re.I
+    ),
+
+    # autologous
     "AUTOLOGOUS_FREE_FLAP": re.compile(r"\bfree\s+flap\b|\bdiep\b|\btr?am\b|\bsiea\b|\bgap\s+flap\b", re.I),
     "LAT_DORSI": re.compile(r"\blatissimus\s+dorsi\b", re.I),
 
-    # revision/refinements (NOT Stage 2 exchange; keep for QA only)
-    "REVISION_RECON_BREAST": re.compile(r"\brevision\b.*\breconstruct(ed|ion)\b.*\bbreast\b|\brevision\s+of\s+reconstructed\s+breast\b", re.I),
+    # revision/refinement (NOT staging)
+    "REVISION_RECON_BREAST": re.compile(
+        r"\brevision\b.*\breconstruct(ed|ion)\b.*\bbreast\b|\brevision\s+of\s+reconstructed\s+breast\b",
+        re.I
+    ),
     "NIPPLE_AREOLA_RECON": re.compile(r"\bnipple\b|\bareola\b", re.I),
 }
 
 
-# CPT-based optional hints (depends on feed)
-# - 11970 is classic TE->implant exchange
-# - 19342 often shows as implant replacement/revision; can be stage2-ish *only if expander pathway exists*
-STAGE2_CPT_HINTS = set([
-    "11970",
-    "19342",
-])
+# CPT hints (optional)
+# 11970 = TE->implant exchange (classic Stage 2)
+# 19342 = delayed insertion / replacement (can be stage2-ish; keep as hint only, requires expander pathway)
+STAGE2_CPT_HINTS = set(["11970", "19342"])
 
 
 def read_csv_fallback(path):
@@ -121,17 +138,23 @@ def classify_row(proc_text, cpt_code):
     t = proc_text
     cpt = (str(cpt_code).strip() if cpt_code is not None else "")
 
-    # Stage 1 signals
-    if PAT["EXPANDER_PLACEMENT"].search(t):
+    # Expander follow-up (NOT stage1 placement)
+    if PAT["EXPANDER_SUBSEQ"].search(t):
+        tags.add("EXPANDER_FOLLOWUP")
+
+    # Stage 1: expander placement (only if not subseq)
+    if PAT["EXPANDER_PLACEMENT"].search(t) and ("EXPANDER_FOLLOWUP" not in tags):
         tags.add("STAGE1_EXPANDER")
 
+    # Stage 1: immediate implant
     if PAT["IMPLANT_IMMEDIATE"].search(t):
         tags.add("STAGE1_IMPLANT_IMMEDIATE")
 
+    # Stage 1: autologous
     if PAT["AUTOLOGOUS_FREE_FLAP"].search(t) or PAT["LAT_DORSI"].search(t):
         tags.add("STAGE1_AUTOLOGOUS")
 
-    # Stage 2 / exchange / delayed implant signals
+    # Stage 2 signals
     if PAT["IMPLANT_SEP_DAY"].search(t):
         tags.add("STAGE2_IMPLANT_SEP_DAY")
 
@@ -141,7 +164,7 @@ def classify_row(proc_text, cpt_code):
     if cpt in STAGE2_CPT_HINTS:
         tags.add("STAGE2_CPT_HINT")
 
-    # Non-staging but useful QA tags
+    # QA-only tags
     if PAT["REVISION_RECON_BREAST"].search(t):
         tags.add("REVISION_RECON")
 
@@ -157,28 +180,22 @@ def classify_row(proc_text, cpt_code):
 def derive_patient_staging(sub):
     """
     sub: patient-level dataframe of encounters (already has parsed date + proc_norm + cpt)
-    Returns a dict with staging outputs.
     """
-    # Keep only rows with a usable date
     s = sub.dropna(subset=["op_date"]).copy()
     s = s.sort_values("op_date")
 
-    # Gather tags per row
     s["tags"] = s.apply(lambda r: classify_row(r["proc_norm"], r.get("cpt", "")), axis=1)
 
-    # Identify whether expander-based pathway exists
     has_expander = s["tags"].apply(lambda z: "STAGE1_EXPANDER" in z).any()
+    has_expander_followup = s["tags"].apply(lambda z: "EXPANDER_FOLLOWUP" in z).any()
 
-    # --------
+    # ----------------
     # Stage 1 selection
-    # --------
-    # Prefer earliest reconstruction-like event.
-    # For two-stage, stage1 should ideally be expander placement.
+    # ----------------
     stage1_date = None
     stage1_proc = None
     stage1_type = None  # expander / implant / autologous
 
-    # If expander exists, pick earliest expander placement as stage 1
     if has_expander:
         exp_rows = s[s["tags"].apply(lambda z: "STAGE1_EXPANDER" in z)]
         if not exp_rows.empty:
@@ -187,7 +204,6 @@ def derive_patient_staging(sub):
             stage1_proc = r1["proc_norm"]
             stage1_type = "expander"
 
-    # Otherwise pick earliest immediate implant or autologous
     if stage1_date is None:
         stage1_mask = s["tags"].apply(lambda z: any(k in z for k in ["STAGE1_IMPLANT_IMMEDIATE", "STAGE1_AUTOLOGOUS"]))
         stage1_rows = s[stage1_mask].copy()
@@ -202,15 +218,14 @@ def derive_patient_staging(sub):
             else:
                 stage1_type = "unknown"
 
-    # --------
+    # ----------------
     # Stage 2 selection (ONLY if expander pathway)
-    # --------
+    # ----------------
     stage2_date = None
     stage2_proc = None
+    stage2_reason = None
 
     if has_expander and stage1_date is not None:
-        # Stage 2 is implant on separate day OR exchange/replacement language OR CPT hint,
-        # but must occur AFTER stage 1 date.
         s2_mask = s["tags"].apply(lambda z: any(k in z for k in [
             "STAGE2_IMPLANT_SEP_DAY",
             "STAGE2_EXCHANGE_REPLACEMENT",
@@ -221,10 +236,19 @@ def derive_patient_staging(sub):
             r2 = s2_rows.iloc[0]
             stage2_date = r2["op_date"]
             stage2_proc = r2["proc_norm"]
+            # simple reason label for QA
+            if "STAGE2_IMPLANT_SEP_DAY" in r2["tags"]:
+                stage2_reason = "implant_sep_day"
+            elif "STAGE2_EXCHANGE_REPLACEMENT" in r2["tags"]:
+                stage2_reason = "exchange_replacement"
+            elif "STAGE2_CPT_HINT" in r2["tags"]:
+                stage2_reason = "cpt_hint"
+            else:
+                stage2_reason = "unknown"
 
-    # --------
+    # ----------------
     # Pathway classification
-    # --------
+    # ----------------
     pathway = "unknown"
     if stage1_type == "autologous":
         pathway = "single_stage_autologous"
@@ -237,11 +261,13 @@ def derive_patient_staging(sub):
         "patient_id": str(sub["patient_id"].iloc[0]),
         "mrn": str(sub["mrn"].iloc[0]) if "mrn" in sub.columns else "",
         "has_expander": bool(has_expander),
+        "has_expander_followup": bool(has_expander_followup),
         "pathway": pathway,
         "stage1_date": stage1_date.strftime("%Y-%m-%d") if pd.notnull(stage1_date) else None,
         "stage1_proc": stage1_proc,
         "stage2_date": stage2_date.strftime("%Y-%m-%d") if pd.notnull(stage2_date) else None,
         "stage2_proc": stage2_proc,
+        "stage2_reason": stage2_reason,
         "n_encounter_rows": int(len(sub)),
         "n_rows_with_dates": int(sub["op_date"].notnull().sum()),
     }
@@ -250,31 +276,23 @@ def derive_patient_staging(sub):
 def main():
     df = read_csv_fallback(OP_ENCOUNTERS_CSV)
 
-    # Basic column validation
     for c in [COL_PATIENT, COL_PROC]:
         if c not in df.columns:
             raise RuntimeError("Missing required column in OP encounters file: {}".format(c))
 
-    # Build working columns
     df["patient_id"] = df[COL_PATIENT].fillna("").astype(str)
     df["mrn"] = df[COL_MRN].fillna("").astype(str) if COL_MRN in df.columns else ""
     df["proc_norm"] = df[COL_PROC].apply(norm_text)
     df["cpt"] = df[COL_CPT].fillna("").astype(str) if COL_CPT in df.columns else ""
-
-    # Dates
     df["op_date"] = parse_date_series(df, COL_OP_DATE, fallback_col=COL_ALT_DATE)
 
-    # Drop rows with no patient_id
     df = df[df["patient_id"].str.len() > 0].copy()
 
-    # Patient-level staging
     rows = []
-    for pid, sub in df.groupby("patient_id", sort=True):
+    for _, sub in df.groupby("patient_id", sort=True):
         rows.append(derive_patient_staging(sub))
 
     out = pd.DataFrame(rows)
-
-    # Write patient-level output
     out.to_csv(OUT_PATIENT_CSV, index=False)
 
     # QA summary
@@ -285,6 +303,11 @@ def main():
     single_implant = int((out["pathway"] == "single_stage_implant").sum())
     single_auto = int((out["pathway"] == "single_stage_autologous").sum())
     unknown = int((out["pathway"] == "unknown").sum())
+
+    exp_follow = int(out["has_expander_followup"].sum())
+
+    # stage2 reason breakdown
+    s2_reason_counts = out["stage2_reason"].fillna("NONE").value_counts()
 
     lines = []
     lines.append("=== Reconstruction staging QA ===")
@@ -301,6 +324,12 @@ def main():
     lines.append("  single_stage_implant:       {}".format(single_implant))
     lines.append("  single_stage_autologous:    {}".format(single_auto))
     lines.append("  unknown:                    {}".format(unknown))
+    lines.append("")
+    lines.append("Expander follow-up (subseq expansions) present: {} patients".format(exp_follow))
+    lines.append("")
+    lines.append("Stage2 reason breakdown (patients):")
+    for k, v in s2_reason_counts.items():
+        lines.append("  {}: {}".format(k, int(v)))
     lines.append("")
     lines.append("Wrote: {}".format(OUT_PATIENT_CSV))
 
