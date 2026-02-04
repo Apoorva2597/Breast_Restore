@@ -9,9 +9,10 @@
 #
 # Notes:
 # - We stage using *procedure strings + dates*, NOT note NLP.
-# - IMPORTANT FIX:
+# - IMPORTANT (based on your observed OP encounter procedure strings):
 #     "tissue expandr placmnt in breast reconst inc subseq expansions"
-#   is NOT Stage 1 placement; it indicates expander follow-up/expansion management.
+#   is a billing-style description that typically refers to the *initial TE placement*
+#   (it often includes the plan for subsequent expansions). We should treat it as Stage 1.
 #
 # Outputs:
 #   1) patient_recon_staging.csv  (patient-level staging)
@@ -42,21 +43,24 @@ COL_ALT_DATE = "DISCHARGE_DATE_DT"
 # Regex patterns on PROCEDURE text (normalized)
 # -------------------------
 PAT = {
-    # oncologic
+    # oncologic (not used for recon staging directly; QA only)
     "MASTECTOMY": re.compile(r"\bmastectomy\b", re.I),
 
     # ---- Expander signals ----
-    # Follow-up expansion management / subseq expansions (NOT Stage 1)
-    "EXPANDER_SUBSEQ": re.compile(
-        r"\bsubseq(uent|)\b.*\bexpansions?\b|\binc\b.*\bsubseq\b.*\bexpansions?\b|\bsubse? q\b.*\bexpans",
+    # Many systems use abbreviations: expandr / plcmnt / placmnt / implnt, etc.
+    # We treat these as Stage 1 expander placement.
+    "EXPANDER_PLACEMENT": re.compile(
+        r"\b(tissue\s*expander|tissue\s*expand|tiss\s*expand|expandr|expander)\b"
+        r".{0,80}\b(plac(e|m)(ent|mnt|mt)|plcmnt|placmnt|placement|insert(ion)?|impla?n?t)\b"
+        r"|"
+        r"\b(plac(e|m)(ent|mnt|mt)|plcmnt|placmnt|placement|insert(ion)?|impla?n?t)\b"
+        r".{0,80}\b(tissue\s*expander|tissue\s*expand|tiss\s*expand|expandr|expander)\b",
         re.I
     ),
 
-    # True Stage 1 TE placement: require placement/insert language
-    # (we keep it high-recall but avoid catching "subseq expansions")
-    "EXPANDER_PLACEMENT": re.compile(
-        r"\b(tissue\s*expand|tiss\s*expand|tissue\s*expander|expandr)\b.*\b(plac(e|m)(ent|t)|insert|insertion|placement)\b|"
-        r"\b(plac(e|m)(ent|t)|insert|insertion|placement)\b.*\b(tissue\s*expand|tiss\s*expand|tissue\s*expander|expandr)\b",
+    # QA-only flag: the phrase "subseq expansions" shows up inside the Stage 1 description a lot
+    "EXPANDER_INCLUDES_SUBSEQ_EXPANSIONS": re.compile(
+        r"\bsubseq(uent)?\b.{0,40}\bexpansions?\b|\binc\b.{0,20}\bsubseq\b.{0,40}\bexpansions?\b",
         re.I
     ),
 
@@ -68,7 +72,7 @@ PAT = {
         re.I
     ),
 
-    # Stage 2 / delayed implant / exchange:
+    # Stage 2 / delayed implant:
     "IMPLANT_SEP_DAY": re.compile(
         r"\bimplant\b.*\bsep(arate)?\s+day\b|"
         r"\bsep\s+day\b.*\bimplant\b|"
@@ -77,17 +81,16 @@ PAT = {
         re.I
     ),
 
-    # Exchange language: expander-to-implant exchange, implant exchange, etc.
+    # Exchange language (higher specificity for Stage 2 when expander pathway exists)
     "EXCHANGE_OR_REPLACEMENT": re.compile(
         r"\bexchange\b.*\b(implant|expander)\b|"
         r"\b(implant|expander)\b.*\bexchange\b|"
-        r"\breplac(e|ement)\b.*\bimplant\b|"
-        r"\bimplant\b.*\breplac(e|ement)\b|"
-        r"\bremove\b.*\bexpander\b.*\bimplant\b|\bremove\b.*\btissue\s*expander\b.*\bimplant\b",
+        r"\bremove(d)?\b.*\b(tissue\s*expander|expander)\b.*\bimplant\b|"
+        r"\bexpander\b.*\bexchange\b.*\bimplant\b",
         re.I
     ),
 
-    # autologous
+    # Autologous (single-stage)
     "AUTOLOGOUS_FREE_FLAP": re.compile(r"\bfree\s+flap\b|\bdiep\b|\btr?am\b|\bsiea\b|\bgap\s+flap\b", re.I),
     "LAT_DORSI": re.compile(r"\blatissimus\s+dorsi\b", re.I),
 
@@ -102,7 +105,7 @@ PAT = {
 
 # CPT hints (optional)
 # 11970 = TE->implant exchange (classic Stage 2)
-# 19342 = delayed insertion / replacement (can be stage2-ish; keep as hint only, requires expander pathway)
+# 19342 = delayed insertion / replacement; may be stage2-ish; treat as hint only (requires expander pathway)
 STAGE2_CPT_HINTS = set(["11970", "19342"])
 
 
@@ -138,13 +141,12 @@ def classify_row(proc_text, cpt_code):
     t = proc_text
     cpt = (str(cpt_code).strip() if cpt_code is not None else "")
 
-    # Expander follow-up (NOT stage1 placement)
-    if PAT["EXPANDER_SUBSEQ"].search(t):
-        tags.add("EXPANDER_FOLLOWUP")
-
-    # Stage 1: expander placement (only if not subseq)
-    if PAT["EXPANDER_PLACEMENT"].search(t) and ("EXPANDER_FOLLOWUP" not in tags):
+    # Stage 1: expander placement
+    if PAT["EXPANDER_PLACEMENT"].search(t):
         tags.add("STAGE1_EXPANDER")
+        # QA-only: does this string also mention subseq expansions?
+        if PAT["EXPANDER_INCLUDES_SUBSEQ_EXPANSIONS"].search(t):
+            tags.add("EXPANDER_DESC_INCLUDES_SUBSEQ_EXPANSIONS")
 
     # Stage 1: immediate implant
     if PAT["IMPLANT_IMMEDIATE"].search(t):
@@ -154,7 +156,7 @@ def classify_row(proc_text, cpt_code):
     if PAT["AUTOLOGOUS_FREE_FLAP"].search(t) or PAT["LAT_DORSI"].search(t):
         tags.add("STAGE1_AUTOLOGOUS")
 
-    # Stage 2 signals
+    # Stage 2 signals (interpreted only if expander pathway exists at patient level)
     if PAT["IMPLANT_SEP_DAY"].search(t):
         tags.add("STAGE2_IMPLANT_SEP_DAY")
 
@@ -187,7 +189,7 @@ def derive_patient_staging(sub):
     s["tags"] = s.apply(lambda r: classify_row(r["proc_norm"], r.get("cpt", "")), axis=1)
 
     has_expander = s["tags"].apply(lambda z: "STAGE1_EXPANDER" in z).any()
-    has_expander_followup = s["tags"].apply(lambda z: "EXPANDER_FOLLOWUP" in z).any()
+    has_expander_desc_subseq = s["tags"].apply(lambda z: "EXPANDER_DESC_INCLUDES_SUBSEQ_EXPANSIONS" in z).any()
 
     # ----------------
     # Stage 1 selection
@@ -196,6 +198,7 @@ def derive_patient_staging(sub):
     stage1_proc = None
     stage1_type = None  # expander / implant / autologous
 
+    # If expander exists, choose earliest expander placement as stage 1
     if has_expander:
         exp_rows = s[s["tags"].apply(lambda z: "STAGE1_EXPANDER" in z)]
         if not exp_rows.empty:
@@ -204,6 +207,7 @@ def derive_patient_staging(sub):
             stage1_proc = r1["proc_norm"]
             stage1_type = "expander"
 
+    # Otherwise choose earliest immediate implant or autologous
     if stage1_date is None:
         stage1_mask = s["tags"].apply(lambda z: any(k in z for k in ["STAGE1_IMPLANT_IMMEDIATE", "STAGE1_AUTOLOGOUS"]))
         stage1_rows = s[stage1_mask].copy()
@@ -226,6 +230,7 @@ def derive_patient_staging(sub):
     stage2_reason = None
 
     if has_expander and stage1_date is not None:
+        # Stage 2 candidates must occur after Stage 1 date
         s2_mask = s["tags"].apply(lambda z: any(k in z for k in [
             "STAGE2_IMPLANT_SEP_DAY",
             "STAGE2_EXCHANGE_REPLACEMENT",
@@ -236,7 +241,8 @@ def derive_patient_staging(sub):
             r2 = s2_rows.iloc[0]
             stage2_date = r2["op_date"]
             stage2_proc = r2["proc_norm"]
-            # simple reason label for QA
+
+            # reason label for QA
             if "STAGE2_IMPLANT_SEP_DAY" in r2["tags"]:
                 stage2_reason = "implant_sep_day"
             elif "STAGE2_EXCHANGE_REPLACEMENT" in r2["tags"]:
@@ -261,7 +267,7 @@ def derive_patient_staging(sub):
         "patient_id": str(sub["patient_id"].iloc[0]),
         "mrn": str(sub["mrn"].iloc[0]) if "mrn" in sub.columns else "",
         "has_expander": bool(has_expander),
-        "has_expander_followup": bool(has_expander_followup),
+        "has_expander_desc_subseq": bool(has_expander_desc_subseq),
         "pathway": pathway,
         "stage1_date": stage1_date.strftime("%Y-%m-%d") if pd.notnull(stage1_date) else None,
         "stage1_proc": stage1_proc,
@@ -304,9 +310,7 @@ def main():
     single_auto = int((out["pathway"] == "single_stage_autologous").sum())
     unknown = int((out["pathway"] == "unknown").sum())
 
-    exp_follow = int(out["has_expander_followup"].sum())
-
-    # stage2 reason breakdown
+    exp_desc_subseq = int(out["has_expander_desc_subseq"].sum())
     s2_reason_counts = out["stage2_reason"].fillna("NONE").value_counts()
 
     lines = []
@@ -325,7 +329,7 @@ def main():
     lines.append("  single_stage_autologous:    {}".format(single_auto))
     lines.append("  unknown:                    {}".format(unknown))
     lines.append("")
-    lines.append("Expander follow-up (subseq expansions) present: {} patients".format(exp_follow))
+    lines.append("Expander descriptions that include 'subseq expansions': {} patients".format(exp_desc_subseq))
     lines.append("")
     lines.append("Stage2 reason breakdown (patients):")
     for k, v in s2_reason_counts.items():
