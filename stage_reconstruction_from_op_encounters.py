@@ -355,6 +355,7 @@ def main():
     lines.append("Expander descriptions that include 'subseq expansions': {} patients".format(exp_desc_subseq))
     lines.append("")
     lines.append("Stage2 reason breakdown (patients):")
+    
     for k, v in s2_reason_counts.items():
         lines.append("  {}: {}".format(k, int(v)))
     lines.append("")
