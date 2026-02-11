@@ -1,14 +1,18 @@
-# qa_cpt_reconstruction_candidates.py
+# stage2_from_operation_notes_expanders.py
 # Python 3.6+ (pandas required)
 #
 # Goal:
-#   Inventory unique CPT codes across ALL encounter files, and identify
-#   "reconstruction-likely" CPTs based on the PROCEDURE strings they appear with.
+#   For expander-pathway patients (from patient_recon_staging.csv),
+#   scan OPERATION NOTES for Stage 2 evidence (TE -> implant exchange).
+#
+# Inputs:
+#   1) patient_recon_staging.csv  (from your structured staging script)
+#   2) HPI11526 Operation Notes.csv (note-level file with NOTE_TEXT, NOTE_DATE_OF_SERVICE, etc.)
 #
 # Outputs:
-#   - qa_cpt_inventory_all_files.csv
-#   - qa_cpt_top_procedures_per_cpt.csv
-#   - qa_cpt_reconstruction_candidates.csv
+#   1) stage2_from_notes_patient_level.csv   (best Stage 2 per patient, tiered)
+#   2) stage2_from_notes_row_hits.csv        (row-level matches for QA)
+#   3) stage2_from_notes_summary.txt         (counts, tier breakdown)
 
 import re
 import sys
@@ -16,155 +20,324 @@ import pandas as pd
 
 
 # -------------------------
-# CONFIG
+# CONFIG (EDIT PATHS ONLY)
 # -------------------------
-BASE = "/home/apokol/my_data_Breast/HPI-11526/HPI11256/"
+PATIENT_STAGING_CSV = "patient_recon_staging.csv"
 
-ENCOUNTER_FILES = [
-    ("clinic_encounters",    BASE + "HPI11526 Clinic Encounters.csv"),
-    ("inpatient_encounters", BASE + "HPI11526 Inpatient Encounters.csv"),
-    ("operation_encounters", BASE + "HPI11526 Operation Encounters.csv"),
-]
+# Update this path to your operation notes file:
+OP_NOTES_CSV = "/home/apokol/my_data_Breast/HPI-11526/HPI11256/HPI11526 Operation Notes.csv"
 
-COL_PAT = "ENCRYPTED_PAT_ID"
-COL_CPT = "CPT_CODE"
-COL_PROC = "PROCEDURE"
+OUT_PATIENT_LEVEL = "stage2_from_notes_patient_level.csv"
+OUT_ROW_HITS = "stage2_from_notes_row_hits.csv"
+OUT_SUMMARY = "stage2_from_notes_summary.txt"
+
+# Note file columns (based on what you showed)
+COL_PATIENT = "ENCRYPTED_PAT_ID"
 COL_MRN = "MRN"
+COL_NOTE_TEXT = "NOTE_TEXT"
+COL_NOTE_DOS = "NOTE_DATE_OF_SERVICE"
+COL_OP_DATE = "OPERATION_DATE"
+COL_NOTE_TYPE = "NOTE_TYPE"
+COL_NOTE_ID = "NOTE_ID"
 
 
 # -------------------------
 # Helpers
 # -------------------------
-def read_csv_fallback(path):
+def read_csv_fallback(path, **kwargs):
     try:
-        return pd.read_csv(path, encoding="utf-8", engine="python")
+        return pd.read_csv(path, encoding="utf-8", engine="python", **kwargs)
     except UnicodeDecodeError:
-        return pd.read_csv(path, encoding="cp1252", engine="python")
+        return pd.read_csv(path, encoding="cp1252", engine="python", **kwargs)
 
 
 def norm_text(x):
-    if x is None or (isinstance(x, float) and pd.isna(x)):
+    if x is None:
         return ""
     s = str(x)
-    s = s.replace("\n", " ").replace("\r", " ").replace("_", " ")
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+    s = s.replace("\n", " ").replace("\r", " ")
+    s = s.replace("_", " ")
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
 
 
-def cpt_norm(x):
-    if x is None or (isinstance(x, float) and pd.isna(x)):
-        return ""
-    s = str(x).strip()
-    s = re.sub(r"\.0$", "", s)  # "19342.0" -> "19342"
-    s = s.replace(" ", "")
-    return s
+def parse_date_series(s):
+    return pd.to_datetime(s, errors="coerce")
 
 
-# Reconstruction-ish keyword screen (based on YOUR procedure text)
-RECON_PROC_PAT = re.compile(
-    r"\b(recon|reconst|reconstruction|implant|implnt|prost|expander|expandr|flap|diep|tram|siea|latissimus|"
-    r"capsulotomy|capsulectomy|nipple|areola|mastopexy|augmentation)\b",
-    re.I
-)
+# -------------------------
+# Stage 2 evidence patterns (notes)
+# -------------------------
+# We want *reliable* Stage 2 = expander removal/explant AND implant placement/exchange.
+#
+# Tier A (Definitive):
+#   - exchange expander to implant
+#   - remove/explant tissue expander + place/insert implant
+#
+# Tier B (Strong):
+#   - explicit "second stage" AND implant placement/exchange language, but expander removal may be implicit
+#   - capsulotomy/capsulectomy + implant placement + expander context
+#
+# Tier C (Suggestive):
+#   - mentions "second stage" / "permanent implant" as plan/history without clear op action
+#
+# We will also capture "noise" patterns (tissue expander present) to help debugging.
+
+RX = {
+    # components
+    "EXPANDER": re.compile(r"\b(tissue\s*expander|expander|expandr|te)\b", re.I),
+    "IMPLANT": re.compile(r"\b(implant|implnt|permanent\s+implant)\b", re.I),
+    "REMOVE": re.compile(r"\b(remove|removed|explant|explanted|take\s*out|taken\s*out)\b", re.I),
+    "PLACE": re.compile(r"\b(place|placed|insert|inserted|insertion|implantation)\b", re.I),
+    "EXCHANGE": re.compile(r"\b(exchange|exchanged)\b", re.I),
+    "SECOND_STAGE": re.compile(r"\b(second\s+stage|stage\s*2|stage\s+ii)\b", re.I),
+    "CAPSU": re.compile(r"\b(capsulotomy|capsulectomy)\b", re.I),
+
+    # strong combined phrases
+    "EXCHANGE_TE_TO_IMPLANT": re.compile(
+        r"\bexchange\b.{0,60}\b(tissue\s*expander|expander|expandr|te)\b.{0,120}\b(implant|implnt|permanent\s+implant)\b|"
+        r"\bexchange\b.{0,60}\b(implant|implnt|permanent\s+implant)\b.{0,120}\b(tissue\s*expander|expander|expandr|te)\b",
+        re.I
+    ),
+    "REMOVE_EXPANDER_PLACE_IMPLANT": re.compile(
+        r"\b(remove|removed|explant|explanted)\b.{0,120}\b(tissue\s*expander|expander|expandr|te)\b.{0,220}\b(place|placed|insert|inserted)\b.{0,80}\b(implant|implnt|permanent\s+implant)\b|"
+        r"\b(place|placed|insert|inserted)\b.{0,80}\b(implant|implnt|permanent\s+implant)\b.{0,220}\b(remove|removed|explant|explanted)\b.{0,120}\b(tissue\s*expander|expander|expandr|te)\b",
+        re.I
+    ),
+}
+
+
+def classify_note_stage2(note_text):
+    """
+    Returns (tier, matched_rule) where tier is one of: A, B, C, None
+    """
+    t = note_text
+
+    # Tier A: definitive
+    if RX["EXCHANGE_TE_TO_IMPLANT"].search(t):
+        return ("A", "EXCHANGE_TE_TO_IMPLANT")
+    if RX["REMOVE_EXPANDER_PLACE_IMPLANT"].search(t):
+        return ("A", "REMOVE_EXPANDER_PLACE_IMPLANT")
+
+    # Tier B: strong but not perfect (requires meaningful combo)
+    has_second = bool(RX["SECOND_STAGE"].search(t))
+    has_capsu = bool(RX["CAPSU"].search(t))
+    has_implant = bool(RX["IMPLANT"].search(t))
+    has_expander = bool(RX["EXPANDER"].search(t))
+    has_exchange = bool(RX["EXCHANGE"].search(t))
+    has_remove = bool(RX["REMOVE"].search(t))
+    has_place = bool(RX["PLACE"].search(t))
+
+    # strong combos
+    if has_exchange and has_implant and has_expander:
+        return ("B", "EXCHANGE+IMPLANT+EXPANDER")
+    if has_capsu and has_implant and (has_exchange or has_remove or has_place) and has_expander:
+        return ("B", "CAPSU+IMPLANT+(ACTION)+EXPANDER")
+    if has_second and has_implant and (has_exchange or has_remove or has_place) and has_expander:
+        return ("B", "SECOND_STAGE+IMPLANT+(ACTION)+EXPANDER")
+
+    # Tier C: suggestive
+    if has_second and (has_implant or has_exchange):
+        return ("C", "SECOND_STAGE_SUGGESTIVE")
+    if has_implant and has_expander and not (has_remove or has_exchange or has_place):
+        return ("C", "IMPLANT+EXPANDER_CONTEXT_NO_ACTION")
+
+    return (None, None)
 
 
 def main():
-    rows = []
-    for file_tag, path in ENCOUNTER_FILES:
-        df = read_csv_fallback(path)
+    # -------------------------
+    # Load expander cohort + index dates (stage1_date)
+    # -------------------------
+    stg = read_csv_fallback(PATIENT_STAGING_CSV)
+    needed_cols = set(["patient_id", "has_expander", "stage1_date"])
+    missing = [c for c in needed_cols if c not in stg.columns]
+    if missing:
+        raise RuntimeError("Missing required columns in {}: {}".format(PATIENT_STAGING_CSV, missing))
 
-        missing = [c for c in [COL_PAT, COL_CPT, COL_PROC] if c not in df.columns]
-        if missing:
-            print("WARN: {} missing columns {} -> skipping {}".format(file_tag, missing, path))
+    # normalize booleans
+    def to_bool(x):
+        s = str(x).strip().lower()
+        return s in ["true", "1", "yes", "y"]
+
+    stg["has_expander_bool"] = stg["has_expander"].apply(to_bool)
+    exp = stg[stg["has_expander_bool"]].copy()
+
+    exp["stage1_dt"] = parse_date_series(exp["stage1_date"])
+    exp_ids = set(exp["patient_id"].astype(str).tolist())
+
+    if len(exp_ids) == 0:
+        raise RuntimeError("No expander patients found in patient_recon_staging.csv (has_expander==True).")
+
+    # quick lookup maps
+    stage1_map = dict(zip(exp["patient_id"].astype(str), exp["stage1_dt"]))
+    mrn_map = dict(zip(exp["patient_id"].astype(str), exp.get("mrn", pd.Series([""]*len(exp))).astype(str)))
+
+    # -------------------------
+    # Stream operation notes and collect hits
+    # -------------------------
+    usecols = [COL_PATIENT, COL_MRN, COL_NOTE_TEXT, COL_NOTE_DOS, COL_OP_DATE, COL_NOTE_TYPE, COL_NOTE_ID]
+    # read header first to ensure columns exist
+    head = read_csv_fallback(OP_NOTES_CSV, nrows=5)
+    for c in usecols:
+        if c not in head.columns:
+            raise RuntimeError("Missing required note column in OP notes file: {}".format(c))
+
+    chunksize = 200000  # adjust if memory issues
+    hit_rows = []
+
+    total_rows_scanned = 0
+    total_rows_in_expanders = 0
+
+    for chunk in read_csv_fallback(OP_NOTES_CSV, usecols=usecols, chunksize=chunksize):
+        chunk[COL_PATIENT] = chunk[COL_PATIENT].fillna("").astype(str)
+        chunk = chunk[chunk[COL_PATIENT].isin(exp_ids)].copy()
+
+        total_rows_scanned += len(chunk)
+        if chunk.empty:
             continue
 
-        df["file_tag"] = file_tag
-        df["patient_id"] = df[COL_PAT].fillna("").astype(str)
-        df["mrn"] = df[COL_MRN].fillna("").astype(str) if COL_MRN in df.columns else ""
-        df["cpt"] = df[COL_CPT].apply(cpt_norm)
-        df["procedure"] = df[COL_PROC].apply(norm_text)
+        total_rows_in_expanders += len(chunk)
 
-        df = df[(df["patient_id"].str.len() > 0) & (df["cpt"].str.len() > 0)].copy()
-        rows.append(df[["file_tag", "patient_id", "mrn", "cpt", "procedure"]])
+        chunk["note_text_norm"] = chunk[COL_NOTE_TEXT].apply(norm_text)
 
-    if not rows:
-        raise RuntimeError("No encounter data loaded (check paths/columns).")
+        # date: prefer NOTE_DATE_OF_SERVICE, fallback OPERATION_DATE
+        chunk["note_dt"] = parse_date_series(chunk[COL_NOTE_DOS])
+        chunk["op_dt"] = parse_date_series(chunk[COL_OP_DATE])
+        chunk["event_dt"] = chunk["note_dt"].fillna(chunk["op_dt"])
 
-    all_df = pd.concat(rows, ignore_index=True)
+        # classify
+        tiers = []
+        rules = []
+        for txt in chunk["note_text_norm"].tolist():
+            tier, rule = classify_note_stage2(txt)
+            tiers.append(tier)
+            rules.append(rule)
 
-    # 1) Global CPT inventory (per file + overall)
-    inv_by_file = (all_df.groupby(["file_tag", "cpt"])
-                         .agg(encounter_rows=("cpt", "size"),
-                              unique_patients=("patient_id", pd.Series.nunique),
-                              unique_procedures=("procedure", pd.Series.nunique))
-                         .reset_index())
+        chunk["tier"] = tiers
+        chunk["rule"] = rules
 
-    inv_overall = (all_df.groupby(["cpt"])
-                         .agg(encounter_rows=("cpt", "size"),
-                              unique_patients=("patient_id", pd.Series.nunique),
-                              unique_files=("file_tag", pd.Series.nunique),
-                              unique_procedures=("procedure", pd.Series.nunique))
-                         .reset_index())
-    inv_overall["file_tag"] = "ALL_FILES"
+        hits = chunk[chunk["tier"].notnull()].copy()
+        if hits.empty:
+            continue
 
-    inv_all = pd.concat(
-        [inv_by_file,
-         inv_overall[["file_tag", "cpt", "encounter_rows", "unique_patients", "unique_procedures"]]],
-        ignore_index=True
+        # attach index (stage1) and delta
+        hits["stage1_dt"] = hits[COL_PATIENT].map(stage1_map)
+        hits["delta_days_vs_stage1"] = (hits["event_dt"] - hits["stage1_dt"]).dt.days
+
+        # keep a short snippet for QA
+        def snippet(s):
+            s = s if s is not None else ""
+            s = str(s)
+            s = re.sub(r"\s+", " ", s).strip()
+            return (s[:240] + "...") if len(s) > 240 else s
+
+        hits["snippet"] = hits[COL_NOTE_TEXT].apply(snippet)
+
+        keep = [
+            COL_PATIENT, COL_MRN, COL_NOTE_TYPE, COL_NOTE_ID,
+            COL_NOTE_DOS, COL_OP_DATE, "event_dt",
+            "tier", "rule", "delta_days_vs_stage1", "snippet"
+        ]
+        hit_rows.append(hits[keep])
+
+    if hit_rows:
+        hits_all = pd.concat(hit_rows, ignore_index=True)
+    else:
+        hits_all = pd.DataFrame(columns=[
+            COL_PATIENT, COL_MRN, COL_NOTE_TYPE, COL_NOTE_ID,
+            COL_NOTE_DOS, COL_OP_DATE, "event_dt",
+            "tier", "rule", "delta_days_vs_stage1", "snippet"
+        ])
+
+    # -------------------------
+    # Patient-level best Stage 2 (prefer: AFTER index, Tier A > B > C, earliest date)
+    # -------------------------
+    # ranking: A=3, B=2, C=1
+    tier_rank = {"A": 3, "B": 2, "C": 1}
+    hits_all["tier_rank"] = hits_all["tier"].map(tier_rank).fillna(0).astype(int)
+
+    # separate after-index vs not
+    hits_all["after_index"] = hits_all["delta_days_vs_stage1"].apply(lambda x: (x is not None) and pd.notnull(x) and (x >= 0))
+
+    # best hit selection per patient:
+    # 1) prefer after_index True
+    # 2) higher tier_rank
+    # 3) earliest event_dt
+    hits_all = hits_all.sort_values(
+        by=[COL_PATIENT, "after_index", "tier_rank", "event_dt"],
+        ascending=[True, False, False, True]
     )
 
-    inv_all.to_csv("qa_cpt_inventory_all_files.csv", index=False)
+    best = hits_all.groupby(COL_PATIENT, as_index=False).head(1).copy()
 
-    # 2) For each CPT, list top procedures it appears with (overall)
-    top_proc = (all_df.groupby(["cpt", "procedure"])
-                      .agg(encounter_rows=("procedure", "size"),
-                           unique_patients=("patient_id", pd.Series.nunique),
-                           files=("file_tag", lambda x: ",".join(sorted(set(x)))))
-                      .reset_index()
-                      .sort_values(["cpt", "encounter_rows"], ascending=[True, False]))
+    # build patient-level table for ALL expander patients, even those with no hits
+    patient_level = pd.DataFrame({ "patient_id": list(exp_ids) })
+    patient_level["stage1_dt"] = patient_level["patient_id"].map(stage1_map)
+    patient_level["mrn_from_staging"] = patient_level["patient_id"].map(mrn_map)
 
-    # keep top N procedures per CPT
-    N = 10
-    top_proc["rank_within_cpt"] = top_proc.groupby("cpt").cumcount() + 1
-    top_proc_out = top_proc[top_proc["rank_within_cpt"] <= N].copy()
-    top_proc_out.to_csv("qa_cpt_top_procedures_per_cpt.csv", index=False)
+    if not best.empty:
+        patient_level = patient_level.merge(
+            best.rename(columns={COL_PATIENT: "patient_id"}),
+            on="patient_id",
+            how="left"
+        )
+    else:
+        # add empty columns
+        for c in [COL_MRN, COL_NOTE_TYPE, COL_NOTE_ID, COL_NOTE_DOS, COL_OP_DATE, "event_dt", "tier", "rule", "delta_days_vs_stage1", "snippet", "after_index", "tier_rank"]:
+            patient_level[c] = None
 
-    # 3) Reconstruction candidate CPTs:
-    # Flag CPTs where ANY associated procedure string matches recon-ish vocabulary.
-    proc_flag = top_proc.copy()
-    proc_flag["recon_like_proc"] = proc_flag["procedure"].apply(lambda s: bool(RECON_PROC_PAT.search(s)))
+    # rename output columns cleanly
+    patient_level = patient_level.rename(columns={
+        "event_dt": "stage2_event_dt_best",
+        "tier": "stage2_tier_best",
+        "rule": "stage2_rule_best",
+        "after_index": "stage2_after_index",
+        "delta_days_vs_stage1": "stage2_delta_days_from_stage1",
+        COL_NOTE_TYPE: "best_note_type",
+        COL_NOTE_ID: "best_note_id",
+        COL_NOTE_DOS: "best_note_dos",
+        COL_OP_DATE: "best_note_op_date",
+        COL_MRN: "mrn_from_notes"
+    })
 
-    # CPT-level rollup of recon-likeness (overall)
-    cand = (proc_flag.groupby("cpt")
-                    .agg(total_rows=("encounter_rows", "sum"),
-                         total_unique_patients=("unique_patients", "sum"),  # not perfect but useful
-                         n_proc_pairs=("procedure", "size"),
-                         n_recon_proc_pairs=("recon_like_proc", lambda x: int(x.sum())),
-                         any_recon_proc=("recon_like_proc", "max"))
-                    .reset_index())
+    # -------------------------
+    # Write outputs
+    # -------------------------
+    hits_all.to_csv(OUT_ROW_HITS, index=False)
+    patient_level.to_csv(OUT_PATIENT_LEVEL, index=False)
 
-    # attach file coverage + true unique patients across all files
-    unique_pat = all_df.groupby("cpt")["patient_id"].nunique().reset_index().rename(columns={"patient_id":"unique_patients_all_files"})
-    unique_files = all_df.groupby("cpt")["file_tag"].nunique().reset_index().rename(columns={"file_tag":"n_files"})
-    cand = cand.merge(unique_pat, on="cpt", how="left").merge(unique_files, on="cpt", how="left")
+    # -------------------------
+    # Summary
+    # -------------------------
+    n_exp = len(exp_ids)
+    n_pat_with_any_hit = int(patient_level["stage2_tier_best"].notnull().sum())
+    n_pat_after_index = int(patient_level["stage2_after_index"].fillna(False).astype(bool).sum())
+    tier_counts = patient_level["stage2_tier_best"].fillna("NONE").value_counts()
 
-    # keep only CPTs with any recon-like procedure text
-    cand = cand[cand["any_recon_proc"] == True].copy()
-    cand = cand.sort_values(["unique_patients_all_files", "total_rows"], ascending=False)
+    lines = []
+    lines.append("=== Stage 2 from OPERATION NOTES (Expanders) ===")
+    lines.append("Expander patients (from patient_recon_staging.csv): {}".format(n_exp))
+    lines.append("Patients with ANY Stage2 note hit (any date): {} ({:.1f}%)".format(
+        n_pat_with_any_hit, (100.0 * n_pat_with_any_hit / n_exp) if n_exp else 0.0
+    ))
+    lines.append("Patients with best Stage2 hit AFTER Stage1 index: {} ({:.1f}%)".format(
+        n_pat_after_index, (100.0 * n_pat_after_index / n_exp) if n_exp else 0.0
+    ))
+    lines.append("")
+    lines.append("Best-hit tier distribution (patients):")
+    for k, v in tier_counts.items():
+        lines.append("  {}: {}".format(k, int(v)))
+    lines.append("")
+    lines.append("Wrote:")
+    lines.append("  - {}".format(OUT_PATIENT_LEVEL))
+    lines.append("  - {}".format(OUT_ROW_HITS))
+    lines.append("  - {}".format(OUT_SUMMARY))
 
-    cand.to_csv("qa_cpt_reconstruction_candidates.csv", index=False)
+    with open(OUT_SUMMARY, "w") as f:
+        f.write("\n".join(lines) + "\n")
 
-    print("Wrote:")
-    print(" - qa_cpt_inventory_all_files.csv")
-    print(" - qa_cpt_top_procedures_per_cpt.csv")
-    print(" - qa_cpt_reconstruction_candidates.csv")
-    print("")
-    print("Recon-candidate CPTs found: {}".format(int(cand.shape[0])))
-
-    # Quick peek: top 15 candidate CPTs
-    if not cand.empty:
-        print("\nTop recon-candidate CPTs (by unique patients across all files):")
-        print(cand.head(15)[["cpt","unique_patients_all_files","n_files","n_recon_proc_pairs","total_rows"]].to_string(index=False))
+    print("\n".join(lines))
 
 
 if __name__ == "__main__":
