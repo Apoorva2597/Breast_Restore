@@ -1,17 +1,24 @@
-# qa_stage2_from_notes_for_expander_patients.py
+# qa_all_encounters_and_notes_stage2_audit.py
 # Python 3.6+ (pandas required)
 #
 # Purpose:
-#   For expander-pathway patients (from patient_recon_staging.csv),
-#   scan available notes (Operation/Inpatient/Clinic) for Stage-2 / exchange language.
+#   Give Clinic/Inpatient encounters + notes the same chance we gave OP notes.
+#   1) Inventory ALL CPT codes and procedure strings per encounter file
+#   2) Find Stage-2-relevant CPTs (e.g., 11970, 19342) in any encounter file
+#   3) Keyword-scan PROCEDURE / REASON_FOR_VISIT in encounter files for Stage-2 language
+#   4) Keyword-scan NOTE_TEXT in note files for Stage-2 language (like the OP note scan)
 #
-# Outputs (safe-ish by design, but still contains snippets from notes):
-#   1) qa_stage2_note_hits_expanders.csv
-#   2) qa_stage2_patient_summary_expanders.csv
-#   3) qa_stage2_keyword_counts.csv
+# Outputs (CSV):
+#   - qa_all_enc_cpt_inventory_by_file.csv
+#   - qa_all_enc_proc_inventory_by_file.csv
+#   - qa_all_enc_stage2_cpt_hits.csv
+#   - qa_all_enc_stage2_keyword_hits.csv
+#   - qa_all_notes_stage2_keyword_hits.csv
+#   - qa_all_notes_keyword_counts.csv
 #
-# NOTE:
-#   This script DOES output short snippets. Store/share carefully.
+# Notes:
+#   - This script is designed to be "audit-first": broad coverage, minimal assumptions.
+#   - Uses chunked reading for the big note files.
 
 import re
 import sys
@@ -19,70 +26,87 @@ import pandas as pd
 
 
 # -------------------------
-# CONFIG (EDIT IF NEEDED)
+# CONFIG: paths
 # -------------------------
-BASE_DIR = "/home/apokol/my_data_Breast/HPI-11526/HPI11256"
+BASE = "/home/apokol/my_data_Breast/HPI-11526/HPI11256/"
 
-# Uses your staging output to define expander patients (recommended)
-PATIENT_STAGING_CSV = "patient_recon_staging.csv"  # in current working directory by default
-
-# Notes files
-OP_NOTES_CSV = BASE_DIR + "/HPI11526 Operation Notes.csv"
-INPATIENT_NOTES_CSV = BASE_DIR + "/HPI11526 Inpatient Notes.csv"
-CLINIC_NOTES_CSV = BASE_DIR + "/HPI11526 Clinic Notes.csv"
-
-# Toggle which notes to scan
-SCAN_OPERATION_NOTES = True
-SCAN_INPATIENT_NOTES = True
-SCAN_CLINIC_NOTES = True
-
-# Notes schema (from your headers)
-COL_PATIENT = "ENCRYPTED_PAT_ID"
-COL_NOTE_DATE = "NOTE_DATE_OF_SERVICE"   # if missing, try OPERATION_DATE / ADMIT_DATE / HOSP_ADMSN_TIME etc.
-COL_NOTE_TYPE = "NOTE_TYPE"
-COL_NOTE_ID = "NOTE_ID"
-COL_LINE = "LINE"
-COL_TEXT = "NOTE_TEXT"
-
-# If notes are split by LINE, we'll group by NOTE_ID within patient/date/type.
-GROUP_LINES_INTO_NOTE = True
-
-# Snippet window around match
-SNIPPET_CHARS = 160
-
-# Filter: only consider hits AFTER index stage1_date (if available)
-# (Set False if you want to see ALL hits regardless of timing.)
-FILTER_TO_AFTER_INDEX = True
-
-# Safety: to reduce output size
-MAX_HITS_PER_PATIENT = 200  # prevents runaway output if a patient has many repetitive mentions
-
-
-# -------------------------
-# Stage-2 / exchange lexicon
-# -------------------------
-# High recall, but we keep patterns clinically grounded.
-# Tip: We track which pattern matched for QA.
-STAGE2_PATTERNS = [
-    ("EXCHANGE_IMPLANT", r"\bexchang(e|ed|ing)\b.{0,60}\b(implant|implnt)\b"),
-    ("EXCHANGE_EXPANDER", r"\bexchang(e|ed|ing)\b.{0,60}\b(expander|expandr|tissue\s*expander)\b"),
-    ("EXPANDER_TO_IMPLANT", r"\b(expander|expandr|tissue\s*expander)\b.{0,80}\bto\b.{0,20}\b(implant|implnt)\b"),
-    ("REMOVE_EXPANDER_IMPLANT", r"\b(remov(e|ed|al)|explant(ed|ation)?)\b.{0,80}\b(expander|expandr|tissue\s*expander)\b.{0,120}\b(implant|implnt)\b"),
-    ("PERMANENT_IMPLANT", r"\b(permanent|final)\b.{0,40}\b(implant|implnt)\b"),
-    ("SECOND_STAGE", r"\b(second\s*stage|stage\s*(ii|2)|2nd\s*stage)\b"),
-    ("IMPLANT_PLACEMENT", r"\b(implant|implnt)\b.{0,40}\b(placement|placed|insert(ed|ion)|insertion)\b"),
-    ("TISSUE_EXPANDER_PRESENT", r"\b(tissue\s*expander|expandr|expander)\b"),  # context helper; low-specificity
-    ("CAPSULECTOMY_CAPSULOTOMY", r"\b(capsulectomy|capsulotomy)\b"),
-    ("RECON_EXCHANGE_GENERIC", r"\bexchange\b.{0,80}\b(recon|reconstruct)\b"),
+ENCOUNTER_FILES = [
+    ("clinic_encounters",   BASE + "HPI11526 Clinic Encounters.csv"),
+    ("inpatient_encounters",BASE + "HPI11526 Inpatient Encounters.csv"),
+    ("operation_encounters",BASE + "HPI11526 Operation Encounters.csv"),
 ]
 
-# Compile regex once
-COMPILED = [(name, re.compile(pat, re.I | re.S)) for name, pat in STAGE2_PATTERNS]
+NOTE_FILES = [
+    ("clinic_notes",   BASE + "HPI11526 Clinic Notes.csv"),
+    ("inpatient_notes",BASE + "HPI11526 Inpatient Notes.csv"),
+    ("operation_notes",BASE + "HPI11526 Operation Notes.csv"),
+]
+
+# Encounter columns (from your headers)
+COL_PAT = "ENCRYPTED_PAT_ID"
+COL_MRN = "MRN"
+COL_CPT = "CPT_CODE"
+COL_PROC = "PROCEDURE"
+COL_REASON = "REASON_FOR_VISIT"          # present in clinic/inpatient encounters; may be absent elsewhere
+COL_DATE_CANDIDATES = [
+    "OPERATION_DATE",
+    "RECONSTRUCTION_DATE",
+    "ADMIT_DATE",
+    "HOSP_ADMSN_TIME",
+    "CHECKOUT_TIME",
+    "DISCHARGE_DATE_DT",
+    "HOSP_DISCHRG_TIME",
+]
+
+# Note columns (common)
+COL_NOTE_TEXT = "NOTE_TEXT"
+COL_NOTE_DATE_CANDIDATES = ["NOTE_DATE_OF_SERVICE", "DATE_OF_SERVICE", "NOTE_DATE", "NOTE_DATETIME"]
 
 
 # -------------------------
-# Helpers
+# Stage-2 CPT list (start conservative; expand later if needed)
 # -------------------------
+STAGE2_CPTS = set([
+    "11970",   # replacement of tissue expander with permanent prosthesis
+    "19342",   # delayed insertion / replacement (can be used for exchange-ish scenarios)
+])
+
+# Also include these as "implant-related" context (not strictly stage2)
+IMPLANT_CONTEXT_CPTS = set([
+    "19340",   # immediate insertion of breast prosthesis (common)
+    "19357",   # tissue expander placement (stage1-ish)
+])
+
+ALL_CPT_OF_INTEREST = STAGE2_CPTS.union(IMPLANT_CONTEXT_CPTS)
+
+# -------------------------
+# Keyword patterns (same idea as OP note scan)
+# -------------------------
+PATTERNS = {
+    "TISSUE_EXPANDER_PRESENT": re.compile(r"\btissue\s+expand(er|ers)\b|\bexpander\b", re.I),
+    "EXCHANGE_IMPLANT": re.compile(r"\bexchange\b.*\bimplant\b|\bimplant\b.*\bexchange\b", re.I),
+    "EXCHANGE_EXPANDER": re.compile(r"\bexchange\b.*\bexpander\b|\bexpander\b.*\bexchange\b", re.I),
+    "EXPANDER_TO_IMPLANT": re.compile(r"\bexpander\b.*\bto\b.*\bimplant\b|\bimplant\b.*\bafter\b.*\bexpander\b", re.I),
+    "REMOVE_EXPANDER_IMPLANT": re.compile(r"\bremove(d)?\b.*\bexpander\b.*\bimplant\b|\bexplant\b.*\bexpander\b.*\bimplant\b", re.I),
+    "PERMANENT_IMPLANT": re.compile(r"\bpermanent\b.*\bimplant\b|\bfinal\b.*\bimplant\b", re.I),
+    "SECOND_STAGE": re.compile(r"\bsecond\s+stage\b|\bstage\s*2\b|\bstage\s+ii\b", re.I),
+    "CAPSULECTOMY_CAPSULOTOMY": re.compile(r"\bcapsulectomy\b|\bcapsulotomy\b", re.I),
+    "IMPLANT_PLACEMENT": re.compile(r"\bimplant\b.*\bplacement\b|\bplace\b.*\bimplant\b", re.I),
+}
+
+# Treat these as “stage2-ish evidence” patterns in keyword scans
+STAGE2_KEYWORDS = [
+    "EXCHANGE_IMPLANT",
+    "EXPANDER_TO_IMPLANT",
+    "REMOVE_EXPANDER_IMPLANT",
+    "SECOND_STAGE",
+    "PERMANENT_IMPLANT",
+    "EXCHANGE_EXPANDER",
+    "CAPSULECTOMY_CAPSULOTOMY",
+    "IMPLANT_PLACEMENT",
+]
+
+
 def read_csv_fallback(path):
     try:
         return pd.read_csv(path, encoding="utf-8", engine="python")
@@ -91,262 +115,257 @@ def read_csv_fallback(path):
 
 
 def norm_text(x):
-    if x is None:
+    if x is None or (isinstance(x, float) and pd.isna(x)):
         return ""
     s = str(x)
-    s = s.replace("\n", " ").replace("\r", " ")
-    s = s.replace("_", " ")
-    s = re.sub(r"\s+", " ", s)
-    return s.strip()
+    s = s.replace("\n", " ").replace("\r", " ").replace("_", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
 
-def coerce_dt(series):
-    return pd.to_datetime(series, errors="coerce")
-
-
-def pick_note_date_col(df):
-    """
-    Try NOTE_DATE_OF_SERVICE first; if not present, pick the first plausible date column.
-    """
-    candidates = [
-        COL_NOTE_DATE,
-        "OPERATION_DATE",
-        "ADMIT_DATE",
-        "HOSP_ADMSN_TIME",
-        "DISCHARGE_DATE_DT",
-        "CHECKOUT_TIME",
-    ]
+def pick_first_date(df, candidates):
     for c in candidates:
         if c in df.columns:
-            return c
-    return None
+            dt = pd.to_datetime(df[c], errors="coerce")
+            if dt.notnull().any():
+                return dt, c
+    return pd.Series([pd.NaT] * len(df)), None
 
 
-def build_note_level_df(df, source_name):
+def cpt_norm(x):
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return ""
+    s = str(x).strip()
+    # normalize common weirdness: "19342.0" -> "19342"
+    s = re.sub(r"\.0$", "", s)
+    s = s.replace(" ", "")
+    return s
+
+
+def keyword_hits(text):
     """
-    Convert a line-level notes table into a note-level table:
-      - group by patient_id + note_id + note_date + note_type
-      - concatenate lines (in line order if LINE is numeric-ish)
+    Return list of pattern names matched in the given text.
     """
-    out_cols = ["source", "patient_id", "note_id", "note_date", "note_type", "note_text"]
+    hits = []
+    t = text
+    for name in STAGE2_KEYWORDS:
+        if PATTERNS[name].search(t):
+            hits.append(name)
+    return hits
 
-    # Validate columns
-    missing = [c for c in [COL_PATIENT, COL_TEXT] if c not in df.columns]
-    if missing:
-        raise RuntimeError("Missing required columns in {}: {}".format(source_name, missing))
 
-    date_col = pick_note_date_col(df)
-    if not date_col:
-        raise RuntimeError("No usable note date column found in {}.".format(source_name))
+def audit_encounters():
+    cpt_rows = []
+    proc_rows = []
+    stage2_cpt_hits = []
+    stage2_kw_hits = []
 
-    df2 = df.copy()
-    df2["patient_id"] = df2[COL_PATIENT].fillna("").astype(str)
-    df2["note_text_line"] = df2[COL_TEXT].apply(norm_text)
-    df2["note_type"] = df2[COL_NOTE_TYPE].fillna("").astype(str) if COL_NOTE_TYPE in df2.columns else ""
-    df2["note_id"] = df2[COL_NOTE_ID].fillna("").astype(str) if COL_NOTE_ID in df2.columns else ""
-    df2["note_date"] = coerce_dt(df2[date_col])
+    for file_tag, path in ENCOUNTER_FILES:
+        df = read_csv_fallback(path)
 
-    # Drop empty patient_id or empty text
-    df2 = df2[(df2["patient_id"].str.len() > 0) & (df2["note_text_line"].str.len() > 0)].copy()
+        # minimal required columns
+        if COL_PAT not in df.columns or COL_PROC not in df.columns:
+            print("WARN: {} missing required columns; skipping. path={}".format(file_tag, path))
+            continue
 
-    if not GROUP_LINES_INTO_NOTE:
-        df2["source"] = source_name
-        df2 = df2.rename(columns={"note_text_line": "note_text"})
-        return df2[["source", "patient_id", "note_id", "note_date", "note_type", "note_text"]]
+        # normalize fields
+        df["file_tag"] = file_tag
+        df["patient_id"] = df[COL_PAT].fillna("").astype(str)
+        df["mrn"] = df[COL_MRN].fillna("").astype(str) if COL_MRN in df.columns else ""
+        df["cpt_norm"] = df[COL_CPT].apply(cpt_norm) if COL_CPT in df.columns else ""
+        df["proc_norm"] = df[COL_PROC].apply(norm_text)
+        if COL_REASON in df.columns:
+            df["reason_norm"] = df[COL_REASON].apply(norm_text)
+        else:
+            df["reason_norm"] = ""
 
-    group_keys = ["patient_id", "note_id", "note_date", "note_type"]
-    if COL_LINE in df2.columns:
-        # Try numeric sort for LINE
-        tmp = df2.copy()
-        tmp["_line_num"] = pd.to_numeric(tmp[COL_LINE], errors="coerce")
-        tmp = tmp.sort_values(["patient_id", "note_id", "note_date", "note_type", "_line_num"])
-        grouped = tmp.groupby(group_keys, dropna=False)["note_text_line"].apply(lambda x: " ".join([t for t in x if t]))
+        # date (best effort)
+        dt, dt_col = pick_first_date(df, COL_DATE_CANDIDATES)
+        df["enc_date"] = dt
+        df["enc_date_source_col"] = dt_col if dt_col else ""
+
+        # ----- CPT inventory (ALL CPTs) -----
+        if COL_CPT in df.columns:
+            tmp = df[df["cpt_norm"] != ""].copy()
+            inv = (tmp.groupby("cpt_norm")
+                      .agg(encounter_rows=("cpt_norm", "size"),
+                           unique_patients=("patient_id", pd.Series.nunique),
+                           unique_procedures=("proc_norm", pd.Series.nunique))
+                      .reset_index()
+                      .rename(columns={"cpt_norm": "cpt"}))
+            inv["file_tag"] = file_tag
+            cpt_rows.append(inv)
+
+        # ----- Procedure inventory (ALL procedure strings) -----
+        invp = (df.groupby("proc_norm")
+                  .agg(encounter_rows=("proc_norm", "size"),
+                       unique_patients=("patient_id", pd.Series.nunique),
+                       unique_cpt_codes=("cpt_norm", lambda x: (x != "").sum()),
+                       unique_cpt_values=("cpt_norm", pd.Series.nunique))
+                  .reset_index()
+                  .rename(columns={"proc_norm": "procedure"}))
+        invp["file_tag"] = file_tag
+        proc_rows.append(invp)
+
+        # ----- Stage2 CPT hits -----
+        if COL_CPT in df.columns:
+            hit = df[df["cpt_norm"].isin(STAGE2_CPTS)].copy()
+            if not hit.empty:
+                keep = ["file_tag", "patient_id", "mrn", "cpt_norm", "proc_norm", "reason_norm", "enc_date", "enc_date_source_col"]
+                hit = hit[keep].rename(columns={"cpt_norm": "cpt", "proc_norm": "procedure", "reason_norm": "reason_for_visit"})
+                stage2_cpt_hits.append(hit)
+
+        # ----- Stage2 keyword hits in encounters (procedure + reason_for_visit) -----
+        df["kw_text"] = (df["proc_norm"].fillna("") + " || " + df["reason_norm"].fillna("")).apply(norm_text)
+        df["kw_hits"] = df["kw_text"].apply(keyword_hits)
+        hit2 = df[df["kw_hits"].apply(lambda x: len(x) > 0)].copy()
+        if not hit2.empty:
+            keep = ["file_tag", "patient_id", "mrn", "cpt_norm", "proc_norm", "reason_norm", "enc_date", "enc_date_source_col", "kw_hits"]
+            hit2 = hit2[keep].rename(columns={"cpt_norm": "cpt", "proc_norm": "procedure", "reason_norm": "reason_for_visit"})
+            # explode kw_hits to one row per hit
+            hit2 = hit2.explode("kw_hits").rename(columns={"kw_hits": "pattern"})
+            stage2_kw_hits.append(hit2)
+
+    # write outputs
+    if cpt_rows:
+        out_cpt = pd.concat(cpt_rows, ignore_index=True)
+        out_cpt.to_csv("qa_all_enc_cpt_inventory_by_file.csv", index=False)
     else:
-        grouped = df2.groupby(group_keys, dropna=False)["note_text_line"].apply(lambda x: " ".join([t for t in x if t]))
+        out_cpt = pd.DataFrame()
 
-    note_df = grouped.reset_index().rename(columns={"note_text_line": "note_text"})
-    note_df["source"] = source_name
-    note_df = note_df[["source", "patient_id", "note_id", "note_date", "note_type", "note_text"]]
-    return note_df
+    if proc_rows:
+        out_proc = pd.concat(proc_rows, ignore_index=True)
+        out_proc.to_csv("qa_all_enc_proc_inventory_by_file.csv", index=False)
+    else:
+        out_proc = pd.DataFrame()
+
+    if stage2_cpt_hits:
+        out_s2c = pd.concat(stage2_cpt_hits, ignore_index=True)
+        out_s2c.to_csv("qa_all_enc_stage2_cpt_hits.csv", index=False)
+    else:
+        out_s2c = pd.DataFrame()
+        out_s2c.to_csv("qa_all_enc_stage2_cpt_hits.csv", index=False)
+
+    if stage2_kw_hits:
+        out_s2k = pd.concat(stage2_kw_hits, ignore_index=True)
+        out_s2k.to_csv("qa_all_enc_stage2_keyword_hits.csv", index=False)
+    else:
+        out_s2k = pd.DataFrame()
+        out_s2k.to_csv("qa_all_enc_stage2_keyword_hits.csv", index=False)
+
+    return out_cpt, out_proc, out_s2c, out_s2k
 
 
-def find_matches(text):
-    """
-    Return list of dicts for matches: pattern_name, start, end, snippet
-    """
-    matches = []
-    if not text:
-        return matches
+def audit_notes():
+    # We will scan NOTE_TEXT for patterns, chunked
+    hits_all = []
+    keyword_counts = {k: 0 for k in PATTERNS.keys()}
+    total_hit_rows = 0
 
-    for name, rx in COMPILED:
-        for m in rx.finditer(text):
-            s, e = m.start(), m.end()
-            left = max(0, s - SNIPPET_CHARS)
-            right = min(len(text), e + SNIPPET_CHARS)
-            snippet = text[left:right]
-            matches.append({
-                "pattern": name,
-                "match_start": s,
-                "match_end": e,
-                "snippet": snippet
-            })
-    return matches
+    for file_tag, path in NOTE_FILES:
+        # chunked read (notes files can be huge)
+        try:
+            reader = pd.read_csv(path, encoding="utf-8", engine="python", chunksize=50000)
+        except UnicodeDecodeError:
+            reader = pd.read_csv(path, encoding="cp1252", engine="python", chunksize=50000)
+
+        for chunk in reader:
+            if COL_NOTE_TEXT not in chunk.columns or COL_PAT not in chunk.columns:
+                continue
+
+            chunk["file_tag"] = file_tag
+            chunk["patient_id"] = chunk[COL_PAT].fillna("").astype(str)
+            chunk["mrn"] = chunk[COL_MRN].fillna("").astype(str) if COL_MRN in chunk.columns else ""
+            chunk["note_text_norm"] = chunk[COL_NOTE_TEXT].apply(norm_text)
+
+            # date best-effort
+            dt, dt_col = pick_first_date(chunk, COL_NOTE_DATE_CANDIDATES)
+            chunk["note_date"] = dt
+            chunk["note_date_source_col"] = dt_col if dt_col else ""
+
+            # find which patterns match
+            def get_hit_patterns(t):
+                hits = []
+                for name in STAGE2_KEYWORDS:
+                    if PATTERNS[name].search(t):
+                        hits.append(name)
+                return hits
+
+            chunk["hit_patterns"] = chunk["note_text_norm"].apply(get_hit_patterns)
+            hit = chunk[chunk["hit_patterns"].apply(lambda x: len(x) > 0)].copy()
+            if hit.empty:
+                continue
+
+            total_hit_rows += int(hit.shape[0])
+
+            # update counts
+            for plist in hit["hit_patterns"].tolist():
+                for p in plist:
+                    keyword_counts[p] += 1
+
+            # keep a compact hit table (avoid dumping full notes unless you want it)
+            keep_cols = ["file_tag", "patient_id", "mrn", "note_date", "note_date_source_col"]
+            # If NOTE_ID exists, keep it
+            if "NOTE_ID" in hit.columns:
+                keep_cols.append("NOTE_ID")
+            if "NOTE_TYPE" in hit.columns:
+                keep_cols.append("NOTE_TYPE")
+            # keep a short snippet for inspection
+            hit["snippet"] = hit["note_text_norm"].str.slice(0, 300)
+
+            hit = hit[keep_cols + ["hit_patterns", "snippet"]].explode("hit_patterns").rename(columns={"hit_patterns": "pattern"})
+            hits_all.append(hit)
+
+    if hits_all:
+        out_hits = pd.concat(hits_all, ignore_index=True)
+        out_hits.to_csv("qa_all_notes_stage2_keyword_hits.csv", index=False)
+    else:
+        out_hits = pd.DataFrame()
+        out_hits.to_csv("qa_all_notes_stage2_keyword_hits.csv", index=False)
+
+    kc = pd.DataFrame([{"pattern": k, "n_hits": int(v)} for k, v in keyword_counts.items()])
+    kc = kc[kc["pattern"].isin(STAGE2_KEYWORDS)].sort_values("n_hits", ascending=False)
+    kc.to_csv("qa_all_notes_keyword_counts.csv", index=False)
+
+    return out_hits, kc, total_hit_rows
 
 
 def main():
-    # ---- Load expander patients from staging output ----
-    try:
-        stg = read_csv_fallback(PATIENT_STAGING_CSV)
-    except Exception as e:
-        raise RuntimeError("Could not read {}: {}".format(PATIENT_STAGING_CSV, e))
+    print("=== Auditing ENCOUNTERS (Clinic/Inpatient/Operation) ===")
+    out_cpt, out_proc, out_s2c, out_s2k = audit_encounters()
 
-    if "patient_id" not in stg.columns:
-        raise RuntimeError("patient_recon_staging.csv must contain 'patient_id' column.")
-
-    # Use expander pathway patients
-    # (Your staging uses has_expander boolean + pathway label)
-    if "has_expander" in stg.columns:
-        expander_ids = stg[stg["has_expander"].astype(str).str.lower().isin(["true", "1", "yes"])].copy()
-    else:
-        # Fallback: pathway label
-        if "pathway" not in stg.columns:
-            raise RuntimeError("Staging file missing 'has_expander' and 'pathway'. Cannot define expander cohort.")
-        expander_ids = stg[stg["pathway"].astype(str) == "two_stage_expander_implant"].copy()
-
-    expander_ids["patient_id"] = expander_ids["patient_id"].astype(str)
-    expander_set = set(expander_ids["patient_id"].tolist())
-
-    # Index date (Stage 1 date)
-    if "stage1_date" in expander_ids.columns:
-        expander_ids["index_date"] = pd.to_datetime(expander_ids["stage1_date"], errors="coerce")
-    else:
-        expander_ids["index_date"] = pd.NaT
-
-    index_map = dict(zip(expander_ids["patient_id"], expander_ids["index_date"]))
-
-    print("Expander patients loaded from {}: {}".format(PATIENT_STAGING_CSV, len(expander_set)))
-
-    # ---- Load and unify notes ----
-    note_frames = []
-
-    if SCAN_OPERATION_NOTES:
-        op_raw = read_csv_fallback(OP_NOTES_CSV)
-        op_notes = build_note_level_df(op_raw, "operation_notes")
-        note_frames.append(op_notes)
-
-    if SCAN_INPATIENT_NOTES:
-        ip_raw = read_csv_fallback(INPATIENT_NOTES_CSV)
-        ip_notes = build_note_level_df(ip_raw, "inpatient_notes")
-        note_frames.append(ip_notes)
-
-    if SCAN_CLINIC_NOTES:
-        cl_raw = read_csv_fallback(CLINIC_NOTES_CSV)
-        cl_notes = build_note_level_df(cl_raw, "clinic_notes")
-        note_frames.append(cl_notes)
-
-    if not note_frames:
-        raise RuntimeError("No note sources enabled. Set SCAN_* = True for at least one notes file.")
-
-    notes = pd.concat(note_frames, ignore_index=True)
-
-    # Keep only expander patients
-    notes = notes[notes["patient_id"].isin(expander_set)].copy()
-    notes["note_text"] = notes["note_text"].fillna("").astype(str)
-
-    # If filtering to AFTER index, attach index date
-    notes["index_date"] = notes["patient_id"].map(index_map)
-
-    if FILTER_TO_AFTER_INDEX:
-        # Keep notes with note_date >= index_date (or keep if index_date missing)
-        keep = (notes["index_date"].isna()) | (notes["note_date"].isna()) | (notes["note_date"] >= notes["index_date"])
-        notes = notes[keep].copy()
-
-    print("Total notes for expander patients (post index filter={}): {}".format(FILTER_TO_AFTER_INDEX, notes.shape[0]))
-
-    # ---- Scan notes for matches ----
-    hits_rows = []
-    per_patient_hit_counts = {}
-
-    # Iterate row-wise (works fine at moderate scale; avoids exploding memory)
-    for i, r in notes.iterrows():
-        pid = r["patient_id"]
-        txt = r["note_text"]
-
-        # cap
-        c = per_patient_hit_counts.get(pid, 0)
-        if c >= MAX_HITS_PER_PATIENT:
-            continue
-
-        matches = find_matches(txt)
-        if not matches:
-            continue
-
-        for m in matches:
-            hits_rows.append({
-                "patient_id": pid,
-                "index_date": r["index_date"].strftime("%Y-%m-%d") if pd.notnull(r["index_date"]) else "",
-                "source": r["source"],
-                "note_date": r["note_date"].strftime("%Y-%m-%d") if pd.notnull(r["note_date"]) else "",
-                "note_type": r["note_type"],
-                "note_id": r["note_id"],
-                "pattern": m["pattern"],
-                "snippet": m["snippet"],
-            })
-
-        per_patient_hit_counts[pid] = c + 1
-
-    hits = pd.DataFrame(hits_rows)
-    if hits.empty:
-        print("No Stage-2 language hits found in the scanned notes.")
-        # Still write empty outputs for consistency
-        hits.to_csv("qa_stage2_note_hits_expanders.csv", index=False)
-        pd.DataFrame(columns=["patient_id", "index_date", "earliest_hit_date", "n_hit_notes", "n_hit_rows"]).to_csv(
-            "qa_stage2_patient_summary_expanders.csv", index=False
-        )
-        pd.DataFrame(columns=["pattern", "n_hits"]).to_csv("qa_stage2_keyword_counts.csv", index=False)
-        return
-
-    # ---- Patient-level summary ----
-    # earliest hit date per patient (based on note_date)
-    tmp = hits.copy()
-    tmp["note_date_dt"] = pd.to_datetime(tmp["note_date"], errors="coerce")
-
-    patient_summary = tmp.groupby("patient_id").agg(
-        index_date=("index_date", "first"),
-        earliest_hit_date=("note_date_dt", "min"),
-        n_hit_rows=("pattern", "size"),
-        n_hit_notes=("note_id", pd.Series.nunique),
-    ).reset_index()
-
-    patient_summary["earliest_hit_date"] = patient_summary["earliest_hit_date"].dt.strftime("%Y-%m-%d")
-
-    # ---- Keyword counts ----
-    keyword_counts = hits["pattern"].value_counts().reset_index()
-    keyword_counts.columns = ["pattern", "n_hits"]
-
-    # ---- Write outputs ----
-    hits.to_csv("qa_stage2_note_hits_expanders.csv", index=False)
-    patient_summary.to_csv("qa_stage2_patient_summary_expanders.csv", index=False)
-    keyword_counts.to_csv("qa_stage2_keyword_counts.csv", index=False)
-
-    # ---- Console summary ----
-    n_patients_with_hits = patient_summary.shape[0]
-    print("")
-    print("=== Stage-2 Notes Scan Summary (Expanders) ===")
-    print("Expander patients total: {}".format(len(expander_set)))
-    print("Patients with >=1 Stage-2 language hit: {} ({:.1f}%)".format(
-        n_patients_with_hits,
-        100.0 * n_patients_with_hits / float(len(expander_set)) if expander_set else 0.0
-    ))
-    print("Total hit rows: {}".format(hits.shape[0]))
-    print("")
-    print("Top patterns:")
-    print(keyword_counts.head(12).to_string(index=False))
-    print("")
     print("Wrote:")
-    print(" - qa_stage2_note_hits_expanders.csv")
-    print(" - qa_stage2_patient_summary_expanders.csv")
-    print(" - qa_stage2_keyword_counts.csv")
+    print(" - qa_all_enc_cpt_inventory_by_file.csv")
+    print(" - qa_all_enc_proc_inventory_by_file.csv")
+    print(" - qa_all_enc_stage2_cpt_hits.csv")
+    print(" - qa_all_enc_stage2_keyword_hits.csv")
+    print("")
+
+    # Quick console summary: stage2 CPTs by file
+    if not out_s2c.empty:
+        s = out_s2c.groupby(["file_tag", "cpt"]).agg(
+            encounter_rows=("cpt", "size"),
+            unique_patients=("patient_id", pd.Series.nunique),
+        ).reset_index()
+        print("Stage2 CPT hits summary (encounters):")
+        print(s.to_string(index=False))
+    else:
+        print("Stage2 CPT hits summary (encounters): NONE")
+
+    print("\n=== Auditing NOTES (Clinic/Inpatient/Operation) ===")
+    out_hits, kc, total_hit_rows = audit_notes()
+
+    print("Wrote:")
+    print(" - qa_all_notes_stage2_keyword_hits.csv")
+    print(" - qa_all_notes_keyword_counts.csv")
+    print("")
+    print("Notes hit rows (any stage2-ish pattern): {}".format(int(total_hit_rows)))
+    print("Top note patterns:")
+    if kc is not None and not kc.empty:
+        print(kc.head(15).to_string(index=False))
+    else:
+        print("NONE")
+    print("\nDone.")
 
 
 if __name__ == "__main__":
