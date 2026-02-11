@@ -206,7 +206,7 @@ def main():
     # Use expander pathway patients
     # (Your staging uses has_expander boolean + pathway label)
     if "has_expander" in stg.columns:
-        expander_ids = stg[stg["has_expander"].astype(str).str.lower().isin(["true", "1", "yes"])اة].copy()
+        expander_ids = stg[stg["has_expander"].astype(str).str.lower().isin(["true", "1", "yes"])].copy()
     else:
         # Fallback: pathway label
         if "pathway" not in stg.columns:
