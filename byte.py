@@ -1,1 +1,4 @@
-b=open('median.py','rb').read(); print('n_0xA0=', b.count(b'\\xA0')); print('first_5_offsets=', [i for i in range(len(b)) if b[i]==0xA0][:5])
+b=open('median.py','rb').read(); \
+import codecs; \
+try: b.decode('utf-8'); print('OK: valid utf-8'); \
+except UnicodeDecodeError as e: print('BAD utf-8:', e, 'byte=', hex(b[e.start]))
