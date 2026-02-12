@@ -1,1 +1,1 @@
-p=3808; b=open('median.py','rb').read(); print('len',len(b)); print('byte@p',hex(b[p])); print('window',b[p-20:p+20])
+b=open('median.py','rb').read(); print('n_0xA0=', b.count(b'\\xA0')); print('first_5_offsets=', [i for i in range(len(b)) if b[i]==0xA0][:5])
