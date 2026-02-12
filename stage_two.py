@@ -1,5 +1,5 @@
 # stage2_scan_op_notes_expanders.py
- -*- coding: cp1252 -*-
+#-*- coding: cp1252 -*-
 # Python 3.6+ (pandas required)
 #
 # Purpose:
