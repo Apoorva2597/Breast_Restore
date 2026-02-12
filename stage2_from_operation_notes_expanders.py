@@ -1,4 +1,3 @@
-cat > stage2_from_operation_notes_expanders.py <<'PY'
 # -*- coding: utf-8 -*-
 # stage2_from_operation_notes_expanders.py
 # Python 3.6+ (pandas required)
@@ -361,4 +360,3 @@ if __name__ == "__main__":
     except Exception as e:
         print("ERROR:", str(e))
         sys.exit(1)
-PY
