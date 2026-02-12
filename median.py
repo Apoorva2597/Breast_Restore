@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 # stage2_from_operation_notes_expanders.py
 # Python 3.6+ (pandas required)
 #
@@ -6,13 +7,13 @@
 #   scan OPERATION NOTES for Stage 2 evidence (TE -> implant exchange).
 #
 # Inputs:
-#   1) patient_recon_staging.csv  (from your structured staging script)
-#   2) HPI11526 Operation Notes.csv (note-level file with NOTE_TEXT, NOTE_DATE_OF_SERVICE, etc.)
+#   1) patient_recon_staging.csv
+#   2) HPI11526 Operation Notes.csv
 #
 # Outputs:
-#   1) stage2_from_notes_patient_level.csv   (best Stage 2 per patient, tiered)
-#   2) stage2_from_notes_row_hits.csv        (row-level matches for QA)
-#   3) stage2_from_notes_summary.txt         (counts, tier breakdown)
+#   1) stage2_from_notes_patient_level.csv
+#   2) stage2_from_notes_row_hits.csv
+#   3) stage2_from_notes_summary.txt
 
 import re
 import sys
@@ -24,14 +25,13 @@ import pandas as pd
 # -------------------------
 PATIENT_STAGING_CSV = "patient_recon_staging.csv"
 
-# Update this path to your operation notes file:
 OP_NOTES_CSV = "/home/apokol/my_data_Breast/HPI-11526/HPI11256/HPI11526 Operation Notes.csv"
 
 OUT_PATIENT_LEVEL = "stage2_from_notes_patient_level.csv"
 OUT_ROW_HITS = "stage2_from_notes_row_hits.csv"
 OUT_SUMMARY = "stage2_from_notes_summary.txt"
 
-# Note file columns (based on what you showed)
+# Note file columns
 COL_PATIENT = "ENCRYPTED_PAT_ID"
 COL_MRN = "MRN"
 COL_NOTE_TEXT = "NOTE_TEXT"
@@ -42,21 +42,37 @@ COL_NOTE_ID = "NOTE_ID"
 
 
 # -------------------------
-# Helpers
+# Robust CSV read helpers
 # -------------------------
-def read_csv_fallback(path, **kwargs):
-    try:
-        return pd.read_csv(path, encoding="utf-8", engine="python", **kwargs)
-    except UnicodeDecodeError:
-        return pd.read_csv(path, encoding="cp1252", engine="python", **kwargs)
+def read_csv_robust(path, **kwargs):
+    """
+    Reads a CSV robustly across common encodings.
+    Priority:
+      1) utf-8
+      2) cp1252 (Windows)
+      3) latin-1 (never fails)
+    """
+    for enc in ("utf-8", "cp1252", "latin-1"):
+        try:
+            return pd.read_csv(path, encoding=enc, engine="python", **kwargs)
+        except UnicodeDecodeError:
+            continue
+    # If we somehow get here, raise last error
+    return pd.read_csv(path, encoding="latin-1", engine="python", **kwargs)
 
 
 def norm_text(x):
     if x is None:
         return ""
     s = str(x)
+
+    # Normalize the usual whitespace + weird bytes
+    # NBSP (non-breaking space) often appears as U+00A0
+    s = s.replace(u"\u00A0", " ")
     s = s.replace("\n", " ").replace("\r", " ")
     s = s.replace("_", " ")
+
+    # Collapse whitespace
     s = re.sub(r"\s+", " ", s)
     return s.strip()
 
@@ -65,24 +81,14 @@ def parse_date_series(s):
     return pd.to_datetime(s, errors="coerce")
 
 
+def to_bool(x):
+    s = str(x).strip().lower()
+    return s in ["true", "1", "yes", "y", "t"]
+
+
 # -------------------------
 # Stage 2 evidence patterns (notes)
 # -------------------------
-# We want *reliable* Stage 2 = expander removal/explant AND implant placement/exchange.
-#
-# Tier A (Definitive):
-#   - exchange expander to implant
-#   - remove/explant tissue expander + place/insert implant
-#
-# Tier B (Strong):
-#   - explicit "second stage" AND implant placement/exchange language, but expander removal may be implicit
-#   - capsulotomy/capsulectomy + implant placement + expander context
-#
-# Tier C (Suggestive):
-#   - mentions "second stage" / "permanent implant" as plan/history without clear op action
-#
-# We will also capture "noise" patterns (tissue expander present) to help debugging.
-
 RX = {
     # components
     "EXPANDER": re.compile(r"\b(tissue\s*expander|expander|expandr|te)\b", re.I),
@@ -93,7 +99,7 @@ RX = {
     "SECOND_STAGE": re.compile(r"\b(second\s+stage|stage\s*2|stage\s+ii)\b", re.I),
     "CAPSU": re.compile(r"\b(capsulotomy|capsulectomy)\b", re.I),
 
-    # strong combined phrases
+    # strong combined phrases (Tier A)
     "EXCHANGE_TE_TO_IMPLANT": re.compile(
         r"\bexchange\b.{0,60}\b(tissue\s*expander|expander|expandr|te)\b.{0,120}\b(implant|implnt|permanent\s+implant)\b|"
         r"\bexchange\b.{0,60}\b(implant|implnt|permanent\s+implant)\b.{0,120}\b(tissue\s*expander|expander|expandr|te)\b",
@@ -119,7 +125,7 @@ def classify_note_stage2(note_text):
     if RX["REMOVE_EXPANDER_PLACE_IMPLANT"].search(t):
         return ("A", "REMOVE_EXPANDER_PLACE_IMPLANT")
 
-    # Tier B: strong but not perfect (requires meaningful combo)
+    # Tier B: strong but not perfect
     has_second = bool(RX["SECOND_STAGE"].search(t))
     has_capsu = bool(RX["CAPSU"].search(t))
     has_implant = bool(RX["IMPLANT"].search(t))
@@ -128,7 +134,6 @@ def classify_note_stage2(note_text):
     has_remove = bool(RX["REMOVE"].search(t))
     has_place = bool(RX["PLACE"].search(t))
 
-    # strong combos
     if has_exchange and has_implant and has_expander:
         return ("B", "EXCHANGE+IMPLANT+EXPANDER")
     if has_capsu and has_implant and (has_exchange or has_remove or has_place) and has_expander:
@@ -145,59 +150,64 @@ def classify_note_stage2(note_text):
     return (None, None)
 
 
+def snippet(text, n=240):
+    s = "" if text is None else str(text)
+    s = s.replace(u"\u00A0", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    return (s[:n] + "...") if len(s) > n else s
+
+
 def main():
     # -------------------------
     # Load expander cohort + index dates (stage1_date)
     # -------------------------
-    stg = read_csv_fallback(PATIENT_STAGING_CSV)
-    needed_cols = set(["patient_id", "has_expander", "stage1_date"])
+    stg = read_csv_robust(PATIENT_STAGING_CSV)
+
+    needed_cols = ["patient_id", "has_expander", "stage1_date"]
     missing = [c for c in needed_cols if c not in stg.columns]
     if missing:
         raise RuntimeError("Missing required columns in {}: {}".format(PATIENT_STAGING_CSV, missing))
 
-    # normalize booleans
-    def to_bool(x):
-        s = str(x).strip().lower()
-        return s in ["true", "1", "yes", "y"]
-
     stg["has_expander_bool"] = stg["has_expander"].apply(to_bool)
     exp = stg[stg["has_expander_bool"]].copy()
 
+    exp["patient_id"] = exp["patient_id"].fillna("").astype(str)
     exp["stage1_dt"] = parse_date_series(exp["stage1_date"])
-    exp_ids = set(exp["patient_id"].astype(str).tolist())
 
-    if len(exp_ids) == 0:
-        raise RuntimeError("No expander patients found in patient_recon_staging.csv (has_expander==True).")
+    exp_ids = set(exp["patient_id"].tolist())
+    if not exp_ids:
+        raise RuntimeError("No expander patients found in {} (has_expander==True).".format(PATIENT_STAGING_CSV))
 
-    # quick lookup maps
-    stage1_map = dict(zip(exp["patient_id"].astype(str), exp["stage1_dt"]))
-    mrn_map = dict(zip(exp["patient_id"].astype(str), exp.get("mrn", pd.Series([""]*len(exp))).astype(str)))
+    stage1_map = dict(zip(exp["patient_id"], exp["stage1_dt"]))
+    mrn_map = dict(zip(exp["patient_id"], exp.get("mrn", pd.Series([""] * len(exp))).fillna("").astype(str)))
 
     # -------------------------
-    # Stream operation notes and collect hits
+    # Validate note columns exist
     # -------------------------
     usecols = [COL_PATIENT, COL_MRN, COL_NOTE_TEXT, COL_NOTE_DOS, COL_OP_DATE, COL_NOTE_TYPE, COL_NOTE_ID]
-    # read header first to ensure columns exist
-    head = read_csv_fallback(OP_NOTES_CSV, nrows=5)
+    head = read_csv_robust(OP_NOTES_CSV, nrows=5)
     for c in usecols:
         if c not in head.columns:
             raise RuntimeError("Missing required note column in OP notes file: {}".format(c))
 
+    # -------------------------
+    # Stream operation notes and collect hits
+    # -------------------------
     chunksize = 200000  # adjust if memory issues
-    hit_rows = []
+    hit_chunks = []
 
-    total_rows_scanned = 0
-    total_rows_in_expanders = 0
+    total_rows_expander = 0
+    total_hit_rows = 0
 
-    for chunk in read_csv_fallback(OP_NOTES_CSV, usecols=usecols, chunksize=chunksize):
+    for chunk in read_csv_robust(OP_NOTES_CSV, usecols=usecols, chunksize=chunksize):
         chunk[COL_PATIENT] = chunk[COL_PATIENT].fillna("").astype(str)
-        chunk = chunk[chunk[COL_PATIENT].isin(exp_ids)].copy()
 
-        total_rows_scanned += len(chunk)
+        # keep expander cohort only
+        chunk = chunk[chunk[COL_PATIENT].isin(exp_ids)].copy()
         if chunk.empty:
             continue
 
-        total_rows_in_expanders += len(chunk)
+        total_rows_expander += len(chunk)
 
         chunk["note_text_norm"] = chunk[COL_NOTE_TEXT].apply(norm_text)
 
@@ -221,17 +231,8 @@ def main():
         if hits.empty:
             continue
 
-        # attach index (stage1) and delta
         hits["stage1_dt"] = hits[COL_PATIENT].map(stage1_map)
         hits["delta_days_vs_stage1"] = (hits["event_dt"] - hits["stage1_dt"]).dt.days
-
-        # keep a short snippet for QA
-        def snippet(s):
-            s = s if s is not None else ""
-            s = str(s)
-            s = re.sub(r"\s+", " ", s).strip()
-            return (s[:240] + "...") if len(s) > 240 else s
-
         hits["snippet"] = hits[COL_NOTE_TEXT].apply(snippet)
 
         keep = [
@@ -239,10 +240,11 @@ def main():
             COL_NOTE_DOS, COL_OP_DATE, "event_dt",
             "tier", "rule", "delta_days_vs_stage1", "snippet"
         ]
-        hit_rows.append(hits[keep])
+        hit_chunks.append(hits[keep])
+        total_hit_rows += len(hits)
 
-    if hit_rows:
-        hits_all = pd.concat(hit_rows, ignore_index=True)
+    if hit_chunks:
+        hits_all = pd.concat(hit_chunks, ignore_index=True)
     else:
         hits_all = pd.DataFrame(columns=[
             COL_PATIENT, COL_MRN, COL_NOTE_TYPE, COL_NOTE_ID,
@@ -251,19 +253,17 @@ def main():
         ])
 
     # -------------------------
-    # Patient-level best Stage 2 (prefer: AFTER index, Tier A > B > C, earliest date)
+    # Patient-level best Stage 2
+    # Prefer: AFTER index, Tier A > B > C, earliest event_dt
     # -------------------------
-    # ranking: A=3, B=2, C=1
     tier_rank = {"A": 3, "B": 2, "C": 1}
     hits_all["tier_rank"] = hits_all["tier"].map(tier_rank).fillna(0).astype(int)
 
-    # separate after-index vs not
-    hits_all["after_index"] = hits_all["delta_days_vs_stage1"].apply(lambda x: (x is not None) and pd.notnull(x) and (x >= 0))
+    def after_index_flag(x):
+        return pd.notnull(x) and (x >= 0)
 
-    # best hit selection per patient:
-    # 1) prefer after_index True
-    # 2) higher tier_rank
-    # 3) earliest event_dt
+    hits_all["after_index"] = hits_all["delta_days_vs_stage1"].apply(after_index_flag)
+
     hits_all = hits_all.sort_values(
         by=[COL_PATIENT, "after_index", "tier_rank", "event_dt"],
         ascending=[True, False, False, True]
@@ -271,8 +271,7 @@ def main():
 
     best = hits_all.groupby(COL_PATIENT, as_index=False).head(1).copy()
 
-    # build patient-level table for ALL expander patients, even those with no hits
-    patient_level = pd.DataFrame({ "patient_id": list(exp_ids) })
+    patient_level = pd.DataFrame({"patient_id": list(exp_ids)})
     patient_level["stage1_dt"] = patient_level["patient_id"].map(stage1_map)
     patient_level["mrn_from_staging"] = patient_level["patient_id"].map(mrn_map)
 
@@ -283,11 +282,10 @@ def main():
             how="left"
         )
     else:
-        # add empty columns
-        for c in [COL_MRN, COL_NOTE_TYPE, COL_NOTE_ID, COL_NOTE_DOS, COL_OP_DATE, "event_dt", "tier", "rule", "delta_days_vs_stage1", "snippet", "after_index", "tier_rank"]:
+        for c in [COL_MRN, COL_NOTE_TYPE, COL_NOTE_ID, COL_NOTE_DOS, COL_OP_DATE, "event_dt",
+                  "tier", "rule", "delta_days_vs_stage1", "snippet", "after_index", "tier_rank"]:
             patient_level[c] = None
 
-    # rename output columns cleanly
     patient_level = patient_level.rename(columns={
         "event_dt": "stage2_event_dt_best",
         "tier": "stage2_tier_best",
@@ -318,6 +316,8 @@ def main():
     lines = []
     lines.append("=== Stage 2 from OPERATION NOTES (Expanders) ===")
     lines.append("Expander patients (from patient_recon_staging.csv): {}".format(n_exp))
+    lines.append("Total note rows scanned (expanders only): {}".format(total_rows_expander))
+    lines.append("Total hit rows (tier A/B/C): {}".format(total_hit_rows))
     lines.append("Patients with ANY Stage2 note hit (any date): {} ({:.1f}%)".format(
         n_pat_with_any_hit, (100.0 * n_pat_with_any_hit / n_exp) if n_exp else 0.0
     ))
@@ -334,7 +334,7 @@ def main():
     lines.append("  - {}".format(OUT_ROW_HITS))
     lines.append("  - {}".format(OUT_SUMMARY))
 
-    with open(OUT_SUMMARY, "w") as f:
+    with open(OUT_SUMMARY, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
 
     print("\n".join(lines))
