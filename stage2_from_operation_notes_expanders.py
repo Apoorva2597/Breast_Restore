@@ -16,8 +16,6 @@ cat > stage2_from_operation_notes_expanders.py <<'PY'
 #   2) stage2_from_notes_row_hits.csv
 #   3) stage2_from_notes_summary.txt
 
-from __future__ import print_function
-
 import re
 import sys
 import pandas as pd
