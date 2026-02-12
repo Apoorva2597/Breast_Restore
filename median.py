@@ -1,20 +1,3 @@
-# -*- coding: utf-8 -*-
-# stage2_from_operation_notes_expanders.py
-# Python 3.6+ (pandas required)
-#
-# Goal:
-#   For expander-pathway patients (from patient_recon_staging.csv),
-#   scan OPERATION NOTES for Stage 2 evidence (TE -> implant exchange).
-#
-# Inputs:
-#   1) patient_recon_staging.csv
-#   2) HPI11526 Operation Notes.csv
-#
-# Outputs:
-#   1) stage2_from_notes_patient_level.csv
-#   2) stage2_from_notes_row_hits.csv
-#   3) stage2_from_notes_summary.txt
-
 import re
 import sys
 import pandas as pd
