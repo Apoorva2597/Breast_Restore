@@ -23,7 +23,7 @@ COL_NOTE_ID = "NOTE_ID"
 
 def read_csv_fallback(path, **kwargs):
     """
-    Read CSV with UTF-8 first; fallback to CP1252 if needed.
+    Read CSV with UTF-8 first; fallback to CP1252 if needed
     """
     try:
         return pd.read_csv(path, encoding="utf-8", engine="python", **kwargs)
