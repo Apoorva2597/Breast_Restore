@@ -4,7 +4,7 @@
 #
 # Purpose:
 #   For expander-pathway patients (from patient_recon_staging.csv),
-#   scan OPERATION NOTES for Stage 2 evidence (tissue expander -> implant exchange).
+#   scan OPERATION NOTES for Stage 2 evidence (tissue expander -> implant exchange)
 #
 # Inputs:
 #   1) patient_recon_staging.csv
