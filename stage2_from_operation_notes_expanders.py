@@ -1,28 +1,7 @@
-# -*- coding: utf-8 -*-
-# stage2_from_operation_notes_expanders.py
-# Python 3.6+ (pandas required)
-#
-# Purpose:
-#   For expander-pathway patients (from patient_recon_staging.csv),
-#   scan OPERATION NOTES for Stage 2 evidence (tissue expander -> implant exchange)
-#
-# Inputs:
-#   1) patient_recon_staging.csv
-#   2) HPI11526 Operation Notes.csv
-#
-# Outputs:
-#   1) stage2_from_notes_patient_level.csv
-#   2) stage2_from_notes_row_hits.csv
-#   3) stage2_from_notes_summary.txt
-
 import re
 import sys
 import pandas as pd
 
-
-# -------------------------
-# CONFIG (EDIT PATHS ONLY)
-# -------------------------
 PATIENT_STAGING_CSV = "patient_recon_staging.csv"
 
 OP_NOTES_CSV = (
@@ -42,10 +21,6 @@ COL_OP_DATE = "OPERATION_DATE"
 COL_NOTE_TYPE = "NOTE_TYPE"
 COL_NOTE_ID = "NOTE_ID"
 
-
-# -------------------------
-# CSV read helpers
-# -------------------------
 def read_csv_fallback(path, **kwargs):
     """
     Read CSV with UTF-8 first; fallback to CP1252 if needed.
@@ -84,23 +59,6 @@ def make_snippet(x, n=240):
         return s[:n] + "..."
     return s
 
-
-# -------------------------
-# Stage 2 evidence patterns (notes)
-# -------------------------
-# Tier A (definitive):
-#   - "exchange expander to implant"
-#   - "remove/explant expander" + "place/insert implant" (close proximity)
-#
-# Tier B (strong):
-#   - exchange + expander + implant (not necessarily explicit removal)
-#   - second stage + implant + action + expander
-#   - capsulotomy/capsulectomy + implant + action + expander
-#
-# Tier C (suggestive):
-#   - second stage + implant/exchange (plan/history possible)
-#   - expander + implant mentioned but no explicit action
-
 RX = {
     "EXPANDER": re.compile(r"\b(tissue\s*expander|expander|expandr|\bte\b)\b", re.I),
     "IMPLANT": re.compile(r"\b(implant|implnt|permanent\s+implant)\b", re.I),
@@ -119,7 +77,7 @@ RX = {
         re.I,
     ),
     "REMOVE_EXPANDER_PLACE_IMPLANT": re.compile(
-        r"\b(remove|removed|explant|explanted)\b.{0,140}\b(tissue\s*expander|expander|expandr|\bte\b)\b.{0,260}\b(place|placed|insert|inserted)\b.{0,100}\b(implant|implnt|permanent\s+implant)\b|"
+        r"\b(remove|removed|explant|explanted)\b.{0,140}\b(tissue\s*expander|expander|expandr|\bte\b)\b.{0,260}\b(place|placed|insert|inserted)\b.{0,100}\b(implant|implnt|permanent\s+implant)\b|",
         r"\b(place|placed|insert|inserted)\b.{0,100}\b(implant|implnt|permanent\s+implant)\b.{0,260}\b(remove|removed|explant|explanted)\b.{0,140}\b(tissue\s*expander|expander|expandr|\bte\b)\b",
         re.I,
     ),
@@ -174,9 +132,6 @@ def classify_note_stage2(note_text):
 
 
 def main():
-    # -------------------------
-    # Load expander cohort from patient_recon_staging.csv
-    # -------------------------
     stg = read_csv_fallback(PATIENT_STAGING_CSV)
 
     required = ["patient_id", "has_expander", "stage1_date"]
@@ -208,9 +163,6 @@ def main():
 
     print("Expander patients:", len(exp_ids))
 
-    # -------------------------
-    # Validate OP notes columns exist
-    # -------------------------
     head = read_csv_fallback(OP_NOTES_CSV, nrows=5)
     needed_note_cols = [
         COL_PATIENT,
@@ -226,10 +178,7 @@ def main():
         raise RuntimeError(
             "Missing required column(s) in OP notes CSV: {}".format(missing)
         )
-
-    # -------------------------
-    # Stream OP notes and collect hits
-    # -------------------------
+        
     usecols = needed_note_cols
     chunksize = 200000
 
@@ -238,7 +187,6 @@ def main():
     n_rows_in_expanders = 0
 
     for chunk in read_csv_fallback(OP_NOTES_CSV, usecols=usecols, chunksize=chunksize):
-        # standardize patient id
         chunk[COL_PATIENT] = chunk[COL_PATIENT].fillna("").astype(str)
 
         n_rows_seen += len(chunk)
@@ -313,9 +261,6 @@ def main():
             ]
         )
 
-    # -------------------------
-    # Patient-level best Stage 2 selection
-    # -------------------------
     tier_rank = {"A": 3, "B": 2, "C": 1}
     if not hits_all.empty:
         hits_all["tier_rank"] = hits_all["tier"].map(tier_rank).fillna(0).astype(int)
@@ -339,7 +284,6 @@ def main():
         best = best.rename(columns={COL_PATIENT: "patient_id"})
         patient_level = patient_level.merge(best, on="patient_id", how="left")
     else:
-        # ensure columns exist
         for c in [
             COL_MRN,
             COL_NOTE_TYPE,
@@ -371,15 +315,9 @@ def main():
         }
     )
 
-    # -------------------------
-    # Write outputs
-    # -------------------------
     hits_all.to_csv(OUT_ROW_HITS, index=False)
     patient_level.to_csv(OUT_PATIENT_LEVEL, index=False)
 
-    # -------------------------
-    # Summary
-    # -------------------------
     n_exp = len(exp_ids)
     n_any_hit = int(patient_level["stage2_tier_best"].notnull().sum())
     n_after = int(patient_level["stage2_after_index"].fillna(False).astype(bool).sum())
