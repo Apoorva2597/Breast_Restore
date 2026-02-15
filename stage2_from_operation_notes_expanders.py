@@ -25,7 +25,9 @@ import pandas as pd
 # -------------------------
 PATIENT_STAGING_CSV = "patient_recon_staging.csv"
 
-OP_NOTES_CSV = "/home/apokol/my_data_Breast/HPI-11526/HPI11256/HPI11526 Operation Notes.csv"
+OP_NOTES_CSV = (
+    "/home/apokol/my_data_Breast/HPI-11526/HPI11256/HPI11526 Operation Notes.csv"
+)
 
 OUT_PATIENT_LEVEL = "stage2_from_notes_patient_level.csv"
 OUT_ROW_HITS = "stage2_from_notes_row_hits.csv"
@@ -102,22 +104,24 @@ def make_snippet(x, n=240):
 RX = {
     "EXPANDER": re.compile(r"\b(tissue\s*expander|expander|expandr|\bte\b)\b", re.I),
     "IMPLANT": re.compile(r"\b(implant|implnt|permanent\s+implant)\b", re.I),
-    "REMOVE": re.compile(r"\b(remove|removed|explant|explanted|take\s*out|taken\s*out)\b", re.I),
-    "PLACE": re.compile(r"\b(place|placed|insert|inserted|insertion|implantation)\b", re.I),
+    "REMOVE": re.compile(
+        r"\b(remove|removed|explant|explanted|take\s*out|taken\s*out)\b", re.I
+    ),
+    "PLACE": re.compile(
+        r"\b(place|placed|insert|inserted|insertion|implantation)\b", re.I
+    ),
     "EXCHANGE": re.compile(r"\b(exchange|exchanged)\b", re.I),
     "SECOND_STAGE": re.compile(r"\b(second\s+stage|stage\s*2|stage\s*ii)\b", re.I),
     "CAPSU": re.compile(r"\b(capsulotomy|capsulectomy)\b", re.I),
-
     "EXCHANGE_TE_TO_IMPLANT": re.compile(
         r"\bexchange\b.{0,60}\b(tissue\s*expander|expander|expandr|\bte\b)\b.{0,120}\b(implant|implnt|permanent\s+implant)\b|"
         r"\bexchange\b.{0,60}\b(implant|implnt|permanent\s+implant)\b.{0,120}\b(tissue\s*expander|expander|expandr|\bte\b)\b",
-        re.I
+        re.I,
     ),
-
     "REMOVE_EXPANDER_PLACE_IMPLANT": re.compile(
         r"\b(remove|removed|explant|explanted)\b.{0,140}\b(tissue\s*expander|expander|expandr|\bte\b)\b.{0,260}\b(place|placed|insert|inserted)\b.{0,100}\b(implant|implnt|permanent\s+implant)\b|"
         r"\b(place|placed|insert|inserted)\b.{0,100}\b(implant|implnt|permanent\s+implant)\b.{0,260}\b(remove|removed|explant|explanted)\b.{0,140}\b(tissue\s*expander|expander|expandr|\bte\b)\b",
-        re.I
+        re.I,
     ),
 }
 
@@ -145,9 +149,19 @@ def classify_note_stage2(note_text):
     # Tier B: strong combos
     if has_exchange and has_implant and has_expander:
         return ("B", "EXCHANGE+IMPLANT+EXPANDER")
-    if has_second and has_implant and (has_exchange or has_remove or has_place) and has_expander:
+    if (
+        has_second
+        and has_implant
+        and (has_exchange or has_remove or has_place)
+        and has_expander
+    ):
         return ("B", "SECOND_STAGE+IMPLANT+ACTION+EXPANDER")
-    if has_capsu and has_implant and (has_exchange or has_remove or has_place) and has_expander:
+    if (
+        has_capsu
+        and has_implant
+        and (has_exchange or has_remove or has_place)
+        and has_expander
+    ):
         return ("B", "CAPSU+IMPLANT+ACTION+EXPANDER")
 
     # Tier C: suggestive
@@ -168,14 +182,18 @@ def main():
     required = ["patient_id", "has_expander", "stage1_date"]
     for c in required:
         if c not in stg.columns:
-            raise RuntimeError("Missing required column in {}: {}".format(PATIENT_STAGING_CSV, c))
+            raise RuntimeError(
+                "Missing required column in {}: {}".format(PATIENT_STAGING_CSV, c)
+            )
 
     stg["patient_id"] = stg["patient_id"].fillna("").astype(str)
     stg["has_expander_bool"] = stg["has_expander"].apply(to_bool)
     exp = stg[stg["has_expander_bool"]].copy()
 
     if exp.empty:
-        raise RuntimeError("No expander patients found (has_expander == True) in patient_recon_staging.csv.")
+        raise RuntimeError(
+            "No expander patients found (has_expander == True) in patient_recon_staging.csv."
+        )
 
     exp["stage1_dt"] = parse_dt(exp["stage1_date"])
 
@@ -194,10 +212,20 @@ def main():
     # Validate OP notes columns exist
     # -------------------------
     head = read_csv_fallback(OP_NOTES_CSV, nrows=5)
-    needed_note_cols = [COL_PATIENT, COL_NOTE_TEXT, COL_NOTE_DOS, COL_OP_DATE, COL_NOTE_TYPE, COL_NOTE_ID, COL_MRN]
+    needed_note_cols = [
+        COL_PATIENT,
+        COL_NOTE_TEXT,
+        COL_NOTE_DOS,
+        COL_OP_DATE,
+        COL_NOTE_TYPE,
+        COL_NOTE_ID,
+        COL_MRN,
+    ]
     missing = [c for c in needed_note_cols if c not in head.columns]
     if missing:
-        raise RuntimeError("Missing required column(s) in OP notes CSV: {}".format(missing))
+        raise RuntimeError(
+            "Missing required column(s) in OP notes CSV: {}".format(missing)
+        )
 
     # -------------------------
     # Stream OP notes and collect hits
@@ -252,20 +280,38 @@ def main():
         hits["snippet"] = hits[COL_NOTE_TEXT].apply(lambda x: make_snippet(x, n=240))
 
         keep = [
-            COL_PATIENT, COL_MRN, COL_NOTE_TYPE, COL_NOTE_ID,
-            COL_NOTE_DOS, COL_OP_DATE, "event_dt",
-            "tier", "rule", "delta_days_vs_stage1", "snippet"
+            COL_PATIENT,
+            COL_MRN,
+            COL_NOTE_TYPE,
+            COL_NOTE_ID,
+            COL_NOTE_DOS,
+            COL_OP_DATE,
+            "event_dt",
+            "tier",
+            "rule",
+            "delta_days_vs_stage1",
+            "snippet",
         ]
         hit_frames.append(hits[keep])
 
     if hit_frames:
         hits_all = pd.concat(hit_frames, ignore_index=True)
     else:
-        hits_all = pd.DataFrame(columns=[
-            COL_PATIENT, COL_MRN, COL_NOTE_TYPE, COL_NOTE_ID,
-            COL_NOTE_DOS, COL_OP_DATE, "event_dt",
-            "tier", "rule", "delta_days_vs_stage1", "snippet"
-        ])
+        hits_all = pd.DataFrame(
+            columns=[
+                COL_PATIENT,
+                COL_MRN,
+                COL_NOTE_TYPE,
+                COL_NOTE_ID,
+                COL_NOTE_DOS,
+                COL_OP_DATE,
+                "event_dt",
+                "tier",
+                "rule",
+                "delta_days_vs_stage1",
+                "snippet",
+            ]
+        )
 
     # -------------------------
     # Patient-level best Stage 2 selection
@@ -279,7 +325,7 @@ def main():
 
         hits_all = hits_all.sort_values(
             by=[COL_PATIENT, "after_index", "tier_rank", "event_dt"],
-            ascending=[True, False, False, True]
+            ascending=[True, False, False, True],
         )
         best = hits_all.groupby(COL_PATIENT, as_index=False).head(1).copy()
     else:
@@ -294,23 +340,36 @@ def main():
         patient_level = patient_level.merge(best, on="patient_id", how="left")
     else:
         # ensure columns exist
-        for c in [COL_MRN, COL_NOTE_TYPE, COL_NOTE_ID, COL_NOTE_DOS, COL_OP_DATE, "event_dt", "tier", "rule", "delta_days_vs_stage1", "snippet"]:
+        for c in [
+            COL_MRN,
+            COL_NOTE_TYPE,
+            COL_NOTE_ID,
+            COL_NOTE_DOS,
+            COL_OP_DATE,
+            "event_dt",
+            "tier",
+            "rule",
+            "delta_days_vs_stage1",
+            "snippet",
+        ]:
             patient_level[c] = None
         patient_level["after_index"] = None
         patient_level["tier_rank"] = None
 
-    patient_level = patient_level.rename(columns={
-        "event_dt": "stage2_event_dt_best",
-        "tier": "stage2_tier_best",
-        "rule": "stage2_rule_best",
-        "after_index": "stage2_after_index",
-        "delta_days_vs_stage1": "stage2_delta_days_from_stage1",
-        COL_NOTE_TYPE: "best_note_type",
-        COL_NOTE_ID: "best_note_id",
-        COL_NOTE_DOS: "best_note_dos",
-        COL_OP_DATE: "best_note_op_date",
-        COL_MRN: "mrn_from_notes",
-    })
+    patient_level = patient_level.rename(
+        columns={
+            "event_dt": "stage2_event_dt_best",
+            "tier": "stage2_tier_best",
+            "rule": "stage2_rule_best",
+            "after_index": "stage2_after_index",
+            "delta_days_vs_stage1": "stage2_delta_days_from_stage1",
+            COL_NOTE_TYPE: "best_note_type",
+            COL_NOTE_ID: "best_note_id",
+            COL_NOTE_DOS: "best_note_dos",
+            COL_OP_DATE: "best_note_op_date",
+            COL_MRN: "mrn_from_notes",
+        }
+    )
 
     # -------------------------
     # Write outputs
@@ -329,15 +388,23 @@ def main():
     lines = []
     lines.append("=== Stage 2 from OPERATION NOTES (Expanders) ===")
     lines.append("Expander patients: {}".format(n_exp))
-    lines.append("Rows scanned total (OP notes file, all patients): {}".format(n_rows_seen))
-    lines.append("Rows scanned within expander patients: {}".format(n_rows_in_expanders))
+    lines.append(
+        "Rows scanned total (OP notes file, all patients): {}".format(n_rows_seen)
+    )
+    lines.append(
+        "Rows scanned within expander patients: {}".format(n_rows_in_expanders)
+    )
     lines.append("")
-    lines.append("Patients with ANY Stage2 note hit (any date): {} ({:.1f}%)".format(
-        n_any_hit, (100.0 * n_any_hit / n_exp) if n_exp else 0.0
-    ))
-    lines.append("Patients with best Stage2 hit AFTER Stage1 index: {} ({:.1f}%)".format(
-        n_after, (100.0 * n_after / n_exp) if n_exp else 0.0
-    ))
+    lines.append(
+        "Patients with ANY Stage2 note hit (any date): {} ({:.1f}%)".format(
+            n_any_hit, (100.0 * n_any_hit / n_exp) if n_exp else 0.0
+        )
+    )
+    lines.append(
+        "Patients with best Stage2 hit AFTER Stage1 index: {} ({:.1f}%)".format(
+            n_after, (100.0 * n_after / n_exp) if n_exp else 0.0
+        )
+    )
     lines.append("")
     lines.append("Best-hit tier distribution (patients):")
     for k, v in tier_counts.items():
@@ -360,3 +427,4 @@ if __name__ == "__main__":
     except Exception as e:
         print("ERROR:", str(e))
         sys.exit(1)
+
