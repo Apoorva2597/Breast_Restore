@@ -77,7 +77,7 @@ RX = {
         re.I,
     ),
     "REMOVE_EXPANDER_PLACE_IMPLANT": re.compile(
-        r"\b(remove|removed|explant|explanted)\b.{0,140}\b(tissue\s*expander|expander|expandr|\bte\b)\b.{0,260}\b(place|placed|insert|inserted)\b.{0,100}\b(implant|implnt|permanent\s+implant)\b|",
+        r"\b(remove|removed|explant|explanted)\b.{0,140}\b(tissue\s*expander|expander|expandr|\bte\b)\b.{0,260}\b(place|placed|insert|inserted)\b.{0,100}\b(implant|implnt|permanent\s+implant)\b|"
         r"\b(place|placed|insert|inserted)\b.{0,100}\b(implant|implnt|permanent\s+implant)\b.{0,260}\b(remove|removed|explant|explanted)\b.{0,140}\b(tissue\s*expander|expander|expandr|\bte\b)\b",
         re.I,
     ),
