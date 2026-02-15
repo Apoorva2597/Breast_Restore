@@ -47,13 +47,12 @@ COL_NOTE_ID = "NOTE_ID"
 # CSV read helpers
 # -------------------------
 def read_csv_fallback(path, **kwargs):
-    """
-    Read CSV with UTF-8 first; fallback to CP1252 if needed.
-    """
-    try:
-        return pd.read_csv(path, encoding="utf-8", engine="python", **kwargs)
-    except UnicodeDecodeError:
-        return pd.read_csv(path, encoding="cp1252", engine="python", **kwargs)
+    return pd.read_csv(
+        path,
+        encoding="cp1252",
+        engine="python",
+        error_bad_lines=False
+    )
 
 
 def to_bool(x):
