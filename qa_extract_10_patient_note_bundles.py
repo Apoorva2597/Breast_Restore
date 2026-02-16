@@ -1,7 +1,13 @@
-# qa_pull_2C_2NONE_all_notes_v2.py
-# Python 3.6+ (pandas required)
+# qa_pull_2C_2NONE_all_notes.py
+# Python 3.6+  (pandas required)
 #
-# Fixes: avoids "I/O operation on closed file" by NOT wrapping open() around chunk iterators.
+# Purpose:
+#   Select 2 Tier C and 2 NONE patients from stage2_from_notes_patient_level.csv
+#   and export ALL notes (op/clinic/inpatient) for those patients for extractor refinement.
+#
+# Outputs:
+#   1) qa_4_patients_all_notes.csv
+#   2) qa_patient_notes/<ENCRYPTED_PAT_ID>.txt
 
 from __future__ import print_function
 
@@ -28,6 +34,7 @@ N_TIER_C = 2
 N_NONE = 2
 CHUNKSIZE = 150000
 
+# Columns we care about (keep minimal)
 COL_PAT = "ENCRYPTED_PAT_ID"
 COL_NOTE_TYPE = "NOTE_TYPE"
 COL_NOTE_TEXT = "NOTE_TEXT"
@@ -35,59 +42,67 @@ COL_NOTE_ID = "NOTE_ID"
 COL_DOS = "NOTE_DATE_OF_SERVICE"
 COL_OP_DATE = "OPERATION_DATE"
 
-REQUIRED_NOTE_COLS = [COL_PAT, COL_NOTE_TYPE, COL_NOTE_TEXT, COL_NOTE_ID, COL_DOS, COL_OP_DATE]
 
 # -------------------------
-# Helpers
+# Robust CSV reading (NO file handles; supports chunksize)
 # -------------------------
-def read_csv_try_encodings(path, **kwargs):
+def read_csv_robust(path, **kwargs):
     """
-    Read CSV by trying common encodings.
-    For chunked reads, returns the TextFileReader iterator.
+    Try a small set of encodings to avoid UnicodeDecodeError on EHR exports
+    (0xA0 is common in cp1252/latin1). Works with chunksize.
     """
     encodings = ["utf-8", "cp1252", "latin1"]
     last_err = None
     for enc in encodings:
         try:
             return pd.read_csv(path, encoding=enc, engine="python", **kwargs)
-        except Exception as e:
+        except UnicodeDecodeError as e:
             last_err = e
+            continue
     raise last_err
+
 
 def ensure_cols_exist(df_cols, required):
     missing = [c for c in required if c not in df_cols]
     if missing:
         raise RuntimeError("Missing columns: {}".format(missing))
 
+
 def clean_text(x):
     if x is None:
         return ""
-    s = str(x).replace("\r", " ").replace("\n", " ")
-    s = s.replace("\u00a0", " ")  # NBSP if present
+    s = str(x)
+    s = s.replace("\r", " ").replace("\n", " ")
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
+
 def to_dt(x):
     return pd.to_datetime(x, errors="coerce")
+
 
 def pick_patients(pl, tier_value, n_needed):
     sub = pl[pl["stage2_tier_best_norm"] == tier_value].copy()
     sub = sub.sort_values(by=["patient_id"], ascending=[True])
     return sub["patient_id"].head(n_needed).tolist()
 
-# -------------------------
-# Main
-# -------------------------
+
 def main():
     # 1) Load patient-level file and pick patients
-    pl = read_csv_try_encodings(PATIENT_LEVEL_CSV)
+    pl = read_csv_robust(PATIENT_LEVEL_CSV)
 
     for col in ["patient_id", "stage2_tier_best"]:
         if col not in pl.columns:
             raise RuntimeError("Expected column '{}' in {}".format(col, PATIENT_LEVEL_CSV))
 
     pl["patient_id"] = pl["patient_id"].fillna("").astype(str)
-    pl["stage2_tier_best_norm"] = pl["stage2_tier_best"].fillna("NONE").astype(str).str.strip().str.upper()
+    pl["stage2_tier_best_norm"] = (
+        pl["stage2_tier_best"]
+        .fillna("NONE")
+        .astype(str)
+        .str.strip()
+        .str.upper()
+    )
 
     chosen_C = pick_patients(pl, "C", N_TIER_C)
     chosen_NONE = pick_patients(pl, "NONE", N_NONE)
@@ -116,17 +131,20 @@ def main():
         raise RuntimeError("No patients selected. Check stage2_from_notes_patient_level.csv.")
 
     # 2) Stream each notes file and collect all notes for chosen patients
-    os.makedirs(OUT_TXT_DIR, exist_ok=True)
+    if not os.path.exists(OUT_TXT_DIR):
+        os.makedirs(OUT_TXT_DIR)
 
     all_rows = []
+    required = [COL_PAT, COL_NOTE_TYPE, COL_NOTE_TEXT, COL_NOTE_ID, COL_DOS, COL_OP_DATE]
+
     for file_tag, path in NOTES_FILES:
         print("\nScanning:", file_tag, path)
 
-        head = read_csv_try_encodings(path, nrows=5)
-        ensure_cols_exist(head.columns, REQUIRED_NOTE_COLS)
+        head = read_csv_robust(path, nrows=5)
+        ensure_cols_exist(head.columns, required)
 
-        # IMPORTANT: chunksize iterator from PATH (not open handle)
-        chunk_iter = read_csv_try_encodings(path, usecols=REQUIRED_NOTE_COLS, chunksize=CHUNKSIZE)
+        # IMPORTANT: use path-based read_csv_robust so chunksize works and file isn't closed
+        chunk_iter = read_csv_robust(path, usecols=required, chunksize=CHUNKSIZE)
 
         kept = 0
         for chunk in chunk_iter:
@@ -172,10 +190,11 @@ def main():
     for pid in chosen:
         sub = out[out[COL_PAT] == pid].copy()
         txt_path = os.path.join(OUT_TXT_DIR, "{}.txt".format(pid))
-        tier = pl.loc[pl["patient_id"] == pid, "stage2_tier_best_norm"].iloc[0]
 
+        # write text as utf-8; any odd chars already decoded via cp1252/latin1 safely
         with open(txt_path, "w", encoding="utf-8") as f:
             f.write("PATIENT: {}\n".format(pid))
+            tier = pl.loc[pl["patient_id"] == pid, "stage2_tier_best_norm"].iloc[0]
             f.write("TIER (patient-level best): {}\n".format(tier))
             f.write("TOTAL NOTES ROWS: {}\n\n".format(len(sub)))
 
@@ -193,6 +212,7 @@ def main():
         print("Wrote:", txt_path)
 
     print("\nDone.")
+
 
 if __name__ == "__main__":
     try:
