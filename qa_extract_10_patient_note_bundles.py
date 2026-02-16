@@ -1,305 +1,202 @@
-# qa_extract_10_patient_note_bundles.py
-# Python 3.6+ (pandas required)
+# qa_pull_2C_2NONE_all_notes.py
+# Python 3.6+  (pandas required)
 #
 # Purpose:
-#   Pick ~10 expander patients and extract NOTE_TYPE + NOTE_TEXT from
-#   Operation / Clinic / Inpatient Notes CSVs for manual review + rule refinement.
+#   Select 2 Tier C and 2 NONE patients from stage2_from_notes_patient_level.csv
+#   and export ALL notes (op/clinic/inpatient) for those patients for extractor refinement.
 #
 # Outputs:
-#   1) qa_10patients_all_notes_minimal.csv
-#   2) qa_10patients_note_bundles/ENCRYPTED_PAT_ID_<id>.txt   (one file per patient)
-#
-# Key design:
-#   - Reads NOTES csvs with encoding='latin-1' to avoid utf-8 decode crashes (0xA0/NBSP).
-#   - Keeps columns minimal: patient_id, note_type, note_text (+ a few IDs if present).
-#
-# Edit only the CONFIG section.
+#   1) qa_4_patients_all_notes.csv
+#   2) qa_patient_notes/<ENCRYPTED_PAT_ID>.txt
+
+from __future__ import print_function
 
 import os
 import re
 import sys
-import random
 import pandas as pd
 
-
 # -------------------------
-# CONFIG
+# CONFIG: edit paths
 # -------------------------
-PATIENT_STAGING_CSV = "patient_recon_staging.csv"
-# Optional (if present): used to stratify by best tier A/B/C/NONE
-STAGE2_FROM_NOTES_PATIENT_LEVEL_CSV = "stage2_from_notes_patient_level.csv"
+PATIENT_LEVEL_CSV = "stage2_from_notes_patient_level.csv"  # produced by your stage2-from-notes script
 
-# Notes files (edit paths)
-OP_NOTES_CSV = "/home/apokol/my_data_Breast/HPI-11526/HPI11256/HPI11526 Operation Notes.csv"
-CLINIC_NOTES_CSV = "/home/apokol/my_data_Breast/HPI-11526/HPI11256/HPI11526 Clinic Notes.csv"
-INPATIENT_NOTES_CSV = "/home/apokol/my_data_Breast/HPI-11526/HPI11256/HPI11526 Inpatient Notes.csv"
+NOTES_FILES = [
+    ("operation_notes", "/home/apokol/my_data_Breast/HPI-11526/HPI11256/HPI11526 Operation Notes.csv"),
+    ("clinic_notes",    "/home/apokol/my_data_Breast/HPI-11526/HPI11256/HPI11526 Clinic Notes.csv"),
+    ("inpatient_notes", "/home/apokol/my_data_Breast/HPI-11526/HPI11256/HPI11526 Inpatient Notes.csv"),
+]
 
-# How many patients to sample per tier (total ~10)
-# If STAGE2_FROM_NOTES_PATIENT_LEVEL_CSV is missing, we sample randomly from expander cohort.
-N_PER_TIER = {
-    "A": 3,
-    "B": 3,
-    "C": 3,
-    "NONE": 1,
-}
-RANDOM_SEED = 42
+OUT_ALL_NOTES_CSV = "qa_4_patients_all_notes.csv"
+OUT_TXT_DIR = "qa_patient_notes"
 
-# Output
-OUT_CSV = "qa_10patients_all_notes_minimal.csv"
-OUT_DIR = "qa_10patients_note_bundles"
+N_TIER_C = 2
+N_NONE = 2
+CHUNKSIZE = 150000
 
-# Column expectations (if some are missing in a file, script will fill blanks)
-COL_PATIENT = "ENCRYPTED_PAT_ID"
+# Columns we care about (keep minimal)
+COL_PAT = "ENCRYPTED_PAT_ID"
 COL_NOTE_TYPE = "NOTE_TYPE"
 COL_NOTE_TEXT = "NOTE_TEXT"
 COL_NOTE_ID = "NOTE_ID"
-COL_NOTE_DOS = "NOTE_DATE_OF_SERVICE"
+COL_DOS = "NOTE_DATE_OF_SERVICE"
 COL_OP_DATE = "OPERATION_DATE"
-
 
 # -------------------------
 # Helpers
 # -------------------------
-def read_csv_safe(path, usecols=None, chunksize=None, is_notes=False):
+def safe_read_csv(path, **kwargs):
     """
-    Safe CSV reader.
-    - For notes files: force encoding='latin-1' to avoid utf-8 decode errors (e.g., 0xA0).
-    - For non-notes: try utf-8 then cp1252.
+    Avoid UnicodeDecodeError by opening with errors='replace'.
+    Replaces bad bytes with � so pandas can proceed.
     """
-    if is_notes:
-        # latin-1 will never throw UnicodeDecodeError; bytes 0-255 map directly.
-        return pd.read_csv(path, encoding="latin-1", engine="python", usecols=usecols, chunksize=chunksize)
-    else:
-        try:
-            return pd.read_csv(path, encoding="utf-8", engine="python", usecols=usecols, chunksize=chunksize)
-        except UnicodeDecodeError:
-            return pd.read_csv(path, encoding="cp1252", engine="python", usecols=usecols, chunksize=chunksize)
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return pd.read_csv(f, engine="python", **kwargs)
+    except Exception:
+        with open(path, "r", encoding="latin1", errors="replace") as f:
+            return pd.read_csv(f, engine="python", **kwargs)
 
+def ensure_cols_exist(df_cols, required):
+    missing = [c for c in required if c not in df_cols]
+    if missing:
+        raise RuntimeError("Missing columns: {}".format(missing))
 
-def norm_text_minimal(x):
-    """Light normalization for review; keep content readable."""
+def clean_text(x):
     if x is None:
         return ""
     s = str(x)
-    # Replace NBSP-like artifacts that can sneak in as weird spacing
-    s = s.replace(u"\xa0", " ")
-    s = s.replace("\r", "\n")
-    # Collapse excessive whitespace but keep newlines for readability
-    s = re.sub(r"[ \t]+", " ", s)
-    s = re.sub(r"\n{3,}", "\n\n", s)
-    return s.strip()
+    s = s.replace("\r", " ").replace("\n", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
+def to_dt(x):
+    return pd.to_datetime(x, errors="coerce")
 
-def to_bool(x):
-    s = str(x).strip().lower()
-    return s in ["true", "1", "yes", "y", "t"]
+def pick_patients(pl, tier_value, n_needed):
+    sub = pl[pl["stage2_tier_best_norm"] == tier_value].copy()
+    sub = sub.sort_values(by=["patient_id"], ascending=[True])
+    return sub["patient_id"].head(n_needed).tolist()
 
-
-def ensure_dir(p):
-    if not os.path.exists(p):
-        os.makedirs(p)
-
-
-def pick_patients(expander_ids, stage2_patient_level_path):
-    """
-    Returns a list of patient_ids (strings).
-    If stage2 patient-level exists, stratify by stage2_tier_best into A/B/C/NONE.
-    Else random sample from expander_ids.
-    """
-    random.seed(RANDOM_SEED)
-    expander_ids = [str(x) for x in expander_ids]
-
-    if stage2_patient_level_path and os.path.exists(stage2_patient_level_path):
-        df = read_csv_safe(stage2_patient_level_path, is_notes=False)
-        # tolerate different column name variants
-        tier_col = None
-        for c in ["stage2_tier_best", "tier", "best_tier", "stage2_tier"]:
-            if c in df.columns:
-                tier_col = c
-                break
-        if tier_col is None:
-            print("WARN: {} found but no tier column recognized; falling back to random.".format(stage2_patient_level_path))
-            return random.sample(expander_ids, min(10, len(expander_ids)))
-
-        df["patient_id"] = df["patient_id"].astype(str) if "patient_id" in df.columns else df[COL_PATIENT].astype(str)
-        df[tier_col] = df[tier_col].fillna("NONE").astype(str)
-
-        # keep only expanders
-        df = df[df["patient_id"].isin(set(expander_ids))].copy()
-
-        chosen = []
-        for tier, n in N_PER_TIER.items():
-            pool = df[df[tier_col] == tier]["patient_id"].tolist()
-            random.shuffle(pool)
-            chosen.extend(pool[:n])
-
-        # If we still have fewer than target, top up from remaining expanders
-        target_n = sum(N_PER_TIER.values())
-        if len(chosen) < target_n:
-            remaining = [pid for pid in expander_ids if pid not in set(chosen)]
-            random.shuffle(remaining)
-            chosen.extend(remaining[: (target_n - len(chosen))])
-
-        # Deduplicate while preserving order
-        seen = set()
-        out = []
-        for pid in chosen:
-            if pid not in seen:
-                out.append(pid)
-                seen.add(pid)
-        return out
-
-    # fallback: random sample
-    target_n = sum(N_PER_TIER.values())
-    return random.sample(expander_ids, min(target_n, len(expander_ids)))
-
-
-def extract_notes_for_patients(file_tag, notes_csv_path, patient_ids_set, chunksize=200000):
-    """
-    Extract minimal note fields for selected patients from one notes CSV.
-    Returns a dataframe.
-    """
-    if not os.path.exists(notes_csv_path):
-        print("WARN: missing file, skipping:", notes_csv_path)
-        return pd.DataFrame(columns=[
-            "file_tag", COL_PATIENT, COL_NOTE_TYPE, COL_NOTE_ID, COL_NOTE_DOS, COL_OP_DATE, COL_NOTE_TEXT
-        ])
-
-    # Read header to see which columns exist
-    head = read_csv_safe(notes_csv_path, is_notes=True, chunksize=None)
-    cols_present = set(head.columns.tolist())
-
-    wanted = [COL_PATIENT, COL_NOTE_TYPE, COL_NOTE_TEXT, COL_NOTE_ID, COL_NOTE_DOS, COL_OP_DATE]
-    usecols = [c for c in wanted if c in cols_present]
-
-    # Must have patient + text
-    if COL_PATIENT not in cols_present or COL_NOTE_TEXT not in cols_present:
-        raise RuntimeError("Notes file {} missing required columns: {} and/or {}".format(
-            notes_csv_path, COL_PATIENT, COL_NOTE_TEXT
-        ))
-
-    out_chunks = []
-
-    reader = read_csv_safe(notes_csv_path, usecols=usecols, chunksize=chunksize, is_notes=True)
-    for chunk in reader:
-        chunk[COL_PATIENT] = chunk[COL_PATIENT].fillna("").astype(str)
-        chunk = chunk[chunk[COL_PATIENT].isin(patient_ids_set)].copy()
-        if chunk.empty:
-            continue
-
-        # add missing columns as blanks for uniform output
-        for c in wanted:
-            if c not in chunk.columns:
-                chunk[c] = ""
-
-        chunk[COL_NOTE_TYPE] = chunk[COL_NOTE_TYPE].fillna("").astype(str)
-        chunk[COL_NOTE_ID] = chunk[COL_NOTE_ID].fillna("").astype(str)
-        chunk[COL_NOTE_DOS] = chunk[COL_NOTE_DOS].fillna("").astype(str)
-        chunk[COL_OP_DATE] = chunk[COL_OP_DATE].fillna("").astype(str)
-
-        # minimal normalization on text for readability
-        chunk[COL_NOTE_TEXT] = chunk[COL_NOTE_TEXT].apply(norm_text_minimal)
-
-        chunk.insert(0, "file_tag", file_tag)
-        out_chunks.append(chunk[["file_tag"] + wanted])
-
-    if out_chunks:
-        return pd.concat(out_chunks, ignore_index=True)
-    return pd.DataFrame(columns=["file_tag"] + wanted)
-
-
-def write_patient_bundle_txt(df_all, patient_id, out_dir):
-    """
-    Write one human-readable text file for a patient with notes grouped by file_tag and note_type.
-    """
-    sub = df_all[df_all[COL_PATIENT].astype(str) == str(patient_id)].copy()
-    if sub.empty:
-        return
-
-    # sort for stable review: file_tag, note_type, note_dos/op_date, note_id
-    sub["sort_dt"] = sub[COL_NOTE_DOS].where(sub[COL_NOTE_DOS].astype(str).str.len() > 0, sub[COL_OP_DATE])
-    sub = sub.sort_values(by=["file_tag", COL_NOTE_TYPE, "sort_dt", COL_NOTE_ID], ascending=True)
-
-    p = os.path.join(out_dir, "ENCRYPTED_PAT_ID_{}.txt".format(patient_id))
-    with open(p, "w") as f:
-        f.write("PATIENT: {}\n".format(patient_id))
-        f.write("=" * 80 + "\n\n")
-
-        for _, r in sub.iterrows():
-            f.write("[{}] NOTE_TYPE: {}\n".format(r["file_tag"], r[COL_NOTE_TYPE]))
-            if str(r[COL_NOTE_DOS]).strip():
-                f.write("NOTE_DATE_OF_SERVICE: {}\n".format(r[COL_NOTE_DOS]))
-            if str(r[COL_OP_DATE]).strip():
-                f.write("OPERATION_DATE: {}\n".format(r[COL_OP_DATE]))
-            if str(r[COL_NOTE_ID]).strip():
-                f.write("NOTE_ID: {}\n".format(r[COL_NOTE_ID]))
-            f.write("-" * 80 + "\n")
-            f.write(r[COL_NOTE_TEXT] + "\n")
-            f.write("\n" + "=" * 80 + "\n\n")
-
-
+# -------------------------
+# Main
+# -------------------------
 def main():
-    random.seed(RANDOM_SEED)
+    # 1) Load patient-level file and pick patients
+    pl = safe_read_csv(PATIENT_LEVEL_CSV)
 
-    # -------------------------
-    # Load expander cohort (848)
-    # -------------------------
-    stg = read_csv_safe(PATIENT_STAGING_CSV, is_notes=False)
-    if "patient_id" not in stg.columns or "has_expander" not in stg.columns:
-        raise RuntimeError("patient_recon_staging.csv must contain columns: patient_id, has_expander")
+    for col in ["patient_id", "stage2_tier_best"]:
+        if col not in pl.columns:
+            raise RuntimeError("Expected column '{}' in {}".format(col, PATIENT_LEVEL_CSV))
 
-    stg["patient_id"] = stg["patient_id"].astype(str)
-    stg["has_expander_bool"] = stg["has_expander"].apply(to_bool)
+    pl["patient_id"] = pl["patient_id"].fillna("").astype(str)
+    pl["stage2_tier_best_norm"] = pl["stage2_tier_best"].fillna("NONE").astype(str).str.strip().str.upper()
 
-    exp = stg[stg["has_expander_bool"]].copy()
-    expander_ids = exp["patient_id"].tolist()
+    chosen_C = pick_patients(pl, "C", N_TIER_C)
+    chosen_NONE = pick_patients(pl, "NONE", N_NONE)
 
-    print("Expander patients:", len(expander_ids))
-    if len(expander_ids) == 0:
-        raise RuntimeError("No expander patients found (has_expander==True).")
+    # Fallback logic if not enough
+    if len(chosen_C) < N_TIER_C:
+        print("WARN: Only found {} Tier C; filling remainder from Tier B.".format(len(chosen_C)))
+        need = N_TIER_C - len(chosen_C)
+        fill = pick_patients(pl, "B", need)
+        chosen_C.extend(fill)
 
-    # -------------------------
-    # Choose 10 patients (stratified if stage2 patient-level exists)
-    # -------------------------
-    chosen = pick_patients(expander_ids, STAGE2_FROM_NOTES_PATIENT_LEVEL_CSV)
-    chosen = [str(x) for x in chosen]
+    if len(chosen_NONE) < N_NONE:
+        print("WARN: Only found {} NONE; filling remainder from Tier A.".format(len(chosen_NONE)))
+        need = N_NONE - len(chosen_NONE)
+        fill = pick_patients(pl, "A", need)
+        chosen_NONE.extend(fill)
+
+    chosen = chosen_C + chosen_NONE
+    chosen = list(dict.fromkeys(chosen))  # de-dupe while keeping order
     chosen_set = set(chosen)
 
     print("Chosen patients (n={}):".format(len(chosen)))
     for pid in chosen:
-        print("  -", pid)
+        tier = pl.loc[pl["patient_id"] == pid, "stage2_tier_best_norm"].iloc[0]
+        print("  {}  tier={}".format(pid, tier))
 
-    # -------------------------
-    # Extract notes from each notes file
-    # -------------------------
-    all_parts = []
+    if len(chosen) == 0:
+        raise RuntimeError("No patients selected. Check stage2_from_notes_patient_level.csv.")
 
-    all_parts.append(extract_notes_for_patients("operation_notes", OP_NOTES_CSV, chosen_set))
-    all_parts.append(extract_notes_for_patients("clinic_notes", CLINIC_NOTES_CSV, chosen_set))
-    all_parts.append(extract_notes_for_patients("inpatient_notes", INPATIENT_NOTES_CSV, chosen_set))
+    # 2) Stream each notes file and collect all notes for chosen patients
+    os.makedirs(OUT_TXT_DIR, exist_ok=True)
 
-    df_all = pd.concat(all_parts, ignore_index=True) if all_parts else pd.DataFrame()
-    if df_all.empty:
-        print("No notes found for chosen patients across provided notes files.")
-        df_all.to_csv(OUT_CSV, index=False)
-        return
+    all_rows = []
+    for file_tag, path in NOTES_FILES:
+        print("\nScanning:", file_tag, path)
 
-    # -------------------------
-    # Write combined CSV
-    # -------------------------
-    df_all.to_csv(OUT_CSV, index=False)
+        head = safe_read_csv(path, nrows=5)
+        required = [COL_PAT, COL_NOTE_TYPE, COL_NOTE_TEXT, COL_NOTE_ID, COL_DOS, COL_OP_DATE]
+        ensure_cols_exist(head.columns, required)
 
-    # -------------------------
-    # Write per-patient bundles
-    # -------------------------
-    ensure_dir(OUT_DIR)
+        chunk_iter = safe_read_csv(path, usecols=required, chunksize=CHUNKSIZE)
+        kept = 0
+
+        for chunk in chunk_iter:
+            chunk[COL_PAT] = chunk[COL_PAT].fillna("").astype(str)
+            chunk = chunk[chunk[COL_PAT].isin(chosen_set)].copy()
+            if chunk.empty:
+                continue
+
+            kept += len(chunk)
+
+            chunk["file_tag"] = file_tag
+            chunk["NOTE_TEXT_CLEAN"] = chunk[COL_NOTE_TEXT].apply(clean_text)
+            chunk["NOTE_DATE_OF_SERVICE_DT"] = to_dt(chunk[COL_DOS])
+            chunk["OPERATION_DATE_DT"] = to_dt(chunk[COL_OP_DATE])
+
+            out_cols = [
+                "file_tag", COL_PAT, COL_NOTE_TYPE, COL_NOTE_ID,
+                COL_DOS, COL_OP_DATE, "NOTE_DATE_OF_SERVICE_DT", "OPERATION_DATE_DT",
+                "NOTE_TEXT_CLEAN"
+            ]
+            all_rows.append(chunk[out_cols])
+
+        print("  Kept rows:", kept)
+
+    if all_rows:
+        out = pd.concat(all_rows, ignore_index=True)
+    else:
+        out = pd.DataFrame(columns=[
+            "file_tag", COL_PAT, COL_NOTE_TYPE, COL_NOTE_ID,
+            COL_DOS, COL_OP_DATE, "NOTE_DATE_OF_SERVICE_DT", "OPERATION_DATE_DT",
+            "NOTE_TEXT_CLEAN"
+        ])
+
+    # 3) Sort and write master CSV
+    out = out.sort_values(
+        by=[COL_PAT, "NOTE_DATE_OF_SERVICE_DT", "OPERATION_DATE_DT", "file_tag"],
+        ascending=[True, True, True, True]
+    )
+    out.to_csv(OUT_ALL_NOTES_CSV, index=False)
+    print("\nWrote:", OUT_ALL_NOTES_CSV, "rows=", len(out))
+
+    # 4) Write one text file per patient
     for pid in chosen:
-        write_patient_bundle_txt(df_all, pid, OUT_DIR)
+        sub = out[out[COL_PAT] == pid].copy()
+        txt_path = os.path.join(OUT_TXT_DIR, "{}.txt".format(pid))
+        with open(txt_path, "w", encoding="utf-8") as f:
+            f.write("PATIENT: {}\n".format(pid))
+            tier = pl.loc[pl["patient_id"] == pid, "stage2_tier_best_norm"].iloc[0]
+            f.write("TIER (patient-level best): {}\n".format(tier))
+            f.write("TOTAL NOTES ROWS: {}\n\n".format(len(sub)))
 
-    print("\nWrote:")
-    print("  -", OUT_CSV)
-    print("  -", OUT_DIR + "/ENCRYPTED_PAT_ID_<id>.txt")
+            for _, r in sub.iterrows():
+                f.write("=" * 80 + "\n")
+                f.write("file_tag: {}\n".format(r.get("file_tag", "")))
+                f.write("NOTE_TYPE: {}\n".format(r.get(COL_NOTE_TYPE, "")))
+                f.write("NOTE_ID: {}\n".format(r.get(COL_NOTE_ID, "")))
+                f.write("NOTE_DOS: {}\n".format(r.get(COL_DOS, "")))
+                f.write("OP_DATE: {}\n".format(r.get(COL_OP_DATE, "")))
+                f.write("\n")
+                f.write(r.get("NOTE_TEXT_CLEAN", ""))
+                f.write("\n\n")
 
+        print("Wrote:", txt_path)
+
+    print("\nDone.")
 
 if __name__ == "__main__":
     try:
