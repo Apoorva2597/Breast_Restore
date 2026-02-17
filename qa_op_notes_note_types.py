@@ -12,6 +12,10 @@
 # Notes:
 #   - Reads with latin1(errors=replace) to avoid UnicodeDecodeError 0xA0
 #   - Designed to run on WVD after you git pull
+#
+# Fix:
+#   - DO NOT use iter_csv_safe(..., nrows=5) because nrows returns a DataFrame,
+#     and iterating over it yields column names (strings). Use read_csv_safe for header probing.
 
 from __future__ import print_function
 
@@ -38,12 +42,24 @@ COL_DOS = "NOTE_DATE_OF_SERVICE"
 COL_OP_DATE = "OPERATION_DATE"
 
 # -------------------------
-# Robust chunk reader
+# Robust readers (Python 3.6 safe)
 # -------------------------
+def read_csv_safe(path, **kwargs):
+    f = open(path, "r", encoding="latin1", errors="replace")
+    try:
+        return pd.read_csv(f, engine="python", **kwargs)
+    finally:
+        try:
+            f.close()
+        except Exception:
+            pass
+
+
 def iter_csv_safe(path, **kwargs):
     f = open(path, "r", encoding="latin1", errors="replace")
     try:
-        for chunk in pd.read_csv(f, engine="python", **kwargs):
+        reader = pd.read_csv(f, engine="python", **kwargs)
+        for chunk in reader:
             yield chunk
     finally:
         try:
@@ -87,16 +103,18 @@ RX_STAGE2 = re.compile(
 )
 
 # A looser “context” signal (expander + implant in same note)
-RX_CONTEXT = re.compile(r"\b(tissue\s*expander|expander|\bte\b)\b.*\b(implant|permanent\s+implant|implnt)\b", re.I)
+RX_CONTEXT = re.compile(
+    r"\b(tissue\s*expander|expander|\bte\b)\b.*\b(implant|permanent\s+implant|implnt)\b",
+    re.I
+)
 
 
 def main():
-    # Validate columns exist quickly
-    head = None
-    for chunk in iter_csv_safe(OP_NOTES_CSV, nrows=5):
-        head = chunk
-        break
-    if head is None:
+    # -------------------------
+    # Validate columns exist quickly (header probe)
+    # -------------------------
+    head = read_csv_safe(OP_NOTES_CSV, nrows=5)
+    if head is None or head.empty:
         raise RuntimeError("Could not read: {}".format(OP_NOTES_CSV))
 
     required = [COL_NOTE_TYPE, COL_NOTE_TEXT]
@@ -109,22 +127,27 @@ def main():
         if c in head.columns:
             usecols.append(c)
 
+    # -------------------------
     # Aggregators
-    note_type_counts = {}
-    # Per type: counts of stage2-like and context hits + unique patients
-    per_type = {}  # type -> dict
+    # -------------------------
+    note_type_counts = {}  # NOTE_TYPE -> rows
+    per_type = {}          # NOTE_TYPE -> dict with counts + sets
 
     total_rows = 0
     total_rows_with_type = 0
     total_stage2_rows = 0
+    total_ctx_rows = 0
 
+    # -------------------------
+    # Stream file
+    # -------------------------
     for chunk in iter_csv_safe(OP_NOTES_CSV, usecols=usecols, chunksize=CHUNKSIZE):
         total_rows += len(chunk)
 
         types = chunk[COL_NOTE_TYPE] if COL_NOTE_TYPE in chunk.columns else pd.Series(["NA"] * len(chunk))
         types = types.fillna("NA").apply(norm_type)
 
-        # count types
+        # count NOTE_TYPE distribution
         for t in types.tolist():
             note_type_counts[t] = note_type_counts.get(t, 0) + 1
         total_rows_with_type += int((types != "NA").sum())
@@ -140,8 +163,10 @@ def main():
         ctx_hit = texts.str.contains(RX_CONTEXT, regex=True)
 
         total_stage2_rows += int(stage2_hit.sum())
+        total_ctx_rows += int(ctx_hit.sum())
 
-        # aggregate by type (loop per row; safe for chunk sizes)
+        # aggregate by type
+        # (loop is fine at this chunksize; keeps logic explicit for Python 3.6)
         for i in range(len(chunk)):
             t = types.iat[i]
             pid = pats.iat[i]
@@ -155,26 +180,36 @@ def main():
                     "context_rows": 0,
                     "unique_patients_any": set(),
                     "unique_patients_stage2": set(),
+                    "unique_patients_context": set(),
                 }
 
             d = per_type[t]
             d["rows"] += 1
+
             if pid:
                 d["unique_patients_any"].add(pid)
+
+            if ctx:
+                d["context_rows"] += 1
+                if pid:
+                    d["unique_patients_context"].add(pid)
+
             if st2:
                 d["stage2_rows"] += 1
                 if pid:
                     d["unique_patients_stage2"].add(pid)
-            if ctx:
-                d["context_rows"] += 1
 
-    # Build NOTE_TYPE counts df
-    nt_df = pd.DataFrame(
-        [{"NOTE_TYPE": k, "ROWS": v} for k, v in note_type_counts.items()]
-    ).sort_values(by="ROWS", ascending=False)
+    # -------------------------
+    # Write NOTE_TYPE counts
+    # -------------------------
+    nt_df = pd.DataFrame([{"NOTE_TYPE": k, "ROWS": v} for k, v in note_type_counts.items()])
+    if not nt_df.empty:
+        nt_df = nt_df.sort_values(by="ROWS", ascending=False)
     nt_df.to_csv(OUT_NOTE_TYPE_COUNTS_CSV, index=False, encoding="utf-8")
 
-    # Build stage2-by-type df
+    # -------------------------
+    # Write stage2 hits by type
+    # -------------------------
     rows = []
     for t, d in per_type.items():
         rows.append({
@@ -184,11 +219,20 @@ def main():
             "CONTEXT_ROWS_EXPANDER+IMPLANT": d["context_rows"],
             "UNIQUE_PATIENTS_ANY": len(d["unique_patients_any"]),
             "UNIQUE_PATIENTS_STAGE2_STRICT": len(d["unique_patients_stage2"]),
+            "UNIQUE_PATIENTS_CONTEXT": len(d["unique_patients_context"]),
         })
-    hits_df = pd.DataFrame(rows).sort_values(by=["UNIQUE_PATIENTS_STAGE2_STRICT", "STAGE2_ROWS_STRICT"], ascending=False)
+
+    hits_df = pd.DataFrame(rows)
+    if not hits_df.empty:
+        hits_df = hits_df.sort_values(
+            by=["UNIQUE_PATIENTS_STAGE2_STRICT", "STAGE2_ROWS_STRICT", "UNIQUE_PATIENTS_CONTEXT"],
+            ascending=[False, False, False]
+        )
     hits_df.to_csv(OUT_STAGE2_HITS_BY_TYPE_CSV, index=False, encoding="utf-8")
 
-    # Write summary text
+    # -------------------------
+    # Summary text
+    # -------------------------
     lines = []
     lines.append("=== QA: Operation Notes NOTE_TYPE coverage + Stage2 phrase hits ===")
     lines.append("File: {}".format(OP_NOTES_CSV))
@@ -196,21 +240,31 @@ def main():
     lines.append("")
     lines.append("Total rows scanned: {}".format(total_rows))
     lines.append("Rows with non-empty NOTE_TYPE: {}".format(total_rows_with_type))
-    lines.append("Total strict Stage2-hit rows (all types): {}".format(total_stage2_rows))
+    lines.append("Total strict Stage2-hit rows (all NOTE_TYPEs): {}".format(total_stage2_rows))
+    lines.append("Total context rows (expander+implant anywhere in note): {}".format(total_ctx_rows))
     lines.append("")
+
     lines.append("Top NOTE_TYPEs by row count (top 25):")
-    top25 = nt_df.head(25)
-    for _, r in top25.iterrows():
-        lines.append("  {:>7}  {}".format(int(r["ROWS"]), r["NOTE_TYPE"]))
+    top25 = nt_df.head(25) if not nt_df.empty else pd.DataFrame()
+    if not top25.empty:
+        for _, r in top25.iterrows():
+            lines.append("  {:>7}  {}".format(int(r["ROWS"]), r["NOTE_TYPE"]))
+    else:
+        lines.append("  (no rows)")
+
     lines.append("")
     lines.append("Top NOTE_TYPEs by UNIQUE_PATIENTS_STAGE2_STRICT (top 25):")
-    top_hits = hits_df.head(25)
-    for _, r in top_hits.iterrows():
-        lines.append("  {:>6} patients | {:>6} rows | {}".format(
-            int(r["UNIQUE_PATIENTS_STAGE2_STRICT"]),
-            int(r["STAGE2_ROWS_STRICT"]),
-            r["NOTE_TYPE"]
-        ))
+    top_hits = hits_df.head(25) if not hits_df.empty else pd.DataFrame()
+    if not top_hits.empty:
+        for _, r in top_hits.iterrows():
+            lines.append("  {:>6} patients | {:>6} rows | {}".format(
+                int(r["UNIQUE_PATIENTS_STAGE2_STRICT"]),
+                int(r["STAGE2_ROWS_STRICT"]),
+                r["NOTE_TYPE"]
+            ))
+    else:
+        lines.append("  (no stage2 hits)")
+
     lines.append("")
     lines.append("Wrote:")
     lines.append("  - {}".format(OUT_SUMMARY_TXT))
