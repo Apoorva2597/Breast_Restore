@@ -30,7 +30,7 @@ import pandas as pd
 # -------------------------
 # CONFIG (EDIT PATHS ONLY)
 # -------------------------
-PATIENT_STAGING_CSV = "patient_recon_staging.csv"
+PATIENT_STAGING_CSV = "patient_recon_staging_refined.csv"
 OP_NOTES_CSV = "/home/apokol/my_data_Breast/HPI-11526/HPI11256/HPI11526 Operation Notes.csv"
 
 OUT_PATIENT_LEVEL = "stage2_from_notes_patient_level.csv"
