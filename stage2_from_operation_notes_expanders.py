@@ -3,8 +3,7 @@
 #
 # Goal:
 #   For expander-pathway patients (from patient_recon_staging.csv),
-#   scan OPERATION NOTES for Stage 2 evidence (TE -> implant exchange),
-#   using PROCEDURE-section–aware logic to improve precision.
+#   scan OPERATION NOTES for Stage 2 evidence (TE -> implant exchange).
 #
 # Inputs:
 #   1) patient_recon_staging.csv
@@ -14,6 +13,12 @@
 #   1) stage2_from_notes_patient_level.csv
 #   2) stage2_from_notes_row_hits.csv
 #   3) stage2_from_notes_summary.txt
+#
+# Key design choices (scope-aligned):
+#   - Stage2 is ONLY TE->implant exchange (not TE->TE swap).
+#   - Prefer high-signal procedure section when present.
+#   - If procedure section missing, use NOTE_TYPE as proxy (OP NOTE / BRIEF OP NOTE / OPERATIVE).
+#   - Robust file reading for Python 3.6 + messy CSV bytes (0xA0 etc): latin1 + errors=replace.
 
 from __future__ import print_function
 
@@ -50,13 +55,13 @@ CHUNKSIZE = 100000  # safe default for big notes files
 def read_csv_safe(path, **kwargs):
     """
     Read CSV robustly in Python 3.6 by using latin1 + errors=replace.
-    This avoids hard failures from 0xA0 (NBSP) or other stray bytes.
+    Avoids hard failures from 0xA0 (NBSP) or other stray bytes.
     """
     f = open(path, "r", encoding="latin1", errors="replace")
     try:
         return pd.read_csv(f, engine="python", **kwargs)
     finally:
-        # If chunksize is used, pandas reads lazily; do not close here.
+        # IMPORTANT: if chunksize is used, caller should use iter_csv_safe instead.
         if "chunksize" not in kwargs:
             try:
                 f.close()
@@ -86,7 +91,10 @@ def norm_text(x):
     s = s.replace("\r", " ").replace("\n", " ")
     s = s.replace("_", " ")
     # normalize NBSP if present (shows up as \xa0 in python strings)
-    s = s.replace(u"\xa0", " ")
+    try:
+        s = s.replace(u"\xa0", " ")
+    except Exception:
+        pass
     s = re.sub(r"\s+", " ", s)
     return s.strip()
 
@@ -100,66 +108,74 @@ def to_bool(x):
     return s in ["true", "1", "yes", "y"]
 
 
+def snippet(text, n=320):
+    s = "" if text is None else str(text)
+    try:
+        s = s.replace(u"\xa0", " ")
+    except Exception:
+        pass
+    s = re.sub(r"\s+", " ", s).strip()
+    return (s[:n] + "...") if len(s) > n else s
+
+
 # -------------------------
 # Procedure-section extraction (HIGH signal)
 # -------------------------
-# We preferentially classify from procedure-like sections to avoid noisy
-# mentions in HPI/history/implant logs.
-PROC_HEADINGS = [
-    r"PROCEDURES\s+PERFORMED\s*:",
-    r"PROCEDURE\(S\)\s*:",
-    r"PROCEDURE\s*:",
-    r"OPERATION\s+PERFORMED\s*:",
-    r"OPERATION\s*:",
-    r"OPERATIVE\s+PROCEDURE\s*:",
-    r"OPERATIONS\s+PERFORMED\s*:",
-]
-PROC_RE = re.compile(r"(" + "|".join(PROC_HEADINGS) + r")", re.I)
+PROC_RE = re.compile(
+    r"\b("
+    r"PROCEDURES?\s*(?:\(\s*S\s*\))?\s*(?:PERFORMED)?"
+    r"|OPERATIVE\s+PROCEDURES?"
+    r"|OPERATION\s+(?:PERFORMED)?"
+    r"|PROCEDURE\s*(?:\(\s*S\s*\))?"
+    r")\b\s*[:\-]?",
+    re.I
+)
 
-# Optional stop headings to avoid swallowing whole note if structured
-STOP_HEADINGS = [
-    r"INDICATIONS?\s*:",
-    r"FINDINGS?\s*:",
-    r"ANESTHESIA\s*:",
-    r"COMPLICATIONS?\s*:",
-    r"DISPOSITION\s*:",
-    r"SPECIMENS?\s*:",
-    r"ESTIMATED\s+BLOOD\s+LOSS\s*:",
-    r"EBL\s*:",
-    r"DRAINS?\s*:",
-    r"IMPLANTS?\s*:",
-    r"PATHOLOGY\s*:",
-    r"DICTATED\s+BY\s*:",
-]
-STOP_RE = re.compile(r"(" + "|".join(STOP_HEADINGS) + r")", re.I)
+STOP_RE = re.compile(
+    r"\b("
+    r"INDICATIONS?"
+    r"|FINDINGS?"
+    r"|ANESTHESIA"
+    r"|COMPLICATIONS?"
+    r"|DISPOSITION"
+    r"|SPECIMENS?"
+    r"|ESTIMATED\s+BLOOD\s+LOSS"
+    r"|EBL"
+    r"|DRAINS?"
+    r"|IMPLANTS?"
+    r"|PATHOLOGY"
+    r"|DICTATED\s+BY"
+    r")\b\s*[:\-]?",
+    re.I
+)
 
 
-def extract_procedure_segment(note_text, max_len=3000):
+def extract_procedure_segment(note_text, max_len=3500):
     """
-    Return a high-signal segment starting at the first procedure heading.
-    If found, cut at either a stop heading (after start) or max_len.
+    Return a high-signal segment starting at the first procedure-ish heading.
     If not found, return "".
     """
     t = norm_text(note_text)
     m = PROC_RE.search(t)
     if not m:
         return ""
-    start = m.start()
 
+    start = m.start()
     window = t[start:start + max_len]
-    # Find first stop heading AFTER the procedure heading (skip 1st char region)
-    m2 = STOP_RE.search(window[20:])  # offset so we don't match within heading itself
+
+    # stop at first stop heading after some buffer
+    m2 = STOP_RE.search(window[30:])
     if m2:
-        end = 20 + m2.start()
+        end = 30 + m2.start()
         return window[:end].strip()
+
     return window.strip()
 
 
 # -------------------------
 # Stage 2 evidence patterns (notes)
 # -------------------------
-# Stage 2 = exchange/remove tissue expander + place/insert implant
-# IMPORTANT: suppress TE->TE exchanges (e.g., ruptured expander exchanged for new expander)
+# Stage 2 = exchange/remove tissue expander + place/insert implant (or explicit expander->implant exchange)
 RX = {
     "EXPANDER": re.compile(r"\b(tissue\s*expander|expander|expandr|\bte\b)\b", re.I),
     "IMPLANT": re.compile(r"\b(implant|implnt|permanent\s+implant)\b", re.I),
@@ -171,31 +187,38 @@ RX = {
 
     # Tier A: definitive combined phrases
     "EXCHANGE_TE_TO_IMPLANT": re.compile(
-        r"\bexchange\b.{0,80}\b(tissue\s*expander|expander|expandr|\bte\b)\b.{0,160}\b(implant|implnt|permanent\s+implant)\b|"
-        r"\bexchange\b.{0,80}\b(implant|implnt|permanent\s+implant)\b.{0,160}\b(tissue\s*expander|expander|expandr|\bte\b)\b",
+        r"\bexchange\b.{0,80}\b(tissue\s*expander|expander|expandr|\bte\b)\b.{0,220}\b(implant|implnt|permanent\s+implant)\b|"
+        r"\bexchange\b.{0,80}\b(implant|implnt|permanent\s+implant)\b.{0,220}\b(tissue\s*expander|expander|expandr|\bte\b)\b",
         re.I
     ),
     "REMOVE_EXPANDER_PLACE_IMPLANT": re.compile(
-        r"\b(remove|removed|explant|explanted)\b.{0,160}\b(tissue\s*expander|expander|expandr|\bte\b)\b.{0,300}\b(place|placed|insert|inserted|insertion|implantation)\b.{0,120}\b(implant|implnt|permanent\s+implant)\b|"
-        r"\b(place|placed|insert|inserted|insertion|implantation)\b.{0,120}\b(implant|implnt|permanent\s+implant)\b.{0,300}\b(remove|removed|explant|explanted)\b.{0,160}\b(tissue\s*expander|expander|expandr|\bte\b)\b",
+        r"\b(remove|removed|explant|explanted)\b.{0,200}\b(tissue\s*expander|expander|expandr|\bte\b)\b.{0,380}\b(place|placed|insert|inserted|insertion|implantation)\b.{0,140}\b(implant|implnt|permanent\s+implant)\b|"
+        r"\b(place|placed|insert|inserted|insertion|implantation)\b.{0,140}\b(implant|implnt|permanent\s+implant)\b.{0,380}\b(remove|removed|explant|explanted)\b.{0,200}\b(tissue\s*expander|expander|expandr|\bte\b)\b",
         re.I
     ),
 }
 
 
-def classify_note_stage2(note_text):
+def is_op_like(note_type):
+    nt = "" if note_type is None else str(note_type).upper()
+    return ("OP NOTE" in nt) or ("BRIEF OP NOTE" in nt) or ("OPERATIVE" in nt)
+
+
+def classify_note_stage2(note_text, note_type):
     """
-    Procedure-aware classification.
-    Returns (tier, rule) where tier in {"A","B","C",None}
+    Returns (tier, rule, using_proc_section)
+    Tier in {"A","B","C",None}
+    using_proc_section is True if we had a procedure segment OR NOTE_TYPE indicates op-like.
     """
     full = norm_text(note_text)
     proc = extract_procedure_segment(full)
 
-    # Prefer procedure section; if absent, fall back to full text but be stricter
-    text = proc if proc else full
-    using_proc = bool(proc)
+    op_like = is_op_like(note_type)
+    using_proc = bool(proc) or op_like
 
-    # quick flags
+    # If we have procedure segment use it; else fallback to full.
+    text = proc if proc else full
+
     has_expander = bool(RX["EXPANDER"].search(text))
     has_implant = bool(RX["IMPLANT"].search(text))
     has_exchange = bool(RX["EXCHANGE"].search(text))
@@ -204,43 +227,54 @@ def classify_note_stage2(note_text):
     has_second = bool(RX["SECOND_STAGE"].search(text))
     has_capsu = bool(RX["CAPSU"].search(text))
 
-    # HARD NEGATIVE:
-    # expander exchange without implant language is often TE->TE swap (rupture/deflation)
+    # Suppress clear TE->TE exchanges (exchange + expander but no implant)
+    # This is directly supported by your de-identified examples (ruptured TE exchanged for new TE).
     if has_exchange and has_expander and (not has_implant):
-        return (None, "EXCHANGE_EXPANDER_NO_IMPLANT")
+        return (None, "EXCHANGE_EXPANDER_NO_IMPLANT", using_proc)
 
-    # Tier A: definitive phrases (only truly A if in procedure section)
+    # Tier A: definitive phrases (only label A when we're confident it's procedural)
     if RX["EXCHANGE_TE_TO_IMPLANT"].search(text):
-        return ("A" if using_proc else "B", "EXCHANGE_TE_TO_IMPLANT")
+        return ("A" if using_proc else "B", "EXCHANGE_TE_TO_IMPLANT", using_proc)
+
     if RX["REMOVE_EXPANDER_PLACE_IMPLANT"].search(text):
-        return ("A" if using_proc else "B", "REMOVE_EXPANDER_PLACE_IMPLANT")
+        return ("A" if using_proc else "B", "REMOVE_EXPANDER_PLACE_IMPLANT", using_proc)
 
     # Tier B: strong combos
-    # If not using procedure section, these combos can be noisy; keep them but degrade.
     if has_expander and has_implant and has_exchange:
-        return ("B" if using_proc else "C", "EXPANDER+IMPLANT+EXCHANGE")
+        return ("B" if using_proc else "C", "EXPANDER+IMPLANT+EXCHANGE", using_proc)
+
     if has_expander and has_implant and (has_remove or has_place) and has_capsu:
-        return ("B" if using_proc else "C", "CAPSU+(REMOVE/PLACE)+EXPANDER+IMPLANT")
+        return ("B" if using_proc else "C", "CAPSU+(REMOVE/PLACE)+EXPANDER+IMPLANT", using_proc)
+
     if has_expander and has_implant and (has_remove or has_place) and has_second:
-        return ("B" if using_proc else "C", "SECOND_STAGE+(REMOVE/PLACE)+EXPANDER+IMPLANT")
+        return ("B" if using_proc else "C", "SECOND_STAGE+(REMOVE/PLACE)+EXPANDER+IMPLANT", using_proc)
 
-    # Tier C: suggestive
-    # Keep C conservative; require expander+implant context.
-    # Prefer C only if procedure section exists; otherwise usually too noisy.
-    if using_proc:
-        if has_expander and has_implant and has_second and not (has_remove or has_place or has_exchange):
-            return ("C", "SECOND_STAGE_MENTION_EXPANDER_IMPLANT")
-        if has_expander and has_implant and not (has_remove or has_place or has_exchange):
-            return ("C", "EXPANDER+IMPLANT_CONTEXT_NO_ACTION")
+    # Tier C: suggestive (conservative; requires expander context)
+    if has_expander and has_implant and has_second:
+        return ("C", "SECOND_STAGE_MENTION_EXPANDER_IMPLANT", using_proc)
 
-    return (None, None)
+    if has_expander and has_implant and not (has_remove or has_place or has_exchange):
+        return ("C", "EXPANDER+IMPLANT_CONTEXT_NO_ACTION", using_proc)
+
+    return (None, None, using_proc)
 
 
-def snippet(text, n=320):
-    s = "" if text is None else str(text)
-    s = s.replace(u"\xa0", " ")
-    s = re.sub(r"\s+", " ", s).strip()
-    return (s[:n] + "...") if len(s) > n else s
+def bin_label(delta_days):
+    if delta_days is None or pd.isnull(delta_days):
+        return None
+    try:
+        x = int(delta_days)
+    except Exception:
+        return None
+    if x <= 30:
+        return "0-30d"
+    if x <= 90:
+        return "31-90d"
+    if x <= 180:
+        return "91-180d"
+    if x <= 365:
+        return "181-365d"
+    return ">365d"
 
 
 def main():
@@ -262,8 +296,7 @@ def main():
         raise RuntimeError("No expander patients found (has_expander==True).")
 
     stage1_map = dict(zip(exp["patient_id"].astype(str), exp["stage1_dt"]))
-    mrn_map = dict(zip(exp["patient_id"].astype(str),
-                       exp.get("mrn", pd.Series([""] * len(exp))).astype(str)))
+    mrn_map = dict(zip(exp["patient_id"].astype(str), exp.get("mrn", pd.Series([""] * len(exp))).astype(str)))
 
     print("Expander patients:", len(exp_ids))
 
@@ -287,6 +320,11 @@ def main():
     total_rows_seen = 0
     total_rows_expanders = 0
 
+    # extra diagnostic counters
+    suppressed_te_to_te = 0
+    any_proc_section_rows = 0
+    op_like_rows = 0
+
     for chunk in iter_csv_safe(OP_NOTES_CSV, usecols=usecols, chunksize=CHUNKSIZE):
         total_rows_seen += len(chunk)
 
@@ -297,7 +335,7 @@ def main():
 
         total_rows_expanders += len(chunk)
 
-        # normalize note text
+        # normalize text
         chunk["note_text_norm"] = chunk[COL_NOTE_TEXT].apply(norm_text)
 
         # date: prefer DOS; fallback OPERATION_DATE
@@ -305,22 +343,40 @@ def main():
         chunk["op_dt"] = to_dt(chunk[COL_OP_DATE])
         chunk["event_dt"] = chunk["note_dt"].fillna(chunk["op_dt"])
 
-        # classify
+        # classify row-by-row (needed for proc-section extraction + note_type)
         tiers = []
         rules = []
         proc_found = []
-        for txt in chunk["note_text_norm"].tolist():
-            # record if procedure segment exists (debug / QA)
-            proc_seg = extract_procedure_segment(txt)
-            proc_found.append(bool(proc_seg))
+        op_like_flags = []
 
-            tier, rule = classify_note_stage2(txt)
+        note_texts = chunk["note_text_norm"].tolist()
+        note_types = chunk[COL_NOTE_TYPE].fillna("").astype(str).tolist()
+
+        for i in range(len(note_texts)):
+            txt = note_texts[i]
+            nt = note_types[i]
+
+            proc_seg = extract_procedure_segment(txt)
+            has_proc = bool(proc_seg)
+            proc_found.append(has_proc)
+
+            op_like = is_op_like(nt)
+            op_like_flags.append(op_like)
+
+            tier, rule, _using_proc = classify_note_stage2(txt, nt)
             tiers.append(tier)
             rules.append(rule)
+
+            if rule == "EXCHANGE_EXPANDER_NO_IMPLANT":
+                suppressed_te_to_te += 1
 
         chunk["tier"] = tiers
         chunk["rule"] = rules
         chunk["has_proc_section"] = proc_found
+        chunk["note_type_oplike"] = op_like_flags
+
+        any_proc_section_rows += int(pd.Series(proc_found).sum())
+        op_like_rows += int(pd.Series(op_like_flags).sum())
 
         hits = chunk[chunk["tier"].notnull()].copy()
         if hits.empty:
@@ -332,14 +388,14 @@ def main():
 
         keep_cols = [
             COL_PATIENT,
-            (COL_MRN if (COL_MRN in hits.columns) else None),
+            (COL_MRN if COL_MRN in hits.columns else None),
             COL_NOTE_TYPE, COL_NOTE_ID,
             COL_NOTE_DOS, COL_OP_DATE,
-            "event_dt", "tier", "rule", "has_proc_section",
+            "event_dt", "tier", "rule",
+            "has_proc_section", "note_type_oplike",
             "delta_days_vs_stage1", "snippet"
         ]
         keep_cols = [c for c in keep_cols if c is not None]
-
         hit_rows.append(hits[keep_cols])
 
     if hit_rows:
@@ -366,6 +422,7 @@ def main():
         patient_level["mrn_from_notes"] = None
         patient_level["snippet"] = None
         patient_level["best_has_proc_section"] = None
+        patient_level["best_note_type_oplike"] = None
     else:
         tier_rank = {"A": 3, "B": 2, "C": 1}
         hits_all["tier_rank"] = hits_all["tier"].map(tier_rank).fillna(0).astype(int)
@@ -374,14 +431,10 @@ def main():
             lambda x: (x is not None) and pd.notnull(x) and (x >= 0)
         )
 
-        # Prefer:
-        # 1) after_index True
-        # 2) has_proc_section True (more reliable)
-        # 3) higher tier
-        # 4) earliest event_dt
+        # prefer after_index True, then higher tier, then earliest event_dt
         hits_all = hits_all.sort_values(
-            by=[COL_PATIENT, "after_index", "has_proc_section", "tier_rank", "event_dt"],
-            ascending=[True, False, False, False, True]
+            by=[COL_PATIENT, "after_index", "tier_rank", "event_dt"],
+            ascending=[True, False, False, True]
         )
 
         best = hits_all.groupby(COL_PATIENT, as_index=False).head(1).copy()
@@ -404,6 +457,7 @@ def main():
             COL_NOTE_DOS: "best_note_dos",
             COL_OP_DATE: "best_note_op_date",
             "has_proc_section": "best_has_proc_section",
+            "note_type_oplike": "best_note_type_oplike",
         }
         if COL_MRN in patient_level.columns:
             rename_map[COL_MRN] = "mrn_from_notes"
@@ -426,36 +480,23 @@ def main():
     n_exp = len(exp_ids)
     n_pat_with_any_hit = int(patient_level["stage2_tier_best"].notnull().sum())
     n_pat_after_index = int(patient_level["stage2_after_index"].fillna(False).astype(bool).sum())
-
     tier_counts = patient_level["stage2_tier_best"].fillna("NONE").value_counts()
 
-    # timing bins (only for those with after-index hit)
-    timing_bins = None
+    # timing bins (only after-index)
     timing = patient_level[patient_level["stage2_after_index"].fillna(False).astype(bool)].copy()
+    timing_bins = None
     if not timing.empty and "stage2_delta_days_from_stage1" in timing.columns:
         d = timing["stage2_delta_days_from_stage1"].dropna()
         if not d.empty:
-            def bin_label(x):
-                if x <= 30:
-                    return "0-30d"
-                if x <= 90:
-                    return "31-90d"
-                if x <= 180:
-                    return "91-180d"
-                if x <= 365:
-                    return "181-365d"
-                return ">365d"
             timing_bins = d.apply(bin_label).value_counts()
 
-    # how often we even found a procedure section among best hits
-    proc_best = None
-    if "best_has_proc_section" in patient_level.columns:
-        proc_best = patient_level["best_has_proc_section"].fillna(False).astype(bool).value_counts()
+    # best-hit had procedure section?
+    best_proc_counts = patient_level["best_has_proc_section"].fillna(False).astype(bool).value_counts()
 
     lines = []
     lines.append("=== Stage 2 from OPERATION NOTES (Expanders) ===")
     lines.append("Python: 3.6-compatible | Read encoding: latin1 (errors=replace) | Write outputs: utf-8")
-    lines.append("Classifier: procedure-section aware + TE->TE exchange suppression")
+    lines.append("Classifier: procedure-section aware + NOTE_TYPE fallback + TE->TE exchange suppression")
     lines.append("")
     lines.append("Expander patients (from patient_recon_staging.csv): {}".format(n_exp))
     lines.append("Patients with ANY Stage2 note hit (any date): {} ({:.1f}%)".format(
@@ -469,11 +510,24 @@ def main():
     for k, v in tier_counts.items():
         lines.append("  {}: {}".format(k, int(v)))
 
-    if proc_best is not None:
-        lines.append("")
-        lines.append("Best-hit had procedure section (patients):")
-        for k, v in proc_best.items():
-            lines.append("  {}: {}".format(bool(k), int(v)))
+    lines.append("")
+    lines.append("Best-hit had procedure section (patients):")
+    if True in best_proc_counts.index:
+        lines.append("  True: {}".format(int(best_proc_counts.get(True, 0))))
+    else:
+        lines.append("  True: 0")
+    if False in best_proc_counts.index:
+        lines.append("  False: {}".format(int(best_proc_counts.get(False, 0))))
+    else:
+        lines.append("  False: 0")
+
+    lines.append("")
+    lines.append("Row diagnostics (expanders only):")
+    lines.append("  Total rows scanned (all patients in file): {}".format(total_rows_seen))
+    lines.append("  Total rows scanned (expander cohort): {}".format(total_rows_expanders))
+    lines.append("  Rows with detected procedure section: {}".format(any_proc_section_rows))
+    lines.append("  Rows with OP-like NOTE_TYPE: {}".format(op_like_rows))
+    lines.append("  Suppressed TE->TE exchanges (exchange+expander without implant): {}".format(suppressed_te_to_te))
 
     if timing_bins is not None:
         lines.append("")
