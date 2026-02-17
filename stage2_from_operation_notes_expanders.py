@@ -2,12 +2,12 @@
 # Python 3.6.8+ (pandas required)
 #
 # Goal:
-#   For expander-pathway patients (from patient_recon_staging.csv),
-#   scan OPERATION NOTES for Stage 2 evidence (TE -> implant exchange).
+#   For expander-pathway patients (from patient_recon_staging_refined.csv),
+#   scan OPERATION NOTES for Stage 2 evidence (TE -> permanent implant exchange).
 #
 # Inputs:
-#   1) patient_recon_staging.csv
-#   2) HPI11526 Operation Notes.csv
+#   1) patient_recon_staging_refined.csv   (must include: patient_id, has_expander_refined, stage1_date)
+#   2) HPI11526 Operation Notes.csv        (must include NOTE_TEXT and date columns)
 #
 # Outputs:
 #   1) stage2_from_notes_patient_level.csv
@@ -17,15 +17,19 @@
 # Key design:
 #   - Stage2 = TE removed/exchanged AND permanent implant placed/exchanged.
 #   - Use BOTH Procedure section AND Implants section (common UM op note pattern).
-#   - Conservative TE->TE suppression: only when explicit "new tissue expander" pattern
-#     OR no implant evidence in the combined high-signal text.
+#   - Conservative TE->TE suppression:
+#       * suppress ONLY when explicit TE->TE replacement language
+#       * OR exchange+expander but NO implant evidence in high-signal text (header+proc+implants)
+#
+# Encoding design (critical for 0xA0 / stray bytes in UM exports):
+#   - Read CSV using latin1 + errors=replace (never crashes)
+#   - Write outputs utf-8
 
 from __future__ import print_function
 
 import re
 import sys
 import pandas as pd
-
 
 # -------------------------
 # CONFIG (EDIT PATHS ONLY)
@@ -48,7 +52,6 @@ COL_NOTE_ID = "NOTE_ID"
 
 CHUNKSIZE = 100000
 
-
 # -------------------------
 # Robust CSV reading (Python 3.6 safe)
 # -------------------------
@@ -63,7 +66,6 @@ def read_csv_safe(path, **kwargs):
             except Exception:
                 pass
 
-
 def iter_csv_safe(path, **kwargs):
     f = open(path, "r", encoding="latin1", errors="replace")
     try:
@@ -74,7 +76,6 @@ def iter_csv_safe(path, **kwargs):
             f.close()
         except Exception:
             pass
-
 
 def norm_text(x):
     if x is None:
@@ -89,15 +90,12 @@ def norm_text(x):
     s = re.sub(r"\s+", " ", s)
     return s.strip()
 
-
 def to_dt(series):
     return pd.to_datetime(series, errors="coerce")
-
 
 def to_bool(x):
     s = str(x).strip().lower()
     return s in ["true", "1", "yes", "y"]
-
 
 def snippet(text, n=320):
     s = "" if text is None else str(text)
@@ -108,11 +106,9 @@ def snippet(text, n=320):
     s = re.sub(r"\s+", " ", s).strip()
     return (s[:n] + "...") if len(s) > n else s
 
-
 def is_op_like(note_type):
     nt = "" if note_type is None else str(note_type).upper()
     return ("OP NOTE" in nt) or ("BRIEF OP NOTE" in nt) or ("OPERATIVE" in nt)
-
 
 # -------------------------
 # Section extraction helpers
@@ -127,7 +123,6 @@ PROC_START_RE = re.compile(
 
 IMPLANTS_START_RE = re.compile(r"\bIMPLANTS?\b\s*[:\-]?", re.I)
 
-# Generic "new heading" detector. Many op notes use all-caps headings or colon headings.
 NEXT_HEADING_RE = re.compile(
     r"\b(INDICATIONS?|FINDINGS?|ANESTHESIA|COMPLICATIONS?|DISPOSITION|SPECIMENS?|"
     r"ESTIMATED\s+BLOOD\s+LOSS|EBL|DRAINS?|PATHOLOGY|DICTATED\s+BY|"
@@ -148,13 +143,11 @@ def extract_section(text, start_re, max_len=4500):
     start = m.start()
     window = t[start:start + max_len]
 
-    # find next heading AFTER some buffer so we don't stop immediately
     m2 = NEXT_HEADING_RE.search(window[40:])
     if m2:
         end = 40 + m2.start()
         return window[:end].strip()
     return window.strip()
-
 
 def build_high_signal_text(note_text):
     """
@@ -170,7 +163,6 @@ def build_high_signal_text(note_text):
     combo = (header + " " + proc + " " + impl).strip()
     return combo, bool(proc), bool(impl)
 
-
 # -------------------------
 # Stage 2 evidence patterns
 # -------------------------
@@ -183,7 +175,6 @@ RX = {
     "SECOND_STAGE": re.compile(r"\b(second\s+stage|stage\s*2|stage\s+ii)\b", re.I),
     "CAPSU": re.compile(r"\b(capsulotomy|capsulectomy)\b", re.I),
 
-    # Strong "TE -> implant" phrasing
     "EXCHANGE_TE_TO_IMPLANT": re.compile(
         r"\bexchange\b.{0,80}\b(tissue\s*expander|expander|expandr|\bte\b)\b.{0,240}\b(implant|implnt|permanent\s+implant)\b|"
         r"\bexchange\b.{0,80}\b(implant|implnt|permanent\s+implant)\b.{0,240}\b(tissue\s*expander|expander|expandr|\bte\b)\b",
@@ -195,7 +186,6 @@ RX = {
         re.I
     ),
 
-    # Explicit TE->TE replacement language (true suppression)
     "EXCHANGE_TO_NEW_EXPANDER": re.compile(
         r"\bexchange(?:d)?\b.{0,120}\b(tissue\s*expander|expander|expandr|\bte\b)\b.{0,120}\bfor\b.{0,60}\b(new|another|replacement)\b.{0,120}\b(tissue\s*expander|expander|expandr|\bte\b)\b",
         re.I
@@ -206,7 +196,6 @@ RX = {
     ),
 }
 
-
 def classify_note_stage2(note_text, note_type):
     """
     Returns (tier, rule, has_proc_section, has_implants_section)
@@ -216,7 +205,6 @@ def classify_note_stage2(note_text, note_type):
     full = norm_text(note_text)
     op_like = is_op_like(note_type)
 
-    # Detect on combined high-signal text (best chance to capture "PROCEDURE" + "IMPLANTS")
     text = combo if combo else full
 
     has_expander = bool(RX["EXPANDER"].search(text))
@@ -227,17 +215,15 @@ def classify_note_stage2(note_text, note_type):
     has_second = bool(RX["SECOND_STAGE"].search(text))
     has_capsu = bool(RX["CAPSU"].search(text))
 
-    # TE->TE suppression ONLY when explicit TE->TE language, OR exchange+expander with zero implant evidence even in combo
+    # Conservative TE->TE suppression (do NOT over-suppress)
     if RX["EXCHANGE_TO_NEW_EXPANDER"].search(text) or RX["REPLACE_EXPANDER"].search(text):
         return (None, "TE_TO_TE_EXPLICIT", has_proc, has_impl)
 
     if has_exchange and has_expander and (not has_implant):
-        # This is still allowed to suppress, but now it's based on COMBO (proc+implants+header), not only procedure.
         return (None, "EXCHANGE_EXPANDER_NO_IMPLANT_IN_COMBO", has_proc, has_impl)
 
     # Tier A: definitive TE->implant
     if RX["EXCHANGE_TE_TO_IMPLANT"].search(text):
-        # If op-like note or has proc section -> A; otherwise B
         tier = "A" if (op_like or has_proc) else "B"
         return (tier, "EXCHANGE_TE_TO_IMPLANT", has_proc, has_impl)
 
@@ -264,7 +250,6 @@ def classify_note_stage2(note_text, note_type):
 
     return (None, None, has_proc, has_impl)
 
-
 def bin_label(delta_days):
     if delta_days is None or pd.isnull(delta_days):
         return None
@@ -282,29 +267,42 @@ def bin_label(delta_days):
         return "181-365d"
     return ">365d"
 
-
 def main():
     # -------------------------
-    # Load expander cohort
+    # Load expander cohort (REFINED!)
     # -------------------------
     stg = read_csv_safe(PATIENT_STAGING_CSV)
-    for col in ["patient_id", "has_expander", "stage1_date"]:
+
+    required = ["patient_id", "has_expander_refined", "stage1_date"]
+    for col in required:
         if col not in stg.columns:
             raise RuntimeError("Missing required column '{}' in {}".format(col, PATIENT_STAGING_CSV))
 
     stg["patient_id"] = stg["patient_id"].fillna("").astype(str)
-    stg["has_expander_bool"] = stg["has_expander"].apply(to_bool)
-    exp = stg[stg["has_expander_bool"]].copy()
+    stg["has_expander_refined_bool"] = stg["has_expander_refined"].apply(to_bool)
+
+    exp = stg[stg["has_expander_refined_bool"]].copy()
 
     exp["stage1_dt"] = to_dt(exp["stage1_date"])
     exp_ids = set(exp["patient_id"].astype(str).tolist())
     if not exp_ids:
-        raise RuntimeError("No expander patients found (has_expander==True).")
+        raise RuntimeError("No refined expander patients found (has_expander_refined==True).")
 
     stage1_map = dict(zip(exp["patient_id"].astype(str), exp["stage1_dt"]))
-    mrn_map = dict(zip(exp["patient_id"].astype(str), exp.get("mrn", pd.Series([""] * len(exp))).astype(str)))
 
-    print("Expander patients:", len(exp_ids))
+    # MRN mapping (only if present)
+    mrn_map = {}
+    if "mrn" in exp.columns:
+        mrn_map = dict(zip(exp["patient_id"].astype(str), exp["mrn"].fillna("").astype(str)))
+    else:
+        mrn_map = dict(zip(exp["patient_id"].astype(str), pd.Series([""] * len(exp)).astype(str)))
+
+    # Bucket mapping (helpful for sanity)
+    bucket_map = {}
+    if "expander_bucket" in exp.columns:
+        bucket_map = dict(zip(exp["patient_id"].astype(str), exp["expander_bucket"].fillna("").astype(str)))
+
+    print("Expander patients (has_expander_refined==True):", len(exp_ids))
 
     # -------------------------
     # Validate note columns exist
@@ -341,8 +339,6 @@ def main():
 
         total_rows_expanders += len(chunk)
 
-        chunk["note_text_norm"] = chunk[COL_NOTE_TEXT].apply(norm_text)
-
         chunk["note_dt"] = to_dt(chunk[COL_NOTE_DOS])
         chunk["op_dt"] = to_dt(chunk[COL_OP_DATE])
         chunk["event_dt"] = chunk["note_dt"].fillna(chunk["op_dt"])
@@ -352,7 +348,7 @@ def main():
         has_proc_list = []
         has_impl_list = []
 
-        note_texts = chunk[COL_NOTE_TEXT].tolist()  # use original to preserve headings
+        note_texts = chunk[COL_NOTE_TEXT].tolist()
         note_types = chunk[COL_NOTE_TYPE].fillna("").astype(str).tolist()
 
         for i in range(len(note_texts)):
@@ -400,10 +396,13 @@ def main():
     # -------------------------
     # Patient-level best Stage 2
     # -------------------------
+    patient_level = pd.DataFrame({"patient_id": list(exp_ids)})
+    patient_level["stage1_dt"] = patient_level["patient_id"].map(stage1_map)
+    patient_level["mrn_from_staging"] = patient_level["patient_id"].map(mrn_map)
+    if bucket_map:
+        patient_level["expander_bucket"] = patient_level["patient_id"].map(bucket_map)
+
     if hits_all.empty:
-        patient_level = pd.DataFrame({"patient_id": list(exp_ids)})
-        patient_level["stage1_dt"] = patient_level["patient_id"].map(stage1_map)
-        patient_level["mrn_from_staging"] = patient_level["patient_id"].map(mrn_map)
         patient_level["stage2_event_dt_best"] = None
         patient_level["stage2_tier_best"] = None
         patient_level["stage2_rule_best"] = None
@@ -420,7 +419,6 @@ def main():
     else:
         tier_rank = {"A": 3, "B": 2, "C": 1}
         hits_all["tier_rank"] = hits_all["tier"].map(tier_rank).fillna(0).astype(int)
-
         hits_all["after_index"] = hits_all["delta_days_vs_stage1"].apply(
             lambda x: (x is not None) and pd.notnull(x) and (x >= 0)
         )
@@ -431,11 +429,6 @@ def main():
         )
 
         best = hits_all.groupby(COL_PATIENT, as_index=False).head(1).copy()
-
-        patient_level = pd.DataFrame({"patient_id": list(exp_ids)})
-        patient_level["stage1_dt"] = patient_level["patient_id"].map(stage1_map)
-        patient_level["mrn_from_staging"] = patient_level["patient_id"].map(mrn_map)
-
         best = best.rename(columns={COL_PATIENT: "patient_id"})
         patient_level = patient_level.merge(best, on="patient_id", how="left")
 
@@ -454,7 +447,6 @@ def main():
         }
         if COL_MRN in patient_level.columns:
             rename_map[COL_MRN] = "mrn_from_notes"
-
         patient_level = patient_level.rename(columns=rename_map)
 
     # -------------------------
@@ -478,15 +470,15 @@ def main():
         if not d.empty:
             timing_bins = d.apply(bin_label).value_counts()
 
-    proc_best = patient_level["best_has_proc_section"].fillna(False).astype(bool).value_counts()
-    impl_best = patient_level["best_has_implants_section"].fillna(False).astype(bool).value_counts()
+    proc_best = patient_level.get("best_has_proc_section", pd.Series([])).fillna(False).astype(bool).value_counts()
+    impl_best = patient_level.get("best_has_implants_section", pd.Series([])).fillna(False).astype(bool).value_counts()
 
     lines = []
     lines.append("=== Stage 2 from OPERATION NOTES (Expanders) ===")
     lines.append("Python: 3.6-compatible | Read encoding: latin1 (errors=replace) | Write outputs: utf-8")
     lines.append("Classifier: Procedure+Implants section aware | Conservative TE->TE suppression")
     lines.append("")
-    lines.append("Expander patients (from patient_recon_staging.csv): {}".format(n_exp))
+    lines.append("Expander patients (from {} | has_expander_refined==True): {}".format(PATIENT_STAGING_CSV, n_exp))
     lines.append("Patients with ANY Stage2 note hit (any date): {} ({:.1f}%)".format(
         n_pat_with_any_hit, (100.0 * n_pat_with_any_hit / n_exp) if n_exp else 0.0
     ))
@@ -498,6 +490,12 @@ def main():
     for k, v in tier_counts.items():
         lines.append("  {}: {}".format(k, int(v)))
 
+    if "expander_bucket" in patient_level.columns:
+        lines.append("")
+        lines.append("Expander bucket distribution (refined cohort):")
+        for k, v in patient_level["expander_bucket"].fillna("MISSING").value_counts().items():
+            lines.append("  {}: {}".format(k, int(v)))
+
     lines.append("")
     lines.append("Best-hit used sections (patients):")
     lines.append("  best_has_proc_section True: {}".format(int(proc_best.get(True, 0))))
@@ -508,11 +506,11 @@ def main():
     lines.append("")
     lines.append("Row diagnostics (expanders only):")
     lines.append("  Total rows scanned (all patients in file): {}".format(total_rows_seen))
-    lines.append("  Total rows scanned (expander cohort): {}".format(total_rows_expanders))
+    lines.append("  Total rows scanned (refined expander cohort): {}".format(total_rows_expanders))
     lines.append("  Rows with detected procedure section: {}".format(rows_with_proc))
     lines.append("  Rows with detected implants section: {}".format(rows_with_impl))
     lines.append("  Suppressed TE->TE explicit: {}".format(suppressed_explicit_te_to_te))
-    lines.append("  Suppressed exchange+expander with no implant in (proc+impl+header): {}".format(suppressed_exchange_no_implant))
+    lines.append("  Suppressed exchange+expander with no implant in (header+proc+implants): {}".format(suppressed_exchange_no_implant))
 
     if timing_bins is not None:
         lines.append("")
@@ -530,7 +528,6 @@ def main():
         f.write("\n".join(lines) + "\n")
 
     print("\n".join(lines))
-
 
 if __name__ == "__main__":
     try:
