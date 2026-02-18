@@ -11,7 +11,7 @@
 #   - Canonical date rules:
 #       * Operation notes: prefer OPERATION_DATE, then NOTE_DATE_OF_SERVICE
 #       * Clinic/Inpatient notes: prefer NOTE_DATE_OF_SERVICE, then OPERATION_DATE
-#     (If a file lacks these, we fall back to other date-like columns if found.)
+#     (If a file lacks these, fall back to other date-like columns if found.)
 #
 # Outputs:
 #   - qa_note_date_fields_summary.txt
@@ -23,7 +23,6 @@
 
 from __future__ import print_function
 
-import os
 import re
 import sys
 import pandas as pd
@@ -51,12 +50,34 @@ COL_NOTE_ID = "NOTE_ID"
 COL_NOTE_TEXT = "NOTE_TEXT"
 
 # -------------------------
-# Robust chunk reader
+# Robust readers (Python 3.6-safe)
 # -------------------------
-def iter_csv_safe(path, **kwargs):
+def read_csv_safe(path, **kwargs):
+    """
+    Always returns a DataFrame (non-chunked).
+    Use for header reads or small reads.
+    """
     f = open(path, "r", encoding="latin1", errors="replace")
     try:
-        for chunk in pd.read_csv(f, engine="python", **kwargs):
+        return pd.read_csv(f, engine="python", **kwargs)
+    finally:
+        try:
+            f.close()
+        except Exception:
+            pass
+
+def iter_csv_chunks_safe(path, **kwargs):
+    """
+    Always yields DataFrame chunks.
+    Requires chunksize in kwargs.
+    """
+    if "chunksize" not in kwargs:
+        raise RuntimeError("iter_csv_chunks_safe requires chunksize=...")
+
+    f = open(path, "r", encoding="latin1", errors="replace")
+    try:
+        reader = pd.read_csv(f, engine="python", **kwargs)
+        for chunk in reader:
             yield chunk
     finally:
         try:
@@ -64,14 +85,7 @@ def iter_csv_safe(path, **kwargs):
         except Exception:
             pass
 
-def read_head(path, nrows=5):
-    it = iter_csv_safe(path, nrows=nrows)
-    for chunk in it:
-        return chunk
-    return None
-
 def to_dt(series):
-    # pandas handles many formats; errors=coerce turns bad values into NaT
     return pd.to_datetime(series, errors="coerce")
 
 def norm_colname(c):
@@ -79,7 +93,6 @@ def norm_colname(c):
 
 def looks_like_date_col(colname):
     c = str(colname).lower()
-    # broad but safe heuristic; we only use these if core cols absent
     keys = ["date", "dt", "time", "timestamp", "dos", "service", "operation"]
     return any(k in c for k in keys)
 
@@ -94,8 +107,6 @@ def build_event_dt(chunk, file_tag, date_cols):
     date_cols: dict of detected columns for this file (strings or None)
     Returns (event_dt_series, used_rule_string)
     """
-    # Extract candidate series if present
-    # All are string-like; convert to datetime safely
     series_map = {}
     for k, col in date_cols.items():
         if col and col in chunk.columns:
@@ -103,7 +114,7 @@ def build_event_dt(chunk, file_tag, date_cols):
         else:
             series_map[k] = None
 
-    # Canonical rules (explicit, stable)
+    # Canonical rules
     if file_tag == "operation_notes":
         # prefer OPERATION_DATE, then NOTE_DATE_OF_SERVICE
         if series_map.get("op_date") is not None:
@@ -130,13 +141,16 @@ def build_event_dt(chunk, file_tag, date_cols):
         if series_map.get("op_date") is not None:
             return series_map["op_date"], "OPERATION_DATE"
 
-    # Fallback: other detected date-like columns in priority order
+    # Fallback: other detected date-like columns
     for k in ["enc_date", "contact_date", "created_dt", "signed_dt", "other_date1", "other_date2"]:
         if series_map.get(k) is not None:
             return series_map[k], "FALLBACK:" + k
 
-    # If nothing found
+    # nothing found
     return pd.to_datetime(pd.Series([None] * len(chunk))), "NO_DATE_COLUMNS_FOUND"
+
+def pct(n, d):
+    return (100.0 * float(n) / float(d)) if d else 0.0
 
 def main():
     summary_rows = []
@@ -150,38 +164,32 @@ def main():
     for file_tag, path in NOTES_FILES:
         lines.append("File tag: {} | Path: {}".format(file_tag, path))
 
-        head = read_head(path, nrows=5)
-        if head is None:
-            lines.append("  ERROR: Could not read file.")
+        head = read_csv_safe(path, nrows=5)
+        if head is None or head.empty:
+            lines.append("  ERROR: Could not read file or file is empty.")
             lines.append("")
             continue
 
         # Normalize columns
-        cols = [norm_colname(c) for c in head.columns.tolist()]
-        # Map normalized -> actual (to avoid surprises if whitespace differs)
         norm_to_actual = {norm_colname(c): c for c in head.columns.tolist()}
         df_cols = list(norm_to_actual.keys())
 
-        # Detect core date columns first (exact matches)
+        # Detect core date columns first
         col_dos = pick_existing_cols(df_cols, ["NOTE_DATE_OF_SERVICE", "NOTE DOS", "DATE_OF_SERVICE", "DOS"])
         col_op  = pick_existing_cols(df_cols, ["OPERATION_DATE", "OP DATE", "DATE_OF_OPERATION", "SURGERY_DATE"])
 
-        # Detect other likely date columns (best-effort)
-        # Keep these conservative; only used if core cols absent
+        # Detect other likely date columns
         date_like = [c for c in df_cols if looks_like_date_col(c)]
-        # Try common alternates
-        col_enc = pick_existing_cols(df_cols, ["ENCOUNTER_DATE", "CONTACT_DATE", "VISIT_DATE"])
+        col_enc = pick_existing_cols(df_cols, ["ENCOUNTER_DATE", "ENC_DATE"])
         col_contact = pick_existing_cols(df_cols, ["CONTACT_DATE", "VISIT_DATE"])
         col_created = pick_existing_cols(df_cols, ["CREATED_DATE", "CREATED_DT", "CREATE_DATE", "CREATE_DTTM"])
         col_signed = pick_existing_cols(df_cols, ["SIGNED_DATE", "SIGNED_DT", "SIGN_DATE", "SIGN_DTTM"])
 
-        # Create two "other" fallbacks from date_like that are not already chosen
         chosen = set([c for c in [col_dos, col_op, col_enc, col_contact, col_created, col_signed] if c])
         others = [c for c in date_like if c not in chosen]
         other1 = others[0] if len(others) > 0 else None
         other2 = others[1] if len(others) > 1 else None
 
-        # Translate normalized -> actual names
         def actual(col_norm):
             return norm_to_actual.get(col_norm) if col_norm else None
 
@@ -196,13 +204,12 @@ def main():
             "other_date2": actual(other2),
         }
 
-        # For QA: scan file in chunks and compute non-null rates for detected columns
+        # Build usecols for faster scanning
         usecols = []
         for c in [COL_PAT, COL_NOTE_TYPE, COL_NOTE_ID, COL_NOTE_TEXT]:
             if c in df_cols:
                 usecols.append(norm_to_actual[c])
 
-        # Add date cols if present
         for k in ["dos", "op_date", "enc_date", "contact_date", "created_dt", "signed_dt", "other_date1", "other_date2"]:
             col = date_cols.get(k)
             if col and col not in usecols:
@@ -212,58 +219,48 @@ def main():
         nonnull_counts = {k: 0 for k in date_cols.keys()}
         event_nonnull = 0
         used_rule_final = None
-
-        # sample collector
         sample_kept = 0
 
-        for chunk in iter_csv_safe(path, usecols=usecols, chunksize=CHUNKSIZE):
+        for chunk in iter_csv_chunks_safe(path, usecols=usecols, chunksize=CHUNKSIZE):
             total_rows += len(chunk)
 
-            # Count non-null for each detected date col
             for k, col in date_cols.items():
                 if col and col in chunk.columns:
                     nonnull_counts[k] += int(chunk[col].notnull().sum())
 
-            # Build EVENT_DT for this chunk using canonical rules
             event_dt, used_rule = build_event_dt(chunk, file_tag, date_cols)
-            used_rule_final = used_rule_final or used_rule
+            if used_rule_final is None:
+                used_rule_final = used_rule
             event_nonnull += int(event_dt.notnull().sum())
 
-            # Save sample rows (small)
             if sample_kept < SAMPLE_PER_FILE:
                 n_take = min(SAMPLE_PER_FILE - sample_kept, len(chunk))
                 sub = chunk.head(n_take).copy()
                 sub["FILE_TAG"] = file_tag
                 sub["EVENT_DT"] = event_dt.head(n_take)
-                # Keep only a few columns
+
                 keep = ["FILE_TAG"]
                 for c in [COL_PAT, COL_NOTE_TYPE, COL_NOTE_ID]:
                     if c in sub.columns:
                         keep.append(c)
-                # Keep the actual chosen date columns too
+
                 for col in [date_cols.get("dos"), date_cols.get("op_date")]:
                     if col and col in sub.columns and col not in keep:
                         keep.append(col)
+
                 keep.append("EVENT_DT")
                 sample_rows.append(sub[keep])
                 sample_kept += n_take
-
-        # Summarize
-        def pct(n, d):
-            return (100.0 * float(n) / float(d)) if d else 0.0
 
         lines.append("  Rows scanned: {}".format(total_rows))
         lines.append("  Canonical EVENT_DT rule used: {}".format(used_rule_final))
         lines.append("  EVENT_DT non-null: {} ({:.1f}%)".format(event_nonnull, pct(event_nonnull, total_rows)))
 
-        # Date column availability summary
         for k in ["dos", "op_date", "enc_date", "contact_date", "created_dt", "signed_dt", "other_date1", "other_date2"]:
             col = date_cols.get(k)
             if col:
-                nn = nonnull_counts.get(k, 0)
-                lines.append("    {:>14}: {:<35} non-null={} ({:.1f}%)".format(
-                    k, col, nn, pct(nn, total_rows)
-                ))
+                nn = int(nonnull_counts.get(k, 0))
+                lines.append("    {:>14}: {:<35} non-null={} ({:.1f}%)".format(k, col, nn, pct(nn, total_rows)))
 
         lines.append("")
 
@@ -271,8 +268,8 @@ def main():
             "file_tag": file_tag,
             "path": path,
             "rows_scanned": total_rows,
-            "event_dt_rule": used_rule_final,
-            "event_dt_nonnull": event_nonnull,
+            "event_dt_rule": used_rule_final if used_rule_final else "",
+            "event_dt_nonnull": int(event_nonnull),
             "event_dt_nonnull_pct": round(pct(event_nonnull, total_rows), 2),
         }
         for k, col in date_cols.items():
@@ -298,7 +295,6 @@ def main():
     print("  - {}".format(OUT_SUMMARY_TXT))
     print("  - {}".format(OUT_SUMMARY_CSV))
     print("  - {}".format(OUT_SAMPLE_CSV))
-
 
 if __name__ == "__main__":
     try:
