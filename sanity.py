@@ -1,47 +1,30 @@
-# sanity.py
+# sanity_stage2_notes.py
 # Python 3.6.8+
 from __future__ import print_function
-
 import sys
 import pandas as pd
 
-PATH = "patient_recon_staging_refined.csv"  # change if needed
+PATH = "stage2_from_notes_patient_level.csv"
 
 def main():
     df = pd.read_csv(PATH, engine="python")
-
-    cols = list(df.columns)
     print("Loaded:", PATH)
-    print("Columns ({}):".format(len(cols)))
-    for c in cols:
-        print("  -", c)
+    print("Rows:", len(df))
 
-    # Look for plausible Stage2 columns
-    cand = []
-    for c in cols:
-        cl = str(c).strip().lower()
-        if ("stage2" in cl) or ("stage_2" in cl) or ("2nd" in cl) or ("second" in cl):
-            cand.append(c)
+    required = ["patient_id", "stage2_tier_best", "stage2_event_dt_best", "stage2_after_index"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise RuntimeError("Missing required columns: {}".format(missing))
 
-    print("\nCandidate Stage2-related columns:", cand if cand else "NONE FOUND")
+    total = len(df)
+    any_hit = int(df["stage2_tier_best"].notnull().sum())
+    after_index = int(df["stage2_after_index"].fillna(False).astype(bool).sum())
 
-    # If a stage2_date-like column exists, compute non-null count
-    preferred = ["stage2_date", "stage2_dt", "stage2", "stage_2_date", "stage2_dos", "stage2_date_of_service"]
-    found = None
-    lower_map = {str(c).strip().lower(): c for c in cols}
-    for p in preferred:
-        if p in lower_map:
-            found = lower_map[p]
-            break
+    print("Patients with ANY Stage2 hit:", any_hit, "({:.1f}%)".format(100.0 * any_hit / total if total else 0.0))
+    print("Patients with AFTER-index best hit:", after_index, "({:.1f}%)".format(100.0 * after_index / total if total else 0.0))
 
-    if found is None:
-        print("\nNo stage2 date column found in this file, so there is nothing to count here.")
-        print("If you want structured Stage2, run this script on patient_recon_structured.csv (or whichever file has recon fields).")
-        print("If you want note-derived Stage2, run counts on stage2_from_notes_patient_level.csv (column: stage2_event_dt_best).")
-        return
-
-    n = int(df[found].notnull().sum())
-    print("\nStructured Stage2 non-null count using column '{}': {}".format(found, n))
+    print("\nTier counts:")
+    print(df["stage2_tier_best"].fillna("NONE").value_counts())
 
 if __name__ == "__main__":
     try:
