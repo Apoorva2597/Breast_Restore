@@ -6,7 +6,7 @@
 #   on/after the Stage 2 date (strict anchor; optional +buffer days).
 #
 # Inputs:
-#   1) stage2_final_ab_patient_level.csv   (must include patient_id and a Stage2 date column)
+#   1) stage2_final_ab_patient_level.csv   (must include patient_id and SOME Stage2 date/dt column)
 #   2) Notes files (Operation / Clinic / Inpatient)
 #
 # Outputs:
@@ -27,7 +27,6 @@
 
 from __future__ import print_function
 
-import os
 import re
 import sys
 import pandas as pd
@@ -52,16 +51,8 @@ CHUNKSIZE = 120000
 # If you later decide you want a buffer, set e.g. BUFFER_DAYS = 1 for Stage2+1 day.
 BUFFER_DAYS = 0
 
-# Common columns (if present)
-COL_PAT_STAGE2 = "patient_id"          # in stage2_final_ab_patient_level.csv
-COL_STAGE2_DT_CANDIDATES = [
-    "stage2_event_dt_best",            # most likely
-    "stage2_dt_best",
-    "stage2_date_ab",
-    "stage2_date",
-    "stage2_dt",
-    "stage2_date_best",
-]
+# Stage2 patient-level columns
+COL_PAT_STAGE2 = "patient_id"  # in stage2_final_ab_patient_level.csv
 
 # Notes columns
 COL_PAT = "ENCRYPTED_PAT_ID"
@@ -79,9 +70,6 @@ OTHER_DATE_COLS = ["ADMIT_DATE", "HOSP_ADMSN_TIME"]
 # Robust CSV helpers (Python 3.6 safe)
 # -------------------------
 def read_csv_safe_df(path, **kwargs):
-    """
-    Read CSV into a DataFrame robustly using latin1(errors=replace).
-    """
     f = open(path, "r", encoding="latin1", errors="replace")
     try:
         return pd.read_csv(f, engine="python", **kwargs)
@@ -93,9 +81,6 @@ def read_csv_safe_df(path, **kwargs):
 
 
 def iter_csv_safe(path, **kwargs):
-    """
-    Chunk iterator that keeps file handle open for the duration of iteration.
-    """
     f = open(path, "r", encoding="latin1", errors="replace")
     try:
         for chunk in pd.read_csv(f, engine="python", **kwargs):
@@ -122,42 +107,18 @@ def clean_snippet(x, n=320):
     return (s[:n] + "...") if len(s) > n else s
 
 
-def pick_stage2_date_column(df_cols):
-    for c in COL_STAGE2_DT_CANDIDATES:
-        if c in df_cols:
-            return c
-    return None
-
-
 def canonical_event_dt(chunk, file_tag):
     """
     Return (event_dt_series, rule_used_string)
     """
-    # Default: use NOTE_DATE_OF_SERVICE if present
     if file_tag == "operation_notes":
-        # Prefer OPERATION_DATE (surgical anchor) if available & parseable, else DOS.
-        if COL_OP_DATE in chunk.columns:
-            op_dt = to_dt(chunk[COL_OP_DATE])
-        else:
-            op_dt = pd.Series([pd.NaT] * len(chunk))
+        op_dt = to_dt(chunk[COL_OP_DATE]) if COL_OP_DATE in chunk.columns else pd.Series([pd.NaT] * len(chunk))
+        dos_dt = to_dt(chunk[COL_DOS]) if COL_DOS in chunk.columns else pd.Series([pd.NaT] * len(chunk))
+        return op_dt.fillna(dos_dt), "OPERATION_DATE -> NOTE_DATE_OF_SERVICE"
 
-        if COL_DOS in chunk.columns:
-            dos_dt = to_dt(chunk[COL_DOS])
-        else:
-            dos_dt = pd.Series([pd.NaT] * len(chunk))
-
-        # Prefer OP_DATE, fallback DOS
-        event = op_dt.fillna(dos_dt)
-        rule = "OPERATION_DATE -> NOTE_DATE_OF_SERVICE"
-        return event, rule
-
-    # clinic / inpatient: use DOS
     if COL_DOS in chunk.columns:
-        event = to_dt(chunk[COL_DOS])
-        rule = "NOTE_DATE_OF_SERVICE"
-        return event, rule
+        return to_dt(chunk[COL_DOS]), "NOTE_DATE_OF_SERVICE"
 
-    # If DOS missing (unlikely given your QA), fallback to any available date col
     for c in [COL_OP_DATE] + OTHER_DATE_COLS:
         if c in chunk.columns:
             return to_dt(chunk[c]), "FALLBACK_" + c
@@ -183,6 +144,71 @@ def bin_label(delta_days):
     return ">365d"
 
 
+# -------------------------
+# NEW: Stage2 date column auto-detection
+# -------------------------
+def detect_stage2_date_column(df):
+    """
+    Pick the best Stage2 date column automatically.
+
+    Strategy:
+      1) Consider any column whose name contains 'stage2' AND ('date' OR 'dt')
+      2) Parse to datetime and choose the column with the most non-null parsed values.
+      3) If ties, prefer names that include 'event' or 'best'.
+    """
+    cols = list(df.columns)
+    candidates = []
+    for c in cols:
+        cl = str(c).lower()
+        if "stage2" in cl and ("date" in cl or "dt" in cl):
+            candidates.append(c)
+
+    # If none matched, broaden slightly: any column with stage2 in it
+    if not candidates:
+        for c in cols:
+            cl = str(c).lower()
+            if "stage2" in cl:
+                candidates.append(c)
+
+    if not candidates:
+        return None, {}
+
+    stats = {}
+    best_col = None
+    best_nonnull = -1
+    best_score = -1
+
+    for c in candidates:
+        parsed = to_dt(df[c])
+        nonnull = int(parsed.notnull().sum())
+
+        # name preference score
+        cl = str(c).lower()
+        score = 0
+        if "event" in cl:
+            score += 2
+        if "best" in cl:
+            score += 2
+        if "ab" in cl:
+            score += 1
+        if "final" in cl:
+            score += 1
+
+        stats[str(c)] = {"parsed_nonnull": nonnull, "name_score": score}
+
+        # choose by nonnull first, then score
+        if nonnull > best_nonnull or (nonnull == best_nonnull and score > best_score):
+            best_nonnull = nonnull
+            best_score = score
+            best_col = c
+
+    # if best has 0 non-null, treat as failure (likely wrong column)
+    if best_nonnull <= 0:
+        return None, stats
+
+    return best_col, stats
+
+
 def main():
     # -------------------------
     # 1) Load confirmed Stage2 (A/B) patient-level file
@@ -192,29 +218,31 @@ def main():
     if COL_PAT_STAGE2 not in st2.columns:
         raise RuntimeError("Missing '{}' in {}".format(COL_PAT_STAGE2, STAGE2_AB_PATIENT_LEVEL_CSV))
 
-    stage2_col = pick_stage2_date_column(st2.columns)
-    if stage2_col is None:
-        raise RuntimeError(
-            "No Stage2 date column found in {}. Expected one of: {}".format(
-                STAGE2_AB_PATIENT_LEVEL_CSV, COL_STAGE2_DT_CANDIDATES
-            )
-        )
-
     st2[COL_PAT_STAGE2] = st2[COL_PAT_STAGE2].fillna("").astype(str)
+
+    stage2_col, det_stats = detect_stage2_date_column(st2)
+    if stage2_col is None:
+        # Provide a helpful, deterministic error message without asking for headers again
+        msg_lines = []
+        msg_lines.append("No Stage2 date column found in {}.".format(STAGE2_AB_PATIENT_LEVEL_CSV))
+        msg_lines.append("I looked for columns containing 'stage2' and 'date'/'dt' (and then any 'stage2' column).")
+        msg_lines.append("Columns present ({}): {}".format(len(st2.columns), list(st2.columns)))
+        if det_stats:
+            msg_lines.append("Candidate parse stats: {}".format(det_stats))
+        raise RuntimeError("\n".join(msg_lines))
+
+    # Parse Stage2 column
     st2[stage2_col] = to_dt(st2[stage2_col])
 
-    # Keep only patients with a non-null Stage2 date
+    # Keep only patients with non-null Stage2 date
     st2_valid = st2[st2[stage2_col].notnull()].copy()
     stage2_map = dict(zip(st2_valid[COL_PAT_STAGE2].astype(str), st2_valid[stage2_col]))
 
     if not stage2_map:
-        raise RuntimeError("No patients with non-null Stage2 date in {}".format(STAGE2_AB_PATIENT_LEVEL_CSV))
+        raise RuntimeError("Detected Stage2 column '{}' but it parsed to all-null datetimes.".format(stage2_col))
 
     stage2_ids = set(stage2_map.keys())
 
-    # Apply buffer (Stage2 + BUFFER_DAYS)
-    # Anchor date = stage2_dt + buffer
-    # (keep Stage2_dt_raw separately for output)
     print("Loaded Stage2 A/B patients with date present:", len(stage2_ids))
     print("Stage2 date column used:", stage2_col)
     print("Anchor buffer days:", BUFFER_DAYS)
@@ -227,17 +255,13 @@ def main():
     total_rows_scanned = 0
     total_rows_stage2_patients = 0
     total_rows_kept = 0
-
-    # For timing bins across ALL kept rows
     all_deltas = []
 
     for file_tag, path in NOTES_FILES:
-        # Read a small head to determine available columns
         head = read_csv_safe_df(path, nrows=5)
         if COL_PAT not in head.columns:
             raise RuntimeError("Missing '{}' in {}".format(COL_PAT, path))
 
-        # Minimal set we want if available
         usecols = [COL_PAT]
         for c in [COL_NOTE_TYPE, COL_NOTE_ID, COL_NOTE_TEXT, COL_DOS, COL_OP_DATE] + OTHER_DATE_COLS:
             if c in head.columns and c not in usecols:
@@ -246,7 +270,6 @@ def main():
         rows_scanned = 0
         rows_stage2 = 0
         rows_kept = 0
-
         event_rule_used = None
 
         for chunk in iter_csv_safe(path, usecols=usecols, chunksize=CHUNKSIZE):
@@ -261,16 +284,13 @@ def main():
             rows_stage2 += len(chunk)
             total_rows_stage2_patients += len(chunk)
 
-            # Canonical event date
             event_dt, rule = canonical_event_dt(chunk, file_tag)
             event_rule_used = rule
             chunk["EVENT_DT"] = event_dt
 
-            # Attach stage2 dt and anchor dt
             chunk["STAGE2_DT_RAW"] = chunk[COL_PAT].map(stage2_map)
             chunk["STAGE2_ANCHOR_DT"] = chunk["STAGE2_DT_RAW"] + pd.to_timedelta(BUFFER_DAYS, unit="D")
 
-            # Keep only EVENT_DT >= STAGE2_ANCHOR_DT
             chunk = chunk[chunk["EVENT_DT"].notnull() & chunk["STAGE2_ANCHOR_DT"].notnull()].copy()
             if chunk.empty:
                 continue
@@ -279,21 +299,17 @@ def main():
             if chunk.empty:
                 continue
 
-            # Delta days (from raw Stage2 date, not buffered anchor)
             chunk["DELTA_DAYS_FROM_STAGE2"] = (chunk["EVENT_DT"] - chunk["STAGE2_DT_RAW"]).dt.days
             rows_kept += len(chunk)
             total_rows_kept += len(chunk)
 
-            # Collect deltas for bins
             all_deltas.extend(chunk["DELTA_DAYS_FROM_STAGE2"].dropna().astype(int).tolist())
 
-            # Snippet for QA
             if COL_NOTE_TEXT in chunk.columns:
                 chunk["NOTE_SNIPPET"] = chunk[COL_NOTE_TEXT].apply(lambda x: clean_snippet(x, n=320))
             else:
                 chunk["NOTE_SNIPPET"] = ""
 
-            # Standardize output columns
             out_cols = [
                 "file_tag",
                 COL_PAT,
@@ -302,11 +318,9 @@ def main():
                 "EVENT_DT",
                 "DELTA_DAYS_FROM_STAGE2",
             ]
-
             for c in [COL_NOTE_TYPE, COL_NOTE_ID, COL_DOS, COL_OP_DATE] + OTHER_DATE_COLS:
                 if c in chunk.columns:
                     out_cols.append(c)
-
             out_cols.append("NOTE_SNIPPET")
 
             chunk["file_tag"] = file_tag
@@ -321,26 +335,15 @@ def main():
             "event_dt_rule": event_rule_used if event_rule_used else "UNKNOWN",
         })
 
-    if kept_frames:
-        out = pd.concat(kept_frames, ignore_index=True)
-    else:
-        out = pd.DataFrame()
+    out = pd.concat(kept_frames, ignore_index=True) if kept_frames else pd.DataFrame()
 
-    # Sort for readability
     if not out.empty:
         out = out.sort_values(by=[COL_PAT, "EVENT_DT", "file_tag"], ascending=[True, True, True])
 
     out.to_csv(OUT_ROWS_CSV, index=False, encoding="utf-8")
 
-    # -------------------------
-    # 3) Summary
-    # -------------------------
-    # Patient counts with at least 1 anchored note
-    patients_with_any = 0
-    if not out.empty:
-        patients_with_any = int(out[COL_PAT].nunique())
+    patients_with_any = int(out[COL_PAT].nunique()) if (not out.empty and COL_PAT in out.columns) else 0
 
-    # Timing bins across all kept rows
     bins_counts = {}
     for d in all_deltas:
         b = bin_label(d)
@@ -348,7 +351,6 @@ def main():
             continue
         bins_counts[b] = bins_counts.get(b, 0) + 1
 
-    # Write summary
     lines = []
     lines.append("=== Stage 2 Complication Anchor (A/B only) ===")
     lines.append("Python: 3.6.8 compatible | Read encoding: latin1(errors=replace) | Outputs: utf-8")
@@ -377,7 +379,6 @@ def main():
     if bins_counts:
         lines.append("")
         lines.append("Timing bins across kept rows (DELTA_DAYS_FROM_STAGE2):")
-        # stable order
         for k in ["0-30d", "31-90d", "91-180d", "181-365d", ">365d"]:
             if k in bins_counts:
                 lines.append("  {}: {}".format(k, bins_counts[k]))
