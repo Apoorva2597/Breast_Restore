@@ -6,7 +6,7 @@
 #     1) Row-level complication hits (category + inferred treatment + minor/major)
 #     2) Patient-level S2_Comp1..S2_Comp3 fields aligned to Breast RESTORE dictionary
 #
-# Inputs (expected in current working dir unless paths edited):
+# Inputs:
 #   - stage2_final_ab_patient_level.csv
 #   - stage2_anchor_rows_with_bins.csv
 #
@@ -40,10 +40,10 @@ OUT_ROW_HITS = "stage2_ab_complications_row_hits.csv"
 OUT_PATIENT_LEVEL = "stage2_ab_complications_patient_level.csv"
 OUT_SUMMARY = "stage2_ab_complications_summary.txt"
 
-CHUNKSIZE = 150000  # anchor rows can be large
+CHUNKSIZE = 150000
 
-# Required/expected id column name
 COL_PATIENT = "patient_id"
+
 
 # -------------------------
 # Robust CSV reading (Python 3.6 safe)
@@ -95,35 +95,42 @@ def first_existing(cols, candidates):
             return c
     return None
 
+def fuzzy_find_col(cols, must_contain_tokens):
+    """
+    Return first col whose upper-case name contains ANY token in must_contain_tokens.
+    Example tokens: ["NOTE_TEXT","TEXT","SNIPPET"]
+    """
+    ucols = [(c, str(c).upper()) for c in cols]
+    for c, uc in ucols:
+        for tok in must_contain_tokens:
+            if tok in uc:
+                return c
+    return None
+
+
 # -------------------------
-# Complication category patterns (dictionary-aligned)
+# Complication category patterns
 # -------------------------
-# Note: These are intentionally explicit. You can expand later.
 COMP_PATTERNS = [
     ("Hematoma", re.compile(r"\bhematoma\b", re.I)),
     ("Wound dehiscence", re.compile(r"\b(dehiscence|wound\s+dehisce|incision\s+dehisce|wound\s+separation)\b", re.I)),
     ("Wound infection", re.compile(r"\b(infection|infected|cellulitis|abscess|purulence|purulent|ssi|surgical\s+site\s+infection)\b", re.I)),
     ("Mastectomy skin flap necrosis", re.compile(r"\b(skin\s+flap\s+necrosis|mastectomy\s+flap\s+necrosis|msfn|flap\s+necrosis)\b", re.I)),
     ("Seroma", re.compile(r"\bseroma\b", re.I)),
-
-    # Implant complications (dictionary subtypes)
     ("Capsular contracture", re.compile(r"\b(capsular\s+contracture)\b", re.I)),
     ("Implant malposition", re.compile(r"\b(implant\s+malposition|malposition)\b", re.I)),
     ("Implant rupture/leak/deflation", re.compile(r"\b(implant\s+(rupture|ruptured|leak|leakage|deflation|deflated))\b|\b(ruptured\s+implant|leaking\s+implant)\b", re.I)),
     ("Implant/expander extrusion", re.compile(r"\b(extrusion|exposed\s+(implant|expander)|implant\s+exposure|expander\s+exposure)\b", re.I)),
-
-    # Flap complications (if present; even though AB is expander->implant, keep for safety)
     ("Acute partial flap necrosis", re.compile(r"\b(partial\s+flap\s+necrosis)\b", re.I)),
     ("Total flap loss", re.compile(r"\b(total\s+flap\s+loss|flap\s+loss)\b", re.I)),
 ]
 
-# Optional: capture "Other" systemic complications only if explicitly named (very conservative)
 OTHER_SYSTEMIC_RE = re.compile(r"\b(pulmonary\s+embolism|pe\b|deep\s+vein\s+thrombosis|dvt\b|pneumonia|sepsis)\b", re.I)
 
+
 # -------------------------
-# Treatment inference (dictionary-aligned buckets)
+# Treatment inference
 # -------------------------
-# These are heuristic and meant for QA; they can be refined later.
 RX_REOP = re.compile(
     r"\b(return(ed)?\s+to\s+or|take\s*back|takeback|re-?operation|reop|washout|operative\s+debridement|"
     r"incision\s+and\s+drainage|i\s*&\s*d|explant|explanted|implant\s+removal|remove(d)?\s+implant|"
@@ -151,7 +158,6 @@ RX_NOTX = re.compile(
 
 def infer_treatment_bucket(text):
     t = norm_text(text)
-    # Priority: REOP > REHOSP > NON-OP > NO TREATMENT
     if RX_REOP.search(t):
         return "REOPERATION"
     if RX_REHOSP.search(t):
@@ -160,7 +166,6 @@ def infer_treatment_bucket(text):
         return "NON-OPERATIVE"
     if RX_NOTX.search(t):
         return "NO TREATMENT"
-    # Unknown -> treat as NON-OPERATIVE? No. Keep as UNKNOWN for QA.
     return "UNKNOWN"
 
 def major_minor_from_treatment(bucket):
@@ -170,11 +175,11 @@ def major_minor_from_treatment(bucket):
         return "MINOR"
     return "UNKNOWN"
 
+
 # -------------------------
 # Column auto-detection
 # -------------------------
 def detect_stage2_date_col(cols):
-    # prefer the final column you created earlier
     candidates = [
         "stage2_date_final",
         "stage2_dt_final",
@@ -188,27 +193,49 @@ def detect_stage2_date_col(cols):
 
 def detect_event_dt_col(cols):
     candidates = ["EVENT_DT", "event_dt", "NOTE_DATE_OF_SERVICE", "note_dt", "OPERATION_DATE", "op_dt"]
-    return first_existing(cols, candidates)
+    c = first_existing(cols, candidates)
+    if c is not None:
+        return c
+    # fallback fuzzy: any column containing EVENT and DT/DATE
+    return fuzzy_find_col(cols, ["EVENT_DT", "EVENT", "DATE_OF_SERVICE", "OPERATION_DATE", "DATE"])
 
 def detect_text_col(cols):
-    candidates = ["NOTE_TEXT", "NOTE_TEXT_CLEAN", "note_text", "note_text_norm", "TEXT", "snippet"]
-    return first_existing(cols, candidates)
+    # strict first
+    candidates = ["NOTE_TEXT", "NOTE_TEXT_CLEAN", "note_text", "note_text_norm", "TEXT", "snippet", "SNIPPET"]
+    c = first_existing(cols, candidates)
+    if c is not None:
+        return c
+    # fuzzy fallback (this is what fixes your run)
+    return fuzzy_find_col(cols, ["NOTE_TEXT", "TEXT", "SNIPPET"])
 
 def detect_note_type_col(cols):
     candidates = ["NOTE_TYPE", "note_type", "best_note_type"]
-    return first_existing(cols, candidates)
+    c = first_existing(cols, candidates)
+    if c is not None:
+        return c
+    return fuzzy_find_col(cols, ["NOTE_TYPE", "TYPE"])
 
 def detect_note_id_col(cols):
     candidates = ["NOTE_ID", "note_id", "best_note_id"]
-    return first_existing(cols, candidates)
+    c = first_existing(cols, candidates)
+    if c is not None:
+        return c
+    return fuzzy_find_col(cols, ["NOTE_ID", "ID"])
 
 def detect_file_tag_col(cols):
     candidates = ["file_tag", "FILE_TAG", "source_file", "SOURCE"]
-    return first_existing(cols, candidates)
+    c = first_existing(cols, candidates)
+    if c is not None:
+        return c
+    return fuzzy_find_col(cols, ["FILE_TAG", "SOURCE", "FILE"])
 
 def detect_delta_col(cols):
-    candidates = ["DELTA_DAYS_FROM_STAGE2", "delta_days_from_stage2", "stage2_delta_days", "stage2_delta_days_from_stage1"]
-    return first_existing(cols, candidates)
+    candidates = ["DELTA_DAYS_FROM_STAGE2", "delta_days_from_stage2"]
+    c = first_existing(cols, candidates)
+    if c is not None:
+        return c
+    return fuzzy_find_col(cols, ["DELTA", "STAGE2"])
+
 
 # -------------------------
 # Main
@@ -221,7 +248,7 @@ def main():
 
     stage2_col = detect_stage2_date_col(ab.columns)
     if stage2_col is None:
-        raise RuntimeError("No Stage2 date column found in {}. Expected one of stage2_date_final/stage2_event_dt_best/etc.".format(
+        raise RuntimeError("No Stage2 date column found in {}. Expected stage2_date_final / stage2_event_dt_best / etc.".format(
             STAGE2_AB_PATIENTS_CSV
         ))
 
@@ -235,8 +262,8 @@ def main():
     if not ab_ids:
         raise RuntimeError("No AB patients with a Stage2 date found in {}".format(STAGE2_AB_PATIENTS_CSV))
 
-    # 2) Peek anchor rows header
-    head = read_csv_safe(ANCHOR_ROWS_CSV, nrows=10)
+    # 2) Peek anchor rows header + detect cols
+    head = read_csv_safe(ANCHOR_ROWS_CSV, nrows=25)
     if COL_PATIENT not in head.columns:
         raise RuntimeError("Missing '{}' in {}".format(COL_PATIENT, ANCHOR_ROWS_CSV))
 
@@ -246,16 +273,17 @@ def main():
     if event_col is None:
         raise RuntimeError("Could not detect an event date column in {} (need EVENT_DT or similar).".format(ANCHOR_ROWS_CSV))
     if text_col is None:
-        raise RuntimeError("Could not detect a note text column in {} (need NOTE_TEXT/NOTE_TEXT_CLEAN/snippet).".format(ANCHOR_ROWS_CSV))
+        raise RuntimeError("Could not detect a note text column in {} (need NOTE_TEXT/NOTE_TEXT_CLEAN/snippet or any col containing TEXT).".format(
+            ANCHOR_ROWS_CSV
+        ))
 
     note_type_col = detect_note_type_col(head.columns)
     note_id_col = detect_note_id_col(head.columns)
     file_tag_col = detect_file_tag_col(head.columns)
-    delta_col = detect_delta_col(head.columns)
+    delta_existing_col = detect_delta_col(head.columns)
 
-    # Only load what we need
     usecols = [COL_PATIENT, event_col, text_col]
-    for c in [note_type_col, note_id_col, file_tag_col, delta_col]:
+    for c in [note_type_col, note_id_col, file_tag_col, delta_existing_col]:
         if c is not None and c not in usecols:
             usecols.append(c)
 
@@ -278,17 +306,15 @@ def main():
         chunk["EVENT_DT"] = to_dt(chunk[event_col])
         chunk["STAGE2_DT"] = chunk[COL_PATIENT].map(stage2_map)
 
-        # anchor: same-day included (>= 0)
+        # recompute anchor delta (do NOT rely on a precomputed column; keep consistent)
         chunk["DELTA_DAYS_FROM_STAGE2"] = (chunk["EVENT_DT"] - chunk["STAGE2_DT"]).dt.days
         chunk = chunk[chunk["DELTA_DAYS_FROM_STAGE2"].notnull() & (chunk["DELTA_DAYS_FROM_STAGE2"] >= 0)].copy()
         if chunk.empty:
             continue
         rows_after_anchor += len(chunk)
 
-        # normalize text once
         chunk["_TEXT_NORM"] = chunk[text_col].fillna("").apply(norm_text)
 
-        # iterate rows and emit per-comp hits
         for _, r in chunk.iterrows():
             pid = r.get(COL_PATIENT, "")
             txt = r.get("_TEXT_NORM", "")
@@ -296,6 +322,7 @@ def main():
                 continue
 
             found_any = False
+
             for comp_name, comp_re in COMP_PATTERNS:
                 if comp_re.search(txt):
                     found_any = True
@@ -316,11 +343,11 @@ def main():
                         "snippet": snippet(r.get(text_col, ""), 260),
                     })
 
-            # conservative "Other" systemic capture
             if OTHER_SYSTEMIC_RE.search(txt):
                 found_any = True
                 bucket = infer_treatment_bucket(txt)
                 mm = major_minor_from_treatment(bucket)
+
                 hits.append({
                     "patient_id": pid,
                     "EVENT_DT": r.get("EVENT_DT", None),
@@ -349,24 +376,18 @@ def main():
         ])
     hits_df.to_csv(OUT_ROW_HITS, index=False, encoding="utf-8")
 
-    # 5) Build patient-level Comp1..3 (chronological)
-    #    Note: dictionary wants up to 3 complications; if more, you escalate manually.
+    # 5) Patient-level Comp1..3 (chronological)
     patient_rows = []
     if not hits_df.empty:
         for pid, g in hits_df.groupby("patient_id"):
             g2 = g.sort_values(by=["EVENT_DT", "complication"], ascending=[True, True]).copy()
-            # collapse duplicates at same date+complication (keep first)
             g2["dedup_key"] = g2["EVENT_DT"].astype(str) + "||" + g2["complication"].astype(str)
             g2 = g2.drop_duplicates(subset=["dedup_key"], keep="first")
 
             comps = g2.head(3).to_dict("records")
 
-            row = {
-                "patient_id": pid,
-                "stage2_dt": stage2_map.get(pid, None),
-            }
+            row = {"patient_id": pid, "stage2_dt": stage2_map.get(pid, None)}
 
-            # Fill S2_Comp1..3 fields
             for i in range(3):
                 idx = i + 1
                 if i < len(comps):
@@ -389,7 +410,6 @@ def main():
 
             patient_rows.append(row)
 
-    # Include AB patients even if no complications detected
     pl = pd.DataFrame({"patient_id": list(ab_ids)})
     pl["stage2_dt"] = pl["patient_id"].map(stage2_map)
 
@@ -397,8 +417,7 @@ def main():
         pl_hits = pd.DataFrame(patient_rows)
         pl = pl.merge(pl_hits, on=["patient_id", "stage2_dt"], how="left")
     else:
-        # create empty columns for consistency
-        for idx in [1,2,3]:
+        for idx in [1, 2, 3]:
             pl["S2_Comp{}_Date".format(idx)] = None
             pl["S2_Comp{}".format(idx)] = ""
             pl["S2_Comp{}_Treatment".format(idx)] = ""
@@ -415,7 +434,6 @@ def main():
     n_pat_anyhit = len(unique_pat_anyhit)
     n_rows_hits = 0 if hits_df.empty else len(hits_df)
 
-    # counts by complication and by treatment
     comp_counts = hits_df["complication"].value_counts() if not hits_df.empty else pd.Series([])
     treat_counts = hits_df["treatment_bucket"].value_counts() if not hits_df.empty else pd.Series([])
 
@@ -423,12 +441,10 @@ def main():
     lines.append("=== Stage2 AB Complication Abstraction (anchored rows -> S2_Comp1..3) ===")
     lines.append("Python: 3.6.8 compatible | Read encoding: latin1(errors=replace) | Write: utf-8")
     lines.append("")
-    lines.append("Inputs:")
-    lines.append("  - {}".format(STAGE2_AB_PATIENTS_CSV))
-    lines.append("    Stage2 date column used: {}".format(stage2_col))
-    lines.append("  - {}".format(ANCHOR_ROWS_CSV))
-    lines.append("    Event date column used: {}".format(event_col))
-    lines.append("    Text column used: {}".format(text_col))
+    lines.append("Detected columns:")
+    lines.append("  Stage2 date col (patients file): {}".format(stage2_col))
+    lines.append("  Event date col (anchor rows): {}".format(event_col))
+    lines.append("  Text col (anchor rows): {}".format(text_col))
     lines.append("")
     lines.append("AB Stage2 patients (with Stage2 date): {}".format(n_ab))
     lines.append("Anchor rows scanned (all): {}".format(total_rows))
