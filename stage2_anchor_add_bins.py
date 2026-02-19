@@ -1,24 +1,24 @@
 # stage2_anchor_add_bins.py
 # Python 3.6.8+ (pandas required)
 #
+# Fix:
+#   Your AB file doesn't have the exact Stage2 date column names we expected.
+#   This version auto-detects the Stage2 date column by scanning headers for
+#   stage2 + (date|dt) and excluding delta/derived columns. It also prints the
+#   candidate columns it found so you can sanity-check quickly.
+#
 # Purpose:
 #   Keep Stage2-anchored rows with NO upper time limit, include same-day (>= Stage2 date),
 #   and add timing bins so you can optionally filter later (e.g., exclude delta==0).
 #
 # Inputs:
 #   1) stage2_final_ab_patient_level.csv   (AB-confirmed Stage2 patients with a Stage2 date)
-#   2) stage2_complication_anchor_rows.csv (your Stage2-anchored rows output; already post Stage2)
+#   2) stage2_complication_anchor_rows.csv (Stage2-anchored rows output; already post Stage2)
 #
 # Outputs:
 #   1) stage2_anchor_rows_with_bins.csv
 #   2) stage2_anchor_rows_excluding_delta0.csv   (optional convenience file)
 #   3) stage2_anchor_bins_summary.txt
-#
-# Notes:
-#   - Python 3.6 safe
-#   - Reads CSVs with latin1(errors=replace) to avoid decode crashes
-#   - Does NOT enforce 1-year cutoff
-#   - Same-day included by construction (DELTA_DAYS_FROM_STAGE2 >= 0)
 
 from __future__ import print_function
 
@@ -51,16 +51,101 @@ def read_csv_safe(path, **kwargs):
             pass
 
 
-def find_first_existing_col(df, candidates):
-    cols = list(df.columns)
-    for c in candidates:
-        if c in cols:
-            return c
-    return None
-
-
 def to_dt(series):
     return pd.to_datetime(series, errors="coerce")
+
+
+def norm_colname(c):
+    return str(c).strip().lower().replace(" ", "_")
+
+
+def auto_detect_stage2_date_col(df):
+    """
+    Heuristic:
+      - must contain 'stage2' or 'stage_2' or 'stage ii' (rare) in normalized name
+      - and contain 'date' or 'dt' or 'datetime' or 'event'
+      - exclude delta / days / diff / bin / tier / rule / after_index / flag columns
+    Returns best column name or None.
+    Also returns list of candidates (in priority order).
+    """
+    cols = list(df.columns)
+    ncols = [(c, norm_colname(c)) for c in cols]
+
+    bad_tokens = ["delta", "days", "diff", "bin", "tier", "rule", "after", "flag", "rank", "timing"]
+    stage2_tokens = ["stage2", "stage_2", "stageii", "stage_ii", "stage-2", "stage2nd", "second_stage"]
+    date_tokens = ["date", "dt", "datetime", "time", "event"]
+
+    candidates = []
+    for orig, n in ncols:
+        if any(t in n for t in stage2_tokens):
+            if any(t in n for t in date_tokens):
+                if not any(bt in n for bt in bad_tokens):
+                    candidates.append(orig)
+
+    # Prefer more "date-like" columns first
+    def score(col):
+        n = norm_colname(col)
+        s = 0
+        # stronger signals
+        if "event" in n:
+            s += 5
+        if "best" in n:
+            s += 4
+        if "recon" in n:
+            s += 1
+        if "op" in n or "surgery" in n:
+            s += 1
+        # prefer explicit "date" over generic "dt"
+        if "date" in n:
+            s += 3
+        if "dt" in n:
+            s += 2
+        # avoid suspicious ones
+        if "string" in n:
+            s -= 2
+        return -s  # sort ascending
+
+    candidates_sorted = sorted(candidates, key=score)
+
+    # If nothing found, do a fallback: any column containing stage2 and NOT bad tokens
+    if not candidates_sorted:
+        fallback = []
+        for orig, n in ncols:
+            if "stage2" in n or "stage_2" in n:
+                if not any(bt in n for bt in bad_tokens):
+                    fallback.append(orig)
+        candidates_sorted = fallback
+
+    best = candidates_sorted[0] if candidates_sorted else None
+    return best, candidates_sorted
+
+
+def auto_detect_event_dt_col(df):
+    """
+    For anchor rows, pick EVENT_DT if present; otherwise first reasonable date column.
+    """
+    cols = list(df.columns)
+    norm = {c: norm_colname(c) for c in cols}
+
+    preferred = ["event_dt", "event_date"]
+    for p in preferred:
+        for c, n in norm.items():
+            if n == p:
+                return c
+
+    # common UM columns
+    for p in ["note_date_of_service", "operation_date", "admit_date", "hosp_admsn_time"]:
+        for c, n in norm.items():
+            if n == p:
+                return c
+
+    # fallback: any column containing 'date' or 'dt' but not delta/days
+    bad = ["delta", "days", "diff", "bin"]
+    dateish = []
+    for c, n in norm.items():
+        if ("date" in n or "dt" in n or "time" in n) and (not any(b in n for b in bad)):
+            dateish.append(c)
+    return dateish[0] if dateish else None
 
 
 def time_bin_days(x):
@@ -90,25 +175,24 @@ def main():
     # Load AB-confirmed Stage2 patients (source of Stage2 date)
     # -------------------------
     ab = read_csv_safe(AB_STAGE2_PATIENTS_CSV)
-    if "patient_id" not in ab.columns:
-        raise RuntimeError("Missing column 'patient_id' in {}".format(AB_STAGE2_PATIENTS_CSV))
 
-    # robust Stage2 date column detection
-    stage2_candidates = [
-        "stage2_event_dt_best",
-        "stage2_dt_best",
-        "stage2_date_ab",
-        "stage2_date",
-        "stage2_dt",
-        "stage2_date_best",
-        "stage2_dt_best_ab",
-    ]
-    stage2_col = find_first_existing_col(ab, stage2_candidates)
+    # patient id column (support either)
+    if "patient_id" not in ab.columns:
+        # allow ENCRYPTED_PAT_ID here too
+        if "ENCRYPTED_PAT_ID" in ab.columns:
+            ab = ab.rename(columns={"ENCRYPTED_PAT_ID": "patient_id"})
+        else:
+            raise RuntimeError(
+                "Missing 'patient_id' (or 'ENCRYPTED_PAT_ID') in {}".format(AB_STAGE2_PATIENTS_CSV)
+            )
+
+    stage2_col, stage2_candidates = auto_detect_stage2_date_col(ab)
     if stage2_col is None:
         raise RuntimeError(
-            "No Stage2 date column found in {}. Expected one of: {}".format(
-                AB_STAGE2_PATIENTS_CSV, stage2_candidates
-            )
+            "No Stage2 date column found in {}.\n"
+            "I scanned headers for stage2+(date|dt|event) and excluded delta/tier/rule fields.\n"
+            "Try opening the file and confirm the Stage2 date column name.\n"
+            "Columns present: {}".format(AB_STAGE2_PATIENTS_CSV, list(ab.columns))
         )
 
     ab["patient_id"] = ab["patient_id"].fillna("").astype(str)
@@ -118,7 +202,10 @@ def main():
     ab = ab[ab["STAGE2_DT"].notnull()].copy()
 
     if ab.empty:
-        raise RuntimeError("No AB patients with non-null Stage2 date found in {}".format(AB_STAGE2_PATIENTS_CSV))
+        raise RuntimeError(
+            "Found Stage2 column '{}' but it parsed to all-null dates. "
+            "Check formatting in {}.".format(stage2_col, AB_STAGE2_PATIENTS_CSV)
+        )
 
     stage2_map = dict(zip(ab["patient_id"].tolist(), ab["STAGE2_DT"].tolist()))
     ab_patients = set(stage2_map.keys())
@@ -128,45 +215,46 @@ def main():
     # -------------------------
     ar = read_csv_safe(ANCHOR_ROWS_CSV)
 
-    # Required: patient id + event date + delta days (if present)
-    if "ENCRYPTED_PAT_ID" in ar.columns and "patient_id" not in ar.columns:
-        ar = ar.rename(columns={"ENCRYPTED_PAT_ID": "patient_id"})
-
     if "patient_id" not in ar.columns:
-        raise RuntimeError("Anchor rows file must include 'patient_id' or 'ENCRYPTED_PAT_ID': {}".format(ANCHOR_ROWS_CSV))
+        if "ENCRYPTED_PAT_ID" in ar.columns:
+            ar = ar.rename(columns={"ENCRYPTED_PAT_ID": "patient_id"})
+        else:
+            raise RuntimeError(
+                "Anchor rows file must include 'patient_id' or 'ENCRYPTED_PAT_ID': {}".format(ANCHOR_ROWS_CSV)
+            )
 
-    # Event date column (depends on your anchor script)
-    event_candidates = ["EVENT_DT", "event_dt", "EVENT_DATE", "NOTE_DATE_OF_SERVICE", "OPERATION_DATE"]
-    event_col = find_first_existing_col(ar, event_candidates)
+    event_col = auto_detect_event_dt_col(ar)
     if event_col is None:
         raise RuntimeError(
-            "No EVENT date column found in {}. Expected one of: {}".format(ANCHOR_ROWS_CSV, event_candidates)
+            "No usable event date column found in {}. Columns present: {}".format(ANCHOR_ROWS_CSV, list(ar.columns))
         )
 
-    # Delta days column (optional; we can recompute if missing)
-    delta_candidates = ["DELTA_DAYS_FROM_STAGE2", "delta_days_from_stage2", "delta_days"]
-    delta_col = find_first_existing_col(ar, delta_candidates)
+    # delta days column (optional)
+    delta_col = None
+    for c in ar.columns:
+        n = norm_colname(c)
+        if n in ["delta_days_from_stage2", "delta_days_stage2", "delta_days"]:
+            delta_col = c
+            break
 
     ar["patient_id"] = ar["patient_id"].fillna("").astype(str)
     pre_rows = len(ar)
 
-    # Keep only AB patients (since this is AB-only Stage2 anchoring)
+    # Keep only AB patients
     ar = ar[ar["patient_id"].isin(ab_patients)].copy()
     kept_prefilter = len(ar)
 
-    # Attach Stage2 date
+    # Attach Stage2 date + parse event date
     ar["STAGE2_DT"] = ar["patient_id"].map(stage2_map)
     ar["EVENT_DT"] = to_dt(ar[event_col])
 
-    # Compute delta if needed
+    # Compute delta if missing
     if delta_col is None:
         ar["DELTA_DAYS_FROM_STAGE2"] = (ar["EVENT_DT"] - ar["STAGE2_DT"]).dt.days
-        delta_col = "DELTA_DAYS_FROM_STAGE2"
     else:
-        # normalize into canonical name
         ar["DELTA_DAYS_FROM_STAGE2"] = pd.to_numeric(ar[delta_col], errors="coerce")
 
-    # Ensure same-day included: keep delta >= 0
+    # Keep same-day and after (>= 0). NO upper limit.
     ar = ar[ar["DELTA_DAYS_FROM_STAGE2"].notnull()].copy()
     ar = ar[ar["DELTA_DAYS_FROM_STAGE2"] >= 0].copy()
     kept_stage2 = len(ar)
@@ -174,7 +262,7 @@ def main():
     # Add bins
     ar["TIME_BIN_STAGE2"] = ar["DELTA_DAYS_FROM_STAGE2"].apply(time_bin_days)
 
-    # Optional convenience exclusion: remove delta==0
+    # Convenience exclusion: remove delta==0
     ar_no0 = ar[ar["DELTA_DAYS_FROM_STAGE2"] != 0].copy()
 
     # Write outputs
@@ -191,9 +279,11 @@ def main():
     lines.append("Python: 3.6.8 compatible | Read encoding: latin1(errors=replace) | Write: utf-8")
     lines.append("")
     lines.append("AB Stage2 file: {}".format(AB_STAGE2_PATIENTS_CSV))
-    lines.append("  Stage2 date column used: {}".format(stage2_col))
+    lines.append("  Stage2 date column auto-detected: {}".format(stage2_col))
+    if stage2_candidates:
+        lines.append("  Other Stage2-like candidates found: {}".format(", ".join([str(x) for x in stage2_candidates[:10]])))
     lines.append("Anchor rows file: {}".format(ANCHOR_ROWS_CSV))
-    lines.append("  Event date column used: {}".format(event_col))
+    lines.append("  Event date column auto-detected: {}".format(event_col))
     lines.append("")
     lines.append("AB Stage2 patients (with Stage2 date): {}".format(total_patients))
     lines.append("Anchor rows scanned (all patients): {}".format(pre_rows))
@@ -203,12 +293,10 @@ def main():
     lines.append("")
     lines.append("Timing bins across kept rows (TIME_BIN_STAGE2):")
     if not bin_counts.empty:
-        # stable order
         order = ["0d", "1-30d", "31-90d", "91-180d", "181-365d", ">365d"]
         for k in order:
             if k in bin_counts.index:
                 lines.append("  {:>8}: {}".format(k, int(bin_counts[k])))
-        # any other bins
         for k, v in bin_counts.items():
             if k not in order:
                 lines.append("  {:>8}: {}".format(str(k), int(v)))
