@@ -1,13 +1,30 @@
 # stage1_abstract_complications.py
-# Python 3.6.8+
+# Python 3.6.8+ (pandas required)
 #
-# Input:
-#   stage1_anchor_rows_with_bins.csv   (Stage1 anchored rows, 0-365d, already binned)
+# Purpose:
+#   Stage 1 complication abstraction (0–365d after Stage1 date):
+#     1) Row-level complication hits (category + inferred treatment + minor/major + snippet)
+#     2) Patient-level S1_Comp1..S1_Comp3 fields
 #
-# Output:
-#   stage1_complications_row_hits.csv
-#   stage1_complications_patient_level.csv
-#   stage1_complications_summary.txt
+# Inputs:
+#   - patient_recon_staging_refined.csv        (must contain patient_id + stage1_date)
+#   - stage1_anchor_rows_with_bins.csv         (anchored rows with EVENT_DT + note text)
+#
+# Outputs:
+#   - stage1_complications_row_hits.csv
+#   - stage1_complications_patient_level.csv
+#   - stage1_complications_summary.txt
+#
+# Notes:
+#   - Read encoding: latin1(errors=replace) for WVD robustness
+#   - Write encoding: utf-8
+#   - Filters to 0 <= delta <= 365 (Stage1 window)
+#   - Adds extra suppressors to reduce false positives:
+#       * negation (no infection / denies / negative for)
+#       * history/prior (hx of infection etc.)
+#       * rule-out / possible / concern for
+#       * "risk of complication" counseling language
+#       * prophylaxis antibiotic mentions
 
 from __future__ import print_function
 
@@ -15,12 +32,14 @@ import re
 import sys
 import pandas as pd
 
-INFILE = "stage1_anchor_rows_with_bins.csv"
+STAGING_CSV = "patient_recon_staging_refined.csv"
+ANCHOR_ROWS_CSV = "stage1_anchor_rows_with_bins.csv"
 
 OUT_ROW_HITS = "stage1_complications_row_hits.csv"
 OUT_PATIENT_LEVEL = "stage1_complications_patient_level.csv"
 OUT_SUMMARY = "stage1_complications_summary.txt"
 
+CHUNKSIZE = 120000
 COL_PATIENT = "patient_id"
 
 
@@ -28,6 +47,19 @@ def read_csv_safe(path, **kwargs):
     f = open(path, "r", encoding="latin1", errors="replace")
     try:
         return pd.read_csv(f, engine="python", **kwargs)
+    finally:
+        if "chunksize" not in kwargs:
+            try:
+                f.close()
+            except Exception:
+                pass
+
+
+def iter_csv_safe(path, **kwargs):
+    f = open(path, "r", encoding="latin1", errors="replace")
+    try:
+        for chunk in pd.read_csv(f, engine="python", **kwargs):
+            yield chunk
     finally:
         try:
             f.close()
@@ -52,7 +84,7 @@ def norm_text(x):
     return s
 
 
-def snippet(s, n=260):
+def snippet(s, n=240):
     t = norm_text(s)
     return (t[:n] + "...") if len(t) > n else t
 
@@ -62,26 +94,26 @@ def norm_colname(c):
 
 
 def pick_first_present(cols, candidates):
-    cset = set([str(c).lower() for c in cols])
+    cset = set([norm_colname(c) for c in cols])
     for cand in candidates:
-        if cand.lower() in cset:
+        if norm_colname(cand) in cset:
             for c in cols:
-                if str(c).lower() == cand.lower():
+                if norm_colname(c) == norm_colname(cand):
                     return c
     return None
 
 
 def fuzzy_find_col(cols, tokens_any):
-    up = [(c, str(c).upper()) for c in cols]
-    for c, uc in up:
-        for tok in tokens_any:
-            if tok in uc:
+    ucols = [(c, str(c).upper()) for c in cols]
+    for c, uc in ucols:
+        for t in tokens_any:
+            if t in uc:
                 return c
     return None
 
 
 # -------------------------
-# Complication patterns
+# Complication category patterns (same as Stage2, plus "Other systemic")
 # -------------------------
 COMP_PATTERNS = [
     ("Hematoma", re.compile(r"\bhematoma\b", re.I)),
@@ -97,41 +129,50 @@ COMP_PATTERNS = [
     ("Total flap loss", re.compile(r"\b(total\s+flap\s+loss|flap\s+loss)\b", re.I)),
 ]
 
-# IMPORTANT FIX: remove ambiguous "PE". Keep only explicit "pulmonary embolism".
+# Systemic: do NOT include PE alone (too many false positives from "PE")
 OTHER_SYSTEMIC_RE = re.compile(
     r"\b(pulmonary\s+embolism|deep\s+vein\s+thrombosis|dvt\b|pneumonia|sepsis)\b",
     re.I
 )
 
 # -------------------------
-# Stage1 false-positive suppressors
+# Suppressors (reduce false positives)
 # -------------------------
-
-# Suppress instructions / counseling / risk talk (these were showing up in your snippets)
-RX_RISK_CONTEXT = re.compile(
-    r"\b("
-    r"signs?\s+of\s+infection|"
-    r"watch\s+for|return\s+precautions|"
-    r"call\s+(?:us|clinic|office|provider)|"
-    r"risks?\s+include|risk\s+of|possible\s+complications?|may\s+include|"
-    r"discussed\s+risks?|counseled\s+on|informed\s+consent|"
-    r"post-?op\s+instructions?|"
-    r"seek\s+care\s+if|"
-    r"redness,\s*warmth,\s*fever|"
-    r"chills|foul\s+odor"
-    r")\b",
+RX_NEGATION = re.compile(
+    r"\b(no|not|without|denies|negative\s+for|no\s+evidence\s+of|free\s+of)\b.{0,40}\b"
+    r"(infection|cellulitis|abscess|purulence|seroma|hematoma|dehiscence|necrosis|pneumonia|sepsis|dvt|deep\s+vein\s+thrombosis|pulmonary\s+embolism)\b",
     re.I
 )
 
-# Negated infection (no evidence of infection, denies infection, etc.)
-RX_INF_NEG = re.compile(
-    r"\b(no|not|without|denies|negative\s+for|no\s+evidence\s+of|free\s+of)\b.{0,35}\b"
-    r"(infection|cellulitis|abscess|purulence|purulent|ssi|surgical\s+site\s+infection)\b",
+RX_HISTORY_CONTEXT = re.compile(
+    r"\b(history\s+of|hx\s+of|prior|past\s+history\s+of|previous|remote\s+history)\b.{0,60}\b"
+    r"(infection|cellulitis|abscess|purulence|seroma|hematoma|dehiscence|necrosis|pneumonia|sepsis|dvt|deep\s+vein\s+thrombosis|pulmonary\s+embolism)\b",
     re.I
 )
 
+RX_RULEOUT = re.compile(
+    r"\b(rule\s+out|r\/o|evaluate\s+for|work\s*up\s+for|concern\s+for|possible|?question\s+of)\b",
+    re.I
+)
+
+RX_RISK_COUNSELING = re.compile(
+    r"\b(risks?\s+(include|of)|discussed\s+risks?|counsel(ed|ing)\s+on\s+risks?|"
+    r"risk\s+of\s+(infection|seroma|hematoma|necrosis|dehiscence))\b",
+    re.I
+)
+
+# Prophylaxis antibiotics / “given periop antibiotics” often triggers infection keywords
+RX_PROPHYLACTIC_ABX = re.compile(
+    r"\b(prophylaxis|prophylactic|peri-?op|pre-?op|post-?op)\b.{0,40}\b(antibiotic|abx|ancef|cefazolin)\b",
+    re.I
+)
+
+# If text is only describing drains/instructions etc. it can still be true comp,
+# so we do NOT suppress routine postop instructions broadly (too risky).
+
+
 # -------------------------
-# Treatment inference (same buckets as Stage2)
+# Treatment inference (same buckets)
 # -------------------------
 RX_REOP = re.compile(
     r"\b(return(ed)?\s+to\s+or|take\s*back|takeback|re-?operation|reop|washout|operative\s+debridement|"
@@ -160,7 +201,7 @@ RX_NOTX = re.compile(
 
 
 def infer_treatment_bucket(text):
-    t = text
+    t = norm_text(text)
     if RX_REOP.search(t):
         return "REOPERATION"
     if RX_REHOSP.search(t):
@@ -180,152 +221,219 @@ def major_minor_from_treatment(bucket):
     return "UNKNOWN"
 
 
+def should_suppress(txt_norm):
+    # order matters: cheap checks first
+    if not txt_norm:
+        return True
+    if RX_RISK_COUNSELING.search(txt_norm):
+        return True
+    if RX_RULEOUT.search(txt_norm):
+        return True
+    if RX_NEGATION.search(txt_norm):
+        return True
+    if RX_HISTORY_CONTEXT.search(txt_norm):
+        return True
+    if RX_PROPHYLACTIC_ABX.search(txt_norm):
+        return True
+    return False
+
+
 def main():
-    df = read_csv_safe(INFILE)
-    if df is None or df.empty:
-        raise RuntimeError("Could not read input: {}".format(INFILE))
+    # -------------------------
+    # Load staging file for Stage1 date
+    # -------------------------
+    st = read_csv_safe(STAGING_CSV)
+    if st is None or st.empty:
+        raise RuntimeError("Could not read staging file: {}".format(STAGING_CSV))
 
-    if COL_PATIENT not in df.columns:
+    if COL_PATIENT not in st.columns:
+        raise RuntimeError("Staging file missing '{}': {}".format(COL_PATIENT, STAGING_CSV))
+
+    stage1_col = pick_first_present(st.columns.tolist(), ["stage1_date", "stage1_dt", "stage1"])
+    if stage1_col is None:
+        # try fuzzy
+        stage1_col = fuzzy_find_col(st.columns.tolist(), ["STAGE1", "STAGE_1"])
+    if stage1_col is None:
+        raise RuntimeError("Could not detect Stage1 date column in staging file: {}".format(STAGING_CSV))
+
+    st[COL_PATIENT] = st[COL_PATIENT].fillna("").astype(str)
+    st["STAGE1_DT"] = to_dt(st[stage1_col])
+    st = st[(st[COL_PATIENT] != "") & (st["STAGE1_DT"].notnull())].copy()
+
+    if st.empty:
+        raise RuntimeError("No patients with non-null Stage1 date after parsing.")
+
+    stage1_map = dict(zip(st[COL_PATIENT].tolist(), st["STAGE1_DT"].tolist()))
+    stage1_patients = set(stage1_map.keys())
+
+    # -------------------------
+    # Detect columns in anchor rows file
+    # -------------------------
+    head = read_csv_safe(ANCHOR_ROWS_CSV, nrows=25)
+    if head is None or head.empty:
+        raise RuntimeError("Could not read anchor rows file: {}".format(ANCHOR_ROWS_CSV))
+
+    if COL_PATIENT not in head.columns:
         # allow ENCRYPTED_PAT_ID fallback
-        if "ENCRYPTED_PAT_ID" in df.columns:
-            df = df.rename(columns={"ENCRYPTED_PAT_ID": COL_PATIENT})
+        if "ENCRYPTED_PAT_ID" in head.columns:
+            # we'll rename in chunks
+            pass
         else:
-            raise RuntimeError("Missing patient_id in {}".format(INFILE))
+            raise RuntimeError("Anchor rows file missing patient_id: {}".format(ANCHOR_ROWS_CSV))
 
-    # detect columns
-    event_col = pick_first_present(df.columns.tolist(), ["EVENT_DT", "event_dt", "note_date", "NOTE_DATE_OF_SERVICE"])
+    event_col = pick_first_present(head.columns.tolist(), ["EVENT_DT", "EVENT_DT_STD", "event_dt", "note_date", "NOTE_DATE_OF_SERVICE"])
     if event_col is None:
-        event_col = fuzzy_find_col(df.columns.tolist(), ["EVENT_DT", "DATE_OF_SERVICE", "NOTE_DATE", "DATE"])
-
-    text_col = pick_first_present(df.columns.tolist(), ["note_text", "NOTE_TEXT", "NOTE_SNIPPET", "snippet", "TEXT"])
-    if text_col is None:
-        text_col = fuzzy_find_col(df.columns.tolist(), ["NOTE_TEXT", "TEXT", "SNIPPET"])
-
-    stage1_col = pick_first_present(df.columns.tolist(), ["stage1_dt", "STAGE1_DT", "stage1_date", "STAGE1_DATE"])
-    if stage1_col is None:
-        stage1_col = fuzzy_find_col(df.columns.tolist(), ["STAGE1", "STAGE_1", "STAGE1_DT", "STAGE1_DATE"])
-
-    note_type_col = pick_first_present(df.columns.tolist(), ["NOTE_TYPE", "note_type"])
-    note_id_col = pick_first_present(df.columns.tolist(), ["NOTE_ID", "note_id"])
-    delta_col = pick_first_present(df.columns.tolist(), ["DELTA_DAYS_FROM_STAGE1", "delta_days_from_stage1"])
-
+        event_col = fuzzy_find_col(head.columns.tolist(), ["EVENT_DT", "DATE_OF_SERVICE", "NOTE_DATE", "DATE"])
     if event_col is None:
-        raise RuntimeError("Could not find event date column (EVENT_DT-like) in {}".format(INFILE))
+        raise RuntimeError("Could not detect event date column in anchor rows file: {}".format(ANCHOR_ROWS_CSV))
+
+    text_col = pick_first_present(head.columns.tolist(), ["note_text", "NOTE_TEXT", "NOTE_TEXT_CLEAN", "SNIPPET", "NOTE_SNIPPET", "TEXT"])
     if text_col is None:
-        raise RuntimeError("Could not find note text column (NOTE_TEXT/NOTE_SNIPPET/etc) in {}".format(INFILE))
-    if stage1_col is None:
-        raise RuntimeError("Could not find stage1 date column (stage1_dt-like) in {}".format(INFILE))
+        text_col = fuzzy_find_col(head.columns.tolist(), ["NOTE_TEXT", "TEXT", "SNIPPET"])
+    if text_col is None:
+        raise RuntimeError("Could not detect note text column in anchor rows file: {}".format(ANCHOR_ROWS_CSV))
 
-    # normalize types
-    df[COL_PATIENT] = df[COL_PATIENT].fillna("").astype(str)
-    df["EVENT_DT_STD"] = to_dt(df[event_col])
-    df["STAGE1_DT_STD"] = to_dt(df[stage1_col])
+    note_type_col = pick_first_present(head.columns.tolist(), ["note_type", "NOTE_TYPE"])
+    if note_type_col is None:
+        note_type_col = fuzzy_find_col(head.columns.tolist(), ["NOTE_TYPE", "TYPE"])
 
-    if delta_col is None:
-        df["DELTA_DAYS_FROM_STAGE1"] = (df["EVENT_DT_STD"] - df["STAGE1_DT_STD"]).dt.days
-    else:
-        df["DELTA_DAYS_FROM_STAGE1"] = pd.to_numeric(df[delta_col], errors="coerce")
+    note_id_col = pick_first_present(head.columns.tolist(), ["note_id", "NOTE_ID"])
+    if note_id_col is None:
+        note_id_col = fuzzy_find_col(head.columns.tolist(), ["NOTE_ID", "ID"])
 
-    # enforce anchor window: 0-365
-    df = df[df["DELTA_DAYS_FROM_STAGE1"].notnull()].copy()
-    df = df[(df["DELTA_DAYS_FROM_STAGE1"] >= 0) & (df["DELTA_DAYS_FROM_STAGE1"] <= 365)].copy()
-
-    # scan rows
-    hits = []
+    # -------------------------
+    # Scan anchor rows and create row-level hits
+    # -------------------------
+    total_rows = 0
+    rows_after_patient_filter = 0
+    rows_after_window = 0
     unique_pat_anyhit = set()
+    hits = []
 
-    for _, r in df.iterrows():
-        pid = r.get(COL_PATIENT, "")
-        if not pid:
+    usecols = [event_col, text_col]
+    # include patient id
+    if COL_PATIENT in head.columns:
+        usecols = [COL_PATIENT] + usecols
+        pid_is_encrypted = False
+    else:
+        usecols = ["ENCRYPTED_PAT_ID"] + usecols
+        pid_is_encrypted = True
+
+    for c in [note_type_col, note_id_col]:
+        if c is not None and c not in usecols:
+            usecols.append(c)
+
+    for chunk in iter_csv_safe(ANCHOR_ROWS_CSV, usecols=usecols, chunksize=CHUNKSIZE):
+        total_rows += len(chunk)
+
+        if pid_is_encrypted:
+            chunk = chunk.rename(columns={"ENCRYPTED_PAT_ID": COL_PATIENT})
+
+        chunk[COL_PATIENT] = chunk[COL_PATIENT].fillna("").astype(str)
+        chunk = chunk[chunk[COL_PATIENT].isin(stage1_patients)].copy()
+        if chunk.empty:
             continue
+        rows_after_patient_filter += len(chunk)
 
-        txt_raw = r.get(text_col, "")
-        txt = norm_text(txt_raw)
-        if not txt:
+        chunk["EVENT_DT"] = to_dt(chunk[event_col])
+        chunk["STAGE1_DT"] = chunk[COL_PATIENT].map(stage1_map)
+
+        # compute delta and enforce 0–365
+        chunk["DELTA_DAYS_FROM_STAGE1"] = (chunk["EVENT_DT"] - chunk["STAGE1_DT"]).dt.days
+        chunk = chunk[chunk["DELTA_DAYS_FROM_STAGE1"].notnull()].copy()
+        chunk = chunk[(chunk["DELTA_DAYS_FROM_STAGE1"] >= 0) & (chunk["DELTA_DAYS_FROM_STAGE1"] <= 365)].copy()
+        if chunk.empty:
             continue
+        rows_after_window += len(chunk)
 
-        # suppress risk/counseling/instruction text blocks
-        if RX_RISK_CONTEXT.search(txt):
-            continue
+        texts = chunk[text_col].fillna("").tolist()
+        pids = chunk[COL_PATIENT].tolist()
+        evs = chunk["EVENT_DT"].tolist()
+        deltas = chunk["DELTA_DAYS_FROM_STAGE1"].tolist()
 
-        found_any = False
+        # optional cols
+        ntypes = chunk[note_type_col].fillna("").tolist() if note_type_col else [""] * len(chunk)
+        nids = chunk[note_id_col].fillna("").tolist() if note_id_col else [""] * len(chunk)
 
-        for comp_name, comp_re in COMP_PATTERNS:
-            if not comp_re.search(txt):
+        for i in range(len(chunk)):
+            pid = pids[i]
+            txt_raw = texts[i]
+            txt = norm_text(txt_raw)
+
+            if should_suppress(txt):
                 continue
 
-            # infection negation suppressor
-            if comp_name == "Wound infection" and RX_INF_NEG.search(txt):
-                continue
+            found_any = False
 
-            found_any = True
-            bucket = infer_treatment_bucket(txt)
-            mm = major_minor_from_treatment(bucket)
+            for comp_name, comp_re in COMP_PATTERNS:
+                if comp_re.search(txt):
+                    found_any = True
+                    bucket = infer_treatment_bucket(txt)
+                    mm = major_minor_from_treatment(bucket)
+                    hits.append({
+                        "patient_id": pid,
+                        "EVENT_DT": evs[i],
+                        "STAGE1_DT": stage1_map.get(pid, None),
+                        "DELTA_DAYS_FROM_STAGE1": deltas[i],
+                        "NOTE_TYPE": ntypes[i],
+                        "NOTE_ID": nids[i],
+                        "complication": comp_name,
+                        "treatment_bucket": bucket,
+                        "comp_classification": mm,
+                        "snippet": snippet(txt_raw, 240),
+                    })
 
-            hits.append({
-                "patient_id": pid,
-                "EVENT_DT": r.get("EVENT_DT_STD", None),
-                "stage1_dt": r.get("STAGE1_DT_STD", None),
-                "DELTA_DAYS_FROM_STAGE1": r.get("DELTA_DAYS_FROM_STAGE1", None),
-                "NOTE_TYPE": r.get(note_type_col, "") if note_type_col else "",
-                "NOTE_ID": r.get(note_id_col, "") if note_id_col else "",
-                "complication": comp_name,
-                "treatment_bucket": bucket,
-                "comp_classification": mm,
-                "snippet": snippet(txt_raw, 260),
-            })
+            # systemic: apply negation/history/ruleout/risk suppressors already in should_suppress
+            if OTHER_SYSTEMIC_RE.search(txt):
+                found_any = True
+                bucket = infer_treatment_bucket(txt)
+                mm = major_minor_from_treatment(bucket)
+                hits.append({
+                    "patient_id": pid,
+                    "EVENT_DT": evs[i],
+                    "STAGE1_DT": stage1_map.get(pid, None),
+                    "DELTA_DAYS_FROM_STAGE1": deltas[i],
+                    "NOTE_TYPE": ntypes[i],
+                    "NOTE_ID": nids[i],
+                    "complication": "Other (systemic)",
+                    "treatment_bucket": bucket,
+                    "comp_classification": mm,
+                    "snippet": snippet(txt_raw, 240),
+                })
 
-        # systemic bucket (after suppressor + no "PE" keyword)
-        if OTHER_SYSTEMIC_RE.search(txt):
-            found_any = True
-            bucket = infer_treatment_bucket(txt)
-            mm = major_minor_from_treatment(bucket)
+            if found_any:
+                unique_pat_anyhit.add(pid)
 
-            hits.append({
-                "patient_id": pid,
-                "EVENT_DT": r.get("EVENT_DT_STD", None),
-                "stage1_dt": r.get("STAGE1_DT_STD", None),
-                "DELTA_DAYS_FROM_STAGE1": r.get("DELTA_DAYS_FROM_STAGE1", None),
-                "NOTE_TYPE": r.get(note_type_col, "") if note_type_col else "",
-                "NOTE_ID": r.get(note_id_col, "") if note_id_col else "",
-                "complication": "Other (systemic)",
-                "treatment_bucket": bucket,
-                "comp_classification": mm,
-                "snippet": snippet(txt_raw, 260),
-            })
-
-        if found_any:
-            unique_pat_anyhit.add(pid)
-
-    # write row hits
+    # -------------------------
+    # Row hits dataframe + write
+    # -------------------------
     if hits:
         hits_df = pd.DataFrame(hits)
         hits_df = hits_df.sort_values(by=["patient_id", "EVENT_DT", "complication"], ascending=[True, True, True])
     else:
         hits_df = pd.DataFrame(columns=[
-            "patient_id","EVENT_DT","stage1_dt","DELTA_DAYS_FROM_STAGE1",
-            "NOTE_TYPE","NOTE_ID","complication","treatment_bucket","comp_classification","snippet"
+            "patient_id", "EVENT_DT", "STAGE1_DT", "DELTA_DAYS_FROM_STAGE1",
+            "NOTE_TYPE", "NOTE_ID", "complication", "treatment_bucket", "comp_classification", "snippet"
         ])
 
     hits_df.to_csv(OUT_ROW_HITS, index=False, encoding="utf-8")
 
-    # patient-level Comp1..3
-    patient_level = df[[COL_PATIENT]].drop_duplicates().copy()
-    patient_level = patient_level.rename(columns={COL_PATIENT: "patient_id"})
-    # best stage1_dt per patient (should be constant)
-    stage1_map = df.groupby("patient_id")["STAGE1_DT_STD"].min().to_dict()
-    patient_level["stage1_dt"] = patient_level["patient_id"].map(stage1_map)
+    # -------------------------
+    # Patient-level Comp1..3 (chronological, dedup by date+comp)
+    # -------------------------
+    pl = pd.DataFrame({"patient_id": list(stage1_patients)})
+    pl["stage1_dt"] = pl["patient_id"].map(stage1_map)
 
+    patient_rows = []
     if not hits_df.empty:
-        rows = []
         for pid, g in hits_df.groupby("patient_id"):
             g2 = g.sort_values(by=["EVENT_DT", "complication"], ascending=[True, True]).copy()
             g2["dedup_key"] = g2["EVENT_DT"].astype(str) + "||" + g2["complication"].astype(str)
             g2 = g2.drop_duplicates(subset=["dedup_key"], keep="first")
 
             comps = g2.head(3).to_dict("records")
-            row = {"patient_id": pid, "stage1_dt": stage1_map.get(pid, None)}
 
+            row = {"patient_id": pid, "stage1_dt": stage1_map.get(pid, None)}
             for i in range(3):
                 idx = i + 1
                 if i < len(comps):
@@ -343,38 +451,45 @@ def main():
                     row["S1_Comp{}_Classification".format(idx)] = ""
                     row["S1_Comp{}_NoteType".format(idx)] = ""
                     row["S1_Comp{}_NoteID".format(idx)] = ""
-            rows.append(row)
+            patient_rows.append(row)
 
-        pl_hits = pd.DataFrame(rows)
-        patient_level = patient_level.merge(pl_hits, on=["patient_id", "stage1_dt"], how="left")
+    if patient_rows:
+        pl_hits = pd.DataFrame(patient_rows)
+        pl = pl.merge(pl_hits, on=["patient_id", "stage1_dt"], how="left")
     else:
         for idx in [1, 2, 3]:
-            patient_level["S1_Comp{}_Date".format(idx)] = None
-            patient_level["S1_Comp{}".format(idx)] = ""
-            patient_level["S1_Comp{}_Treatment".format(idx)] = ""
-            patient_level["S1_Comp{}_Classification".format(idx)] = ""
-            patient_level["S1_Comp{}_NoteType".format(idx)] = ""
-            patient_level["S1_Comp{}_NoteID".format(idx)] = ""
+            pl["S1_Comp{}_Date".format(idx)] = None
+            pl["S1_Comp{}".format(idx)] = ""
+            pl["S1_Comp{}_Treatment".format(idx)] = ""
+            pl["S1_Comp{}_Classification".format(idx)] = ""
+            pl["S1_Comp{}_NoteType".format(idx)] = ""
+            pl["S1_Comp{}_NoteID".format(idx)] = ""
 
-    patient_level = patient_level.sort_values(by=["patient_id"], ascending=[True])
-    patient_level.to_csv(OUT_PATIENT_LEVEL, index=False, encoding="utf-8")
+    pl = pl.sort_values(by=["patient_id"], ascending=[True])
+    pl.to_csv(OUT_PATIENT_LEVEL, index=False, encoding="utf-8")
 
-    # summary
-    n_anchor_rows = int(len(df))
-    n_anchor_pats = int(df["patient_id"].nunique())
-    n_hit_rows = int(len(hits_df)) if not hits_df.empty else 0
-    n_hit_pats = int(len(unique_pat_anyhit))
+    # -------------------------
+    # Summary
+    # -------------------------
+    n_stage1 = int(pl["patient_id"].nunique())
+    n_pat_anyhit = len(unique_pat_anyhit)
+    n_rows_hits = 0 if hits_df.empty else int(len(hits_df))
 
     comp_counts = hits_df["complication"].value_counts() if not hits_df.empty else pd.Series(dtype=int)
     treat_counts = hits_df["treatment_bucket"].value_counts() if not hits_df.empty else pd.Series(dtype=int)
 
+    # print detected columns nicely
     lines = []
-    lines.append("=== Stage1 Complication Abstraction (anchored rows -> S1_Comp1..3) ===")
-    lines.append("Input: {}".format(INFILE))
+    lines.append("=== Stage 1 Complication Abstraction (anchored rows -> S1_Comp1..3) ===")
+    lines.append("Python: 3.6.8 compatible | Read encoding: latin1(errors=replace) | Write: utf-8")
+    lines.append("")
+    lines.append("Inputs:")
+    lines.append("  Staging file: {}".format(STAGING_CSV))
+    lines.append("  Anchor rows file: {}".format(ANCHOR_ROWS_CSV))
     lines.append("")
     lines.append("Detected columns:")
     lines.append("  patient_id: {}".format(COL_PATIENT))
-    lines.append("  stage1 date col: {}".format(stage1_col))
+    lines.append("  Stage1 date col: {}".format(stage1_col))
     lines.append("  event date col: {}".format(event_col))
     lines.append("  text col: {}".format(text_col))
     if note_type_col:
@@ -382,19 +497,19 @@ def main():
     if note_id_col:
         lines.append("  NOTE_ID: {}".format(note_id_col))
     lines.append("")
-    lines.append("Anchored rows (0-365d) scanned: {}".format(n_anchor_rows))
-    lines.append("Unique patients in anchor rows: {}".format(n_anchor_pats))
-    lines.append("Row-level complication hits: {}".format(n_hit_rows))
-    lines.append("Patients with >=1 hit: {} ({:.1f}%)".format(
-        n_hit_pats, (100.0 * n_hit_pats / n_anchor_pats) if n_anchor_pats else 0.0
-    ))
+    lines.append("Anchored rows scanned (0–365d window enforced):")
+    lines.append("  Total rows read: {}".format(total_rows))
+    lines.append("  Rows after patient filter: {}".format(rows_after_patient_filter))
+    lines.append("  Rows kept in 0–365d window: {}".format(rows_after_window))
+    lines.append("")
+    lines.append("Row-level complication hits: {}".format(n_rows_hits))
+    lines.append("Patients with >=1 hit: {} ({:.1f}%)".format(n_pat_anyhit, (100.0 * n_pat_anyhit / n_stage1) if n_stage1 else 0.0))
+    lines.append("")
 
     if not hits_df.empty:
-        lines.append("")
         lines.append("Top complication categories (top 15):")
         for k, v in comp_counts.head(15).items():
             lines.append("  {:>6}  {}".format(int(v), k))
-
         lines.append("")
         lines.append("Treatment buckets:")
         for k, v in treat_counts.items():
