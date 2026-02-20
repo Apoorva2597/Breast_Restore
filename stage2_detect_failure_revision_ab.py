@@ -15,19 +15,26 @@
 #
 # Design (conservative):
 #   - Failure: explicit device removal/explant AND signals of NOT replaced / flat chest / delayed reconstruction.
-#              If "removed and replaced/exchanged/implanted" is present nearby, we suppress failure.
-#   - Revision: revision-type procedures (capsulectomy, fat grafting, scar revision, mastopexy, etc.)
-#              occurring after Stage2 date (already anchored rows are >=0 days).
+#              If "removed and replaced/exchanged/implanted" is present nearby, suppress failure.
+#   - Revision: revision-type procedures (capsulectomy, fat grafting, scar revision, mastopexy, symmetry, etc.)
+#              occurring after Stage2 date (anchor rows are already >= stage2_dt but we still enforce).
 #
 # Notes:
 #   - Uses NOTE_SNIPPET (or similar) if full note text isn't available.
-#   - Read encoding latin1(errors=replace) for WVD robustness.
+#   - Read encoding latin1(errors=replace) for Windows drive robustness.
+#   - Write utf-8.
+#
+# Fixes vs prior version:
+#   1) Correctly reads a header sample from ANCHOR_ROWS_CSV (no iterating over DataFrame -> str bug).
+#   2) Safe conditional renaming/merging when NOTE_TYPE / NOTE_ID cols are absent.
+#   3) More defensive handling of missing/odd text values.
 
 from __future__ import print_function
 
 import re
 import sys
 import pandas as pd
+
 
 # -------------------------
 # CONFIG (EDIT PATHS ONLY)
@@ -41,6 +48,7 @@ OUT_SUMMARY = "stage2_ab_failure_revision_summary.txt"
 
 CHUNKSIZE = 150000
 
+
 # -------------------------
 # CSV reading helpers (Py3.6 safe)
 # -------------------------
@@ -49,14 +57,14 @@ def read_csv_safe(path, **kwargs):
     try:
         return pd.read_csv(f, engine="python", **kwargs)
     finally:
-        if "chunksize" not in kwargs:
-            try:
-                f.close()
-            except Exception:
-                pass
+        try:
+            f.close()
+        except Exception:
+            pass
 
 
 def iter_csv_safe(path, **kwargs):
+    # expects chunksize in kwargs for chunk iteration
     f = open(path, "r", encoding="latin1", errors="replace")
     try:
         for chunk in pd.read_csv(f, engine="python", **kwargs):
@@ -71,7 +79,10 @@ def iter_csv_safe(path, **kwargs):
 def norm_text(x):
     if x is None:
         return ""
-    s = str(x)
+    try:
+        s = str(x)
+    except Exception:
+        return ""
     try:
         s = s.replace(u"\xa0", " ")
     except Exception:
@@ -89,18 +100,15 @@ def to_dt(series):
 # Auto-detect column names
 # -------------------------
 def pick_first_present(cols, candidates):
-    cset = set([c.lower() for c in cols])
+    # returns actual column name with original casing
+    lower_map = {c.lower(): c for c in cols}
     for cand in candidates:
-        if cand.lower() in cset:
-            # return actual column name with original casing
-            for c in cols:
-                if c.lower() == cand.lower():
-                    return c
+        if cand.lower() in lower_map:
+            return lower_map[cand.lower()]
     return None
 
 
 def detect_stage2_date_col(cols):
-    # your pipeline recently used stage2_date_final; keep broad fallback list
     cands = [
         "stage2_date_final",
         "stage2_dt",
@@ -110,6 +118,8 @@ def detect_stage2_date_col(cols):
         "stage2_date",
         "stage2_date_ab",
         "stage2_dt_best_ab",
+        "stage2_date_final_ab",
+        "stage2_date_final_best",
     ]
     return pick_first_present(cols, cands)
 
@@ -119,11 +129,12 @@ def detect_text_col(cols):
         "NOTE_SNIPPET",
         "NOTE_TEXT",
         "NOTE_TEXT_CLEAN",
-        "snippet",
         "SNIPPET",
+        "snippet",
         "note_text",
         "note_text_clean",
         "TEXT",
+        "text",
     ]
     return pick_first_present(cols, cands)
 
@@ -138,7 +149,7 @@ RX_DEVICE = re.compile(r"\b(implant|implnt|prosthesis|tissue\s*expander|expander
 # Removal keywords
 RX_REMOVE = re.compile(r"\b(remove|removed|removal|explant|explanted|take\s+out|taken\s+out)\b", re.I)
 
-# Replacement / exchange keywords (suppresses failure if present close-by)
+# Replacement / exchange keywords (suppresses failure if present nearby)
 RX_REPLACE = re.compile(r"\b(replace|replaced|replacement|exchange|exchanged|insert|inserted|implantation|placed|place)\b", re.I)
 
 # Explicit “not replaced” / flat chest / delayed recon language (strong failure evidence)
@@ -150,7 +161,7 @@ RX_NOT_REPLACED = re.compile(
     re.I
 )
 
-# “Removed due to infection/extrusion” can be failure OR major comp; we treat as failure only if not replaced
+# Removal due to infection/extrusion/etc can be failure OR major comp; treat as failure only if not replaced
 RX_STRONG_REMOVE_CONTEXT = re.compile(r"\b(extrusion|exposed\s+implant|infect(?:ion|ed)|necrosis)\b", re.I)
 
 # Revision procedure keywords (includes items from protocol examples)
@@ -170,20 +181,19 @@ RX_REVISION = re.compile(
     re.I
 )
 
-# Revision suppressor: nipple reconstruction ALONE should not count as revision per protocol,
-# but your protocol says nipple reconstruction by itself is NOT revision.
-# If note mentions ONLY nipple reconstruction and nothing else revision-like, suppress.
-RX_NIPPLE_ONLY = re.compile(r"\b(nipple\s+reconstruction|nipple\s+revision)\b", re.I)
+# Nipple-only suppression per protocol
+RX_NIPPLE = re.compile(r"\b(nipple\s+reconstruction|nipple\s+revision)\b", re.I)
 
-# Helper: detect “nipple only” scenario
+
 def is_nipple_only_revision(text):
+    """
+    True if text mentions nipple reconstruction/revision but no other revision keyword.
+    """
     t = text
-    if not RX_NIPPLE_ONLY.search(t):
+    if not RX_NIPPLE.search(t):
         return False
-    # If other revision keywords exist beyond nipple terms, it's not nipple-only.
-    # Remove nipple phrases and re-check revision keywords.
     t2 = re.sub(r"(nipple\s+reconstruction|nipple\s+revision)", " ", t, flags=re.I)
-    return bool(RX_REVISION.search(t2)) is False
+    return (RX_REVISION.search(t2) is None)
 
 
 # -------------------------
@@ -216,18 +226,17 @@ def classify_failure_revision(text):
     has_remove = bool(RX_REMOVE.search(t))
 
     if has_device and has_remove:
-        # If “not replaced / flat / delayed recon later” => failure strong
+        # Strong failure evidence if not replaced / flat / delayed recon
         if RX_NOT_REPLACED.search(t):
             failure = True
             fail_rule = "REMOVE_WITH_NOT_REPLACED_OR_FLAT"
         else:
-            # If removal context (infection/extrusion/etc) and NO replacement/exchange language => possible failure
-            # But still conservative: require no replace/exchange terms.
+            # If strong removal context and NO replace/exchange language, consider failure
             if RX_STRONG_REMOVE_CONTEXT.search(t) and (not RX_REPLACE.search(t)):
                 failure = True
                 fail_rule = "REMOVE_WITH_STRONG_CONTEXT_NO_REPLACE"
             else:
-                # If replacement/exchange/inserted present, treat as NOT failure
+                # replacement/exchange present => not failure
                 failure = False
                 fail_rule = None
 
@@ -260,24 +269,23 @@ def main():
     # Keep only those with non-null Stage2 date
     ab = ab[ab[s2_col].notnull()].copy()
     ab_ids = set(ab["patient_id"].tolist())
-
     if not ab_ids:
         raise RuntimeError("No AB patients with non-null Stage2 date found in {}".format(AB_STAGE2_PATIENTS_CSV))
 
     stage2_map = dict(zip(ab["patient_id"], ab[s2_col]))
 
-    # Detect columns in anchor rows
-    head = None
-    for chunk in iter_csv_safe(ANCHOR_ROWS_CSV, nrows=5):
-        head = chunk
-        break
-    if head is None:
+    # Detect columns in anchor rows (read a tiny header sample correctly)
+    head = read_csv_safe(ANCHOR_ROWS_CSV, nrows=5)
+    if head is None or head.empty:
         raise RuntimeError("Could not read: {}".format(ANCHOR_ROWS_CSV))
 
     if "patient_id" not in head.columns:
         raise RuntimeError("Anchor rows file missing required column: patient_id")
 
-    event_col = pick_first_present(head.columns.tolist(), ["EVENT_DT", "event_dt", "NOTE_DATE_OF_SERVICE", "OPERATION_DATE"])
+    event_col = pick_first_present(
+        head.columns.tolist(),
+        ["EVENT_DT", "event_dt", "NOTE_DATE_OF_SERVICE", "OPERATION_DATE", "DOS", "DATE_OF_SERVICE"]
+    )
     if not event_col:
         raise RuntimeError("Could not detect EVENT_DT-like column in anchor rows file: {}".format(ANCHOR_ROWS_CSV))
 
@@ -289,23 +297,21 @@ def main():
 
     note_type_col = pick_first_present(head.columns.tolist(), ["NOTE_TYPE", "note_type"])
     note_id_col = pick_first_present(head.columns.tolist(), ["NOTE_ID", "note_id"])
-
     file_tag_col = pick_first_present(head.columns.tolist(), ["file_tag", "FILE_TAG"])
     delta_col = pick_first_present(head.columns.tolist(), ["DELTA_DAYS_FROM_STAGE2", "delta_days_from_stage2"])
 
-    # Scan anchor rows (already stage2-anchored in your pipeline, but we still filter to AB ids)
+    # Scan anchor rows (already stage2-anchored in your pipeline, but enforce and filter to AB ids)
     total_rows = 0
     kept_rows = 0
-    hit_rows = []
+    hit_frames = []
 
-    counts = {
-        "failure_rows": 0,
-        "revision_rows": 0,
-        "both_rows": 0
-    }
+    counts = {"failure_rows": 0, "revision_rows": 0, "both_rows": 0}
 
     for chunk in iter_csv_safe(ANCHOR_ROWS_CSV, chunksize=CHUNKSIZE):
         total_rows += len(chunk)
+
+        if "patient_id" not in chunk.columns:
+            continue
 
         chunk["patient_id"] = chunk["patient_id"].fillna("").astype(str)
         chunk = chunk[chunk["patient_id"].isin(ab_ids)].copy()
@@ -314,25 +320,25 @@ def main():
 
         kept_rows += len(chunk)
 
-        # Ensure event_dt parsed for safety
+        # Parse event dt
         chunk[event_col] = to_dt(chunk[event_col])
+
         # Attach Stage2 dt
         chunk["stage2_dt"] = chunk["patient_id"].map(stage2_map)
 
-        # Keep only rows with EVENT_DT >= stage2_dt (should already be true, but enforce)
+        # Enforce >= stage2_dt
         chunk = chunk[(chunk[event_col].notnull()) & (chunk["stage2_dt"].notnull())].copy()
         chunk = chunk[chunk[event_col] >= chunk["stage2_dt"]].copy()
         if chunk.empty:
             continue
 
-        # classify
+        # classify per row
         failures = []
         fail_rules = []
         revisions = []
         rev_rules = []
 
-        texts = chunk[text_col].fillna("").tolist()
-        for txt in texts:
+        for txt in chunk[text_col].fillna("").tolist():
             f, fr, r, rr = classify_failure_revision(txt)
             failures.append(bool(f))
             fail_rules.append(fr)
@@ -344,7 +350,6 @@ def main():
         chunk["S2_Revision_Flag"] = revisions
         chunk["S2_Revision_Rule"] = rev_rules
 
-        # keep hit rows only
         hits = chunk[(chunk["S2_Failure_Flag"]) | (chunk["S2_Revision_Flag"])].copy()
         if hits.empty:
             continue
@@ -353,18 +358,18 @@ def main():
         counts["revision_rows"] += int(hits["S2_Revision_Flag"].sum())
         counts["both_rows"] += int(((hits["S2_Failure_Flag"]) & (hits["S2_Revision_Flag"])).sum())
 
-        # compute delta days if needed
+        # Delta days from stage2
         hits["DELTA_DAYS_FROM_STAGE2"] = (hits[event_col] - hits["stage2_dt"]).dt.days
 
-        # output cols
+        # Choose output columns
         out_cols = ["patient_id", event_col, "stage2_dt", "DELTA_DAYS_FROM_STAGE2"]
-        if delta_col and delta_col not in out_cols:
+        if delta_col and (delta_col in hits.columns) and (delta_col not in out_cols):
             out_cols.append(delta_col)
-        if note_type_col:
+        if note_type_col and (note_type_col in hits.columns):
             out_cols.append(note_type_col)
-        if note_id_col:
+        if note_id_col and (note_id_col in hits.columns):
             out_cols.append(note_id_col)
-        if file_tag_col:
+        if file_tag_col and (file_tag_col in hits.columns):
             out_cols.append(file_tag_col)
 
         out_cols += [
@@ -373,73 +378,77 @@ def main():
             text_col
         ]
 
-        # ensure unique and existing
+        # Keep unique + existing
         out_cols_final = []
         for c in out_cols:
             if c in hits.columns and c not in out_cols_final:
                 out_cols_final.append(c)
 
-        hit_rows.append(hits[out_cols_final])
+        hit_frames.append(hits[out_cols_final])
 
-    hits_all = pd.concat(hit_rows, ignore_index=True) if hit_rows else pd.DataFrame()
+    hits_all = pd.concat(hit_frames, ignore_index=True) if hit_frames else pd.DataFrame()
 
-    # Patient-level rollup
+    # Patient-level rollup (AB-only)
     patient_level = ab[["patient_id"]].drop_duplicates().copy()
     patient_level["stage2_dt"] = patient_level["patient_id"].map(stage2_map)
 
-    if hits_all.empty:
-        patient_level["Stage2_Failure"] = 0
-        patient_level["Stage2_Revision"] = 0
-        patient_level["Stage2_Failure_FirstDate"] = pd.NaT
-        patient_level["Stage2_Revision_FirstDate"] = pd.NaT
-        patient_level["Stage2_Failure_FirstNoteType"] = ""
-        patient_level["Stage2_Failure_FirstNoteID"] = ""
-        patient_level["Stage2_Revision_FirstNoteType"] = ""
-        patient_level["Stage2_Revision_FirstNoteID"] = ""
-    else:
-        # Ensure EVENT_DT column name standard for grouping
+    # Default outputs
+    patient_level["Stage2_Failure"] = 0
+    patient_level["Stage2_Revision"] = 0
+    patient_level["Stage2_Failure_FirstDate"] = pd.NaT
+    patient_level["Stage2_Revision_FirstDate"] = pd.NaT
+    patient_level["Stage2_Failure_FirstNoteType"] = ""
+    patient_level["Stage2_Failure_FirstNoteID"] = ""
+    patient_level["Stage2_Revision_FirstNoteType"] = ""
+    patient_level["Stage2_Revision_FirstNoteID"] = ""
+
+    if not hits_all.empty:
         hits_all["EVENT_DT_STD"] = to_dt(hits_all[event_col])
 
         # Earliest failure hit per patient
         fail_hits = hits_all[hits_all["S2_Failure_Flag"]].copy()
-        fail_hits = fail_hits.sort_values(by=["patient_id", "EVENT_DT_STD"], ascending=[True, True])
-        first_fail = fail_hits.groupby("patient_id", as_index=False).head(1).copy()
+        if not fail_hits.empty:
+            fail_hits = fail_hits.sort_values(by=["patient_id", "EVENT_DT_STD"], ascending=[True, True])
+            first_fail = fail_hits.groupby("patient_id", as_index=False).head(1).copy()
+            patient_level["Stage2_Failure"] = patient_level["patient_id"].isin(set(first_fail["patient_id"])).astype(int)
+
+            keep = ["patient_id", "EVENT_DT_STD"]
+            ren = {"EVENT_DT_STD": "Stage2_Failure_FirstDate"}
+            if note_type_col and note_type_col in first_fail.columns:
+                keep.append(note_type_col)
+                ren[note_type_col] = "Stage2_Failure_FirstNoteType"
+            if note_id_col and note_id_col in first_fail.columns:
+                keep.append(note_id_col)
+                ren[note_id_col] = "Stage2_Failure_FirstNoteID"
+
+            patient_level = patient_level.merge(first_fail[keep].rename(columns=ren), on="patient_id", how="left")
 
         # Earliest revision hit per patient
         rev_hits = hits_all[hits_all["S2_Revision_Flag"]].copy()
-        rev_hits = rev_hits.sort_values(by=["patient_id", "EVENT_DT_STD"], ascending=[True, True])
-        first_rev = rev_hits.groupby("patient_id", as_index=False).head(1).copy()
+        if not rev_hits.empty:
+            rev_hits = rev_hits.sort_values(by=["patient_id", "EVENT_DT_STD"], ascending=[True, True])
+            first_rev = rev_hits.groupby("patient_id", as_index=False).head(1).copy()
+            patient_level["Stage2_Revision"] = patient_level["patient_id"].isin(set(first_rev["patient_id"])).astype(int)
 
-        patient_level["Stage2_Failure"] = patient_level["patient_id"].isin(set(first_fail["patient_id"])).astype(int)
-        patient_level["Stage2_Revision"] = patient_level["patient_id"].isin(set(first_rev["patient_id"])).astype(int)
+            keep = ["patient_id", "EVENT_DT_STD"]
+            ren = {"EVENT_DT_STD": "Stage2_Revision_FirstDate"}
+            if note_type_col and note_type_col in first_rev.columns:
+                keep.append(note_type_col)
+                ren[note_type_col] = "Stage2_Revision_FirstNoteType"
+            if note_id_col and note_id_col in first_rev.columns:
+                keep.append(note_id_col)
+                ren[note_id_col] = "Stage2_Revision_FirstNoteID"
 
-        # attach first dates and identifiers
-        patient_level = patient_level.merge(
-            first_fail[["patient_id", "EVENT_DT_STD"] + ([note_type_col] if note_type_col else []) + ([note_id_col] if note_id_col else [])].rename(
-                columns={"EVENT_DT_STD": "Stage2_Failure_FirstDate",
-                         note_type_col: "Stage2_Failure_FirstNoteType" if note_type_col else note_type_col,
-                         note_id_col: "Stage2_Failure_FirstNoteID" if note_id_col else note_id_col}
-            ),
-            on="patient_id",
-            how="left"
-        )
+            patient_level = patient_level.merge(first_rev[keep].rename(columns=ren), on="patient_id", how="left")
 
-        patient_level = patient_level.merge(
-            first_rev[["patient_id", "EVENT_DT_STD"] + ([note_type_col] if note_type_col else []) + ([note_id_col] if note_id_col else [])].rename(
-                columns={"EVENT_DT_STD": "Stage2_Revision_FirstDate",
-                         note_type_col: "Stage2_Revision_FirstNoteType" if note_type_col else note_type_col,
-                         note_id_col: "Stage2_Revision_FirstNoteID" if note_id_col else note_id_col}
-            ),
-            on="patient_id",
-            how="left"
-        )
-
-        # Fill missing cols if note_type/id absent
-        if not note_type_col:
+        # Ensure identifier cols exist even if anchor lacked them
+        if "Stage2_Failure_FirstNoteType" not in patient_level.columns:
             patient_level["Stage2_Failure_FirstNoteType"] = ""
-            patient_level["Stage2_Revision_FirstNoteType"] = ""
-        if not note_id_col:
+        if "Stage2_Failure_FirstNoteID" not in patient_level.columns:
             patient_level["Stage2_Failure_FirstNoteID"] = ""
+        if "Stage2_Revision_FirstNoteType" not in patient_level.columns:
+            patient_level["Stage2_Revision_FirstNoteType"] = ""
+        if "Stage2_Revision_FirstNoteID" not in patient_level.columns:
             patient_level["Stage2_Revision_FirstNoteID"] = ""
 
     # Write outputs
