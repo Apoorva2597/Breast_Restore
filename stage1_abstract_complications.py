@@ -16,14 +16,14 @@
 #   - stage1_complications_summary.txt
 #
 # Notes:
-#   - Read encoding: latin1(errors=replace) for WVD robustness
+#   - Read encoding: latin1(errors=replace)
 #   - Write encoding: utf-8
 #   - Filters to 0 <= delta <= 365 (Stage1 window)
-#   - Adds extra suppressors to reduce false positives:
+#   - Suppressors reduce false positives:
 #       * negation (no infection / denies / negative for)
-#       * history/prior (hx of infection etc.)
+#       * history/prior
 #       * rule-out / possible / concern for
-#       * "risk of complication" counseling language
+#       * "risk of complications" counseling language
 #       * prophylaxis antibiotic mentions
 
 from __future__ import print_function
@@ -113,7 +113,7 @@ def fuzzy_find_col(cols, tokens_any):
 
 
 # -------------------------
-# Complication category patterns (same as Stage2, plus "Other systemic")
+# Complication category patterns
 # -------------------------
 COMP_PATTERNS = [
     ("Hematoma", re.compile(r"\bhematoma\b", re.I)),
@@ -129,14 +129,14 @@ COMP_PATTERNS = [
     ("Total flap loss", re.compile(r"\b(total\s+flap\s+loss|flap\s+loss)\b", re.I)),
 ]
 
-# Systemic: do NOT include PE alone (too many false positives from "PE")
+# Systemic: avoid "PE" alone (too many false positives)
 OTHER_SYSTEMIC_RE = re.compile(
     r"\b(pulmonary\s+embolism|deep\s+vein\s+thrombosis|dvt\b|pneumonia|sepsis)\b",
     re.I
 )
 
 # -------------------------
-# Suppressors (reduce false positives)
+# Suppressors
 # -------------------------
 RX_NEGATION = re.compile(
     r"\b(no|not|without|denies|negative\s+for|no\s+evidence\s+of|free\s+of)\b.{0,40}\b"
@@ -150,8 +150,9 @@ RX_HISTORY_CONTEXT = re.compile(
     re.I
 )
 
+# FIXED: removed the invalid "?question" token
 RX_RULEOUT = re.compile(
-    r"\b(rule\s+out|r\/o|evaluate\s+for|work\s*up\s+for|concern\s+for|possible|?question\s+of)\b",
+    r"\b(rule\s+out|r\/o|evaluate\s+for|work\s*up\s+for|concern\s+for|possible|question\s+of|suspicious\s+for)\b",
     re.I
 )
 
@@ -161,18 +162,13 @@ RX_RISK_COUNSELING = re.compile(
     re.I
 )
 
-# Prophylaxis antibiotics / “given periop antibiotics” often triggers infection keywords
 RX_PROPHYLACTIC_ABX = re.compile(
     r"\b(prophylaxis|prophylactic|peri-?op|pre-?op|post-?op)\b.{0,40}\b(antibiotic|abx|ancef|cefazolin)\b",
     re.I
 )
 
-# If text is only describing drains/instructions etc. it can still be true comp,
-# so we do NOT suppress routine postop instructions broadly (too risky).
-
-
 # -------------------------
-# Treatment inference (same buckets)
+# Treatment inference
 # -------------------------
 RX_REOP = re.compile(
     r"\b(return(ed)?\s+to\s+or|take\s*back|takeback|re-?operation|reop|washout|operative\s+debridement|"
@@ -222,7 +218,6 @@ def major_minor_from_treatment(bucket):
 
 
 def should_suppress(txt_norm):
-    # order matters: cheap checks first
     if not txt_norm:
         return True
     if RX_RISK_COUNSELING.search(txt_norm):
@@ -239,9 +234,7 @@ def should_suppress(txt_norm):
 
 
 def main():
-    # -------------------------
-    # Load staging file for Stage1 date
-    # -------------------------
+    # 1) Load staging file for Stage1 date
     st = read_csv_safe(STAGING_CSV)
     if st is None or st.empty:
         raise RuntimeError("Could not read staging file: {}".format(STAGING_CSV))
@@ -251,7 +244,6 @@ def main():
 
     stage1_col = pick_first_present(st.columns.tolist(), ["stage1_date", "stage1_dt", "stage1"])
     if stage1_col is None:
-        # try fuzzy
         stage1_col = fuzzy_find_col(st.columns.tolist(), ["STAGE1", "STAGE_1"])
     if stage1_col is None:
         raise RuntimeError("Could not detect Stage1 date column in staging file: {}".format(STAGING_CSV))
@@ -266,22 +258,15 @@ def main():
     stage1_map = dict(zip(st[COL_PATIENT].tolist(), st["STAGE1_DT"].tolist()))
     stage1_patients = set(stage1_map.keys())
 
-    # -------------------------
-    # Detect columns in anchor rows file
-    # -------------------------
+    # 2) Detect columns in anchor rows file
     head = read_csv_safe(ANCHOR_ROWS_CSV, nrows=25)
     if head is None or head.empty:
         raise RuntimeError("Could not read anchor rows file: {}".format(ANCHOR_ROWS_CSV))
 
-    if COL_PATIENT not in head.columns:
-        # allow ENCRYPTED_PAT_ID fallback
-        if "ENCRYPTED_PAT_ID" in head.columns:
-            # we'll rename in chunks
-            pass
-        else:
-            raise RuntimeError("Anchor rows file missing patient_id: {}".format(ANCHOR_ROWS_CSV))
+    if COL_PATIENT not in head.columns and "ENCRYPTED_PAT_ID" not in head.columns:
+        raise RuntimeError("Anchor rows file missing patient_id: {}".format(ANCHOR_ROWS_CSV))
 
-    event_col = pick_first_present(head.columns.tolist(), ["EVENT_DT", "EVENT_DT_STD", "event_dt", "note_date", "NOTE_DATE_OF_SERVICE"])
+    event_col = pick_first_present(head.columns.tolist(), ["EVENT_DT", "event_dt", "note_date", "NOTE_DATE_OF_SERVICE"])
     if event_col is None:
         event_col = fuzzy_find_col(head.columns.tolist(), ["EVENT_DT", "DATE_OF_SERVICE", "NOTE_DATE", "DATE"])
     if event_col is None:
@@ -301,9 +286,7 @@ def main():
     if note_id_col is None:
         note_id_col = fuzzy_find_col(head.columns.tolist(), ["NOTE_ID", "ID"])
 
-    # -------------------------
-    # Scan anchor rows and create row-level hits
-    # -------------------------
+    # 3) Scan anchor rows and extract hits
     total_rows = 0
     rows_after_patient_filter = 0
     rows_after_window = 0
@@ -311,7 +294,6 @@ def main():
     hits = []
 
     usecols = [event_col, text_col]
-    # include patient id
     if COL_PATIENT in head.columns:
         usecols = [COL_PATIENT] + usecols
         pid_is_encrypted = False
@@ -338,7 +320,6 @@ def main():
         chunk["EVENT_DT"] = to_dt(chunk[event_col])
         chunk["STAGE1_DT"] = chunk[COL_PATIENT].map(stage1_map)
 
-        # compute delta and enforce 0–365
         chunk["DELTA_DAYS_FROM_STAGE1"] = (chunk["EVENT_DT"] - chunk["STAGE1_DT"]).dt.days
         chunk = chunk[chunk["DELTA_DAYS_FROM_STAGE1"].notnull()].copy()
         chunk = chunk[(chunk["DELTA_DAYS_FROM_STAGE1"] >= 0) & (chunk["DELTA_DAYS_FROM_STAGE1"] <= 365)].copy()
@@ -351,7 +332,6 @@ def main():
         evs = chunk["EVENT_DT"].tolist()
         deltas = chunk["DELTA_DAYS_FROM_STAGE1"].tolist()
 
-        # optional cols
         ntypes = chunk[note_type_col].fillna("").tolist() if note_type_col else [""] * len(chunk)
         nids = chunk[note_id_col].fillna("").tolist() if note_id_col else [""] * len(chunk)
 
@@ -383,7 +363,6 @@ def main():
                         "snippet": snippet(txt_raw, 240),
                     })
 
-            # systemic: apply negation/history/ruleout/risk suppressors already in should_suppress
             if OTHER_SYSTEMIC_RE.search(txt):
                 found_any = True
                 bucket = infer_treatment_bucket(txt)
@@ -404,9 +383,7 @@ def main():
             if found_any:
                 unique_pat_anyhit.add(pid)
 
-    # -------------------------
-    # Row hits dataframe + write
-    # -------------------------
+    # 4) Write row hits
     if hits:
         hits_df = pd.DataFrame(hits)
         hits_df = hits_df.sort_values(by=["patient_id", "EVENT_DT", "complication"], ascending=[True, True, True])
@@ -418,9 +395,7 @@ def main():
 
     hits_df.to_csv(OUT_ROW_HITS, index=False, encoding="utf-8")
 
-    # -------------------------
-    # Patient-level Comp1..3 (chronological, dedup by date+comp)
-    # -------------------------
+    # 5) Patient-level Comp1..3
     pl = pd.DataFrame({"patient_id": list(stage1_patients)})
     pl["stage1_dt"] = pl["patient_id"].map(stage1_map)
 
@@ -468,9 +443,7 @@ def main():
     pl = pl.sort_values(by=["patient_id"], ascending=[True])
     pl.to_csv(OUT_PATIENT_LEVEL, index=False, encoding="utf-8")
 
-    # -------------------------
-    # Summary
-    # -------------------------
+    # 6) Summary
     n_stage1 = int(pl["patient_id"].nunique())
     n_pat_anyhit = len(unique_pat_anyhit)
     n_rows_hits = 0 if hits_df.empty else int(len(hits_df))
@@ -478,7 +451,6 @@ def main():
     comp_counts = hits_df["complication"].value_counts() if not hits_df.empty else pd.Series(dtype=int)
     treat_counts = hits_df["treatment_bucket"].value_counts() if not hits_df.empty else pd.Series(dtype=int)
 
-    # print detected columns nicely
     lines = []
     lines.append("=== Stage 1 Complication Abstraction (anchored rows -> S1_Comp1..3) ===")
     lines.append("Python: 3.6.8 compatible | Read encoding: latin1(errors=replace) | Write: utf-8")
@@ -497,13 +469,15 @@ def main():
     if note_id_col:
         lines.append("  NOTE_ID: {}".format(note_id_col))
     lines.append("")
-    lines.append("Anchored rows scanned (0–365d window enforced):")
+    lines.append("Row counts:")
     lines.append("  Total rows read: {}".format(total_rows))
     lines.append("  Rows after patient filter: {}".format(rows_after_patient_filter))
     lines.append("  Rows kept in 0–365d window: {}".format(rows_after_window))
     lines.append("")
     lines.append("Row-level complication hits: {}".format(n_rows_hits))
-    lines.append("Patients with >=1 hit: {} ({:.1f}%)".format(n_pat_anyhit, (100.0 * n_pat_anyhit / n_stage1) if n_stage1 else 0.0))
+    lines.append("Patients with >=1 hit: {} ({:.1f}%)".format(
+        n_pat_anyhit, (100.0 * n_pat_anyhit / n_stage1) if n_stage1 else 0.0
+    ))
     lines.append("")
 
     if not hits_df.empty:
