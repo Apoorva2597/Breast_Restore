@@ -8,13 +8,12 @@ import pandas as pd
 INPUT_CSV = "Breast-Restore.csv"
 OUTPUT_CSV = "gold_cleaned_for_cedar.csv"
 
-# These are EXCEL row numbers from the original sheet (1-based).
-# If your CSV includes an "__excel_row__" column, we will use it.
-# Otherwise, we will fall back to dropping by CSV row index (less ideal).
+# EXCEL row numbers from the original sheet (1-based)
 DROP_EXCEL_ROWS = [29, 198, 203, 284]
 
-# Heuristic tokens treated as blank
+# Tokens treated as blank
 BLANK_TOKENS = {"na", "n/a", "none", "null", ".", "-", "--", "nan"}
+
 
 # -------------------------
 # Helpers
@@ -25,10 +24,11 @@ def clean_header(s):
     s = re.sub(r"^\s*\d+\s*\.\s*", "", s)  # remove leading "34. "
     return s
 
+
 def norm_cell(x):
-    # old-pandas safe missing value representation
     if x is None:
         return np.nan
+
     # keep numeric values as-is (except NaN)
     if isinstance(x, (int, float)):
         if isinstance(x, float) and np.isnan(x):
@@ -48,10 +48,11 @@ def norm_cell(x):
         return np.nan
     return s
 
-def find_true_header_row(path, max_scan=50):
+
+def find_true_header_row(path, max_scan=60):
     """
-    Scan first max_scan rows with header=None and find the row that looks like
-    the real column header. We look for MRN + PatientID (or close variants).
+    Scan first max_scan rows with header=None and find the row that looks like the
+    real column header. We look for MRN + PatientID (or close variants).
     Returns 0-based row index.
     """
     preview = pd.read_csv(path, header=None, nrows=max_scan, engine="python", encoding="latin1")
@@ -65,13 +66,11 @@ def find_true_header_row(path, max_scan=50):
         has_mrn = ("MRN" in row_up) or ("MRN" in joined)
         has_pid = ("PATIENTID" in row_up) or ("PATIENT_ID" in joined) or ("PATIENTID" in joined)
 
-        # This combo is very characteristic of the real header
         if has_mrn and has_pid:
             best_i = i
             break
 
     if best_i is None:
-        # fallback: row containing MRN alone
         for i in range(len(preview)):
             row_vals = [clean_header(v) for v in preview.iloc[i].tolist()]
             row_up = [str(v).strip().upper() for v in row_vals if str(v).strip() != ""]
@@ -79,8 +78,19 @@ def find_true_header_row(path, max_scan=50):
                 best_i = i
                 break
 
-    # last resort: assume 0
     return 0 if best_i is None else int(best_i)
+
+
+def looks_like_date_col(colname):
+    cl = str(colname).strip().lower()
+    if "dob" in cl:
+        return True
+    if cl.endswith("_dt"):
+        return True
+    if "date" in cl:
+        return True
+    return False
+
 
 # -------------------------
 # Main
@@ -104,7 +114,7 @@ df = pd.read_csv(
 
 original_rows = len(df)
 
-# 3) Clean headers: whitespace, remove leading numbers, drop Unnamed
+# 3) Clean headers and drop Unnamed
 df.columns = [clean_header(c) for c in df.columns]
 df = df.loc[:, [c for c in df.columns if c and not str(c).lower().startswith("unnamed")]].copy()
 
@@ -115,15 +125,10 @@ print(list(df.columns)[:30])
 for col in df.columns:
     df[col] = df[col].map(norm_cell)
 
-# 5) Clean DOB columns (strip "00:00:00" etc)
-for c in df.columns:
-    if "dob" in str(c).lower():
-        df[c] = pd.to_datetime(df[c], errors="coerce").dt.date.astype(object)
-
-# 6) Drop fully blank rows (all NaN)
+# 5) Drop fully blank rows (all NaN)
 df = df[~df.isna().all(axis=1)].copy()
 
-# 7) Drop identifier-only rows
+# 6) Drop identifier-only rows (MRN/PatientID/Name/DOB filled but everything else empty)
 id_cols = [c for c in df.columns if re.search(r"(mrn|patientid|name|dob)", str(c), re.I)]
 var_cols = [c for c in df.columns if c not in id_cols]
 
@@ -132,8 +137,7 @@ if id_cols and var_cols:
     no_vars = df[var_cols].isna().all(axis=1)
     df = df[~(has_id & no_vars)].copy()
 
-# 8) Drop flagged red rows
-# Prefer using an explicit excel-row column if present
+# 7) Drop flagged red rows
 excel_row_col = None
 for c in df.columns:
     if str(c).strip().lower() in ["__excel_row__", "_excel_row_", "excel_row", "excelrow"]:
@@ -146,9 +150,7 @@ if excel_row_col is not None:
     df = df[~df[excel_row_col].isin(DROP_EXCEL_ROWS)].copy()
     print("\nDropped red rows using {}: {} rows removed".format(excel_row_col, before - len(df)))
 else:
-    # Fallback: try to reconstruct excel row numbers if the CSV appears to have come from row 1
-    # This is less reliable, but better than nothing if there's no excel row column.
-    # We treat the first data row as Excel row = hdr_idx+2 (since Excel rows are 1-based, and header row counts).
+    # reconstruct excel row numbers (best effort)
     first_data_excel_row = (hdr_idx + 1) + 1  # header row (1-based) + 1
     df = df.reset_index(drop=True)
     df.insert(0, "__excel_row__", range(first_data_excel_row, first_data_excel_row + len(df)))
@@ -156,27 +158,33 @@ else:
     df = df[~df["__excel_row__"].isin(DROP_EXCEL_ROWS)].copy()
     print("\nDropped red rows using reconstructed __excel_row__: {} rows removed".format(before - len(df)))
 
-# 9) Drop rows where all Stage1 outcomes are blank (mirrors original)
+# 8) Drop rows where all Stage1 outcomes are blank
 stage1_cols = [c for c in df.columns if "Stage1" in str(c)]
 if stage1_cols:
     df = df[~df[stage1_cols].isna().all(axis=1)].copy()
 else:
     print("\nWARNING: No Stage1 columns found.")
 
-# 10) Force MRN / PatientID to string (as strings, not numbers)
+# 9) Force MRN / PatientID to string
 for c in df.columns:
     if re.search(r"(mrn|patientid)", str(c), re.I):
-        df[c] = df[c].astype(str).str.strip()
+        df[c] = df[c].fillna("").astype(str).str.strip()
 
-# 11) Stage2_Applicable (do NOT edit gold values; only add helper column)
+# 10) Add Stage2_Applicable (helper only; does not modify Stage2 columns)
 stage2_cols = [c for c in df.columns if "Stage2" in str(c)]
 if stage2_cols:
-    # any non-missing value in any Stage2 column counts as applicable
     df["Stage2_Applicable"] = df[stage2_cols].notna().any(axis=1).astype(int)
 else:
     print("\nWARNING: No Stage2 columns found.")
 
-# 12) Write
+# 11) Force ALL date-like columns to YYYY-MM-DD strings (no time)
+for c in df.columns:
+    if looks_like_date_col(c):
+        dt = pd.to_datetime(df[c], errors="coerce")
+        df[c] = dt.dt.strftime("%Y-%m-%d")
+        df[c] = df[c].fillna("")
+
+# 12) Summary + write
 final_rows = len(df)
 print("\nRow counts:")
 print("Original rows (raw read):", original_rows)
@@ -187,20 +195,15 @@ print("Stage2 columns detected:", len(stage2_cols))
 if stage2_cols:
     print("Stage2_Applicable=1 count:", int(df["Stage2_Applicable"].sum()))
 
-print("\nFirst row after cleaning:")
+print("\nFirst row after cleaning (after date formatting):")
 if final_rows > 0:
     print(df.iloc[0].to_dict())
 else:
     print("No rows left.")
-    
-# --- force date columns to clean YYYY-MM-DD strings ---
-for c in df.columns:
-    cl = str(c).lower()
-    if "dob" in cl or cl.endswith("_dt") or "date" in cl:
-        dt = pd.to_datetime(df[c], errors="coerce")
-        df[c] = dt.dt.strftime("%Y-%m-%d")
-        # keep missing as blank (instead of 'NaT')
-        df[c] = df[c].fillna("")
+
+# quick DOB peek
+if "DOB" in df.columns:
+    print("\nDOB sample (first 10):", df["DOB"].head(10).tolist())
 
 df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8")
 print("\nWrote:", OUTPUT_CSV)
