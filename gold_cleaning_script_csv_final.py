@@ -55,7 +55,9 @@ def find_true_header_row(path, max_scan=60):
     real column header. We look for MRN + PatientID (or close variants).
     Returns 0-based row index.
     """
-    preview = pd.read_csv(path, header=None, nrows=max_scan, engine="python", encoding="latin1")
+    preview = pd.read_csv(
+        path, header=None, nrows=max_scan, engine="python", encoding="latin1"
+    )
     best_i = None
 
     for i in range(len(preview)):
@@ -92,6 +94,36 @@ def looks_like_date_col(colname):
     return False
 
 
+def print_red_row_presence(df, excel_row_col, drop_rows):
+    """
+    Debug: show which "red rows" are actually present right before dropping.
+    """
+    if excel_row_col not in df.columns:
+        print("\nDEBUG red-row presence: excel row col not found:", excel_row_col)
+        return
+
+    tmp = df.copy()
+    tmp[excel_row_col] = pd.to_numeric(tmp[excel_row_col], errors="coerce")
+
+    present_mask = tmp[excel_row_col].isin(drop_rows)
+    present = tmp.loc[present_mask].copy()
+
+    # Try to show PatientID/MRN if present
+    cols_to_show = [excel_row_col]
+    for c in ["PatientID", "MRN", "patient_id", "mrn"]:
+        if c in present.columns and c not in cols_to_show:
+            cols_to_show.append(c)
+
+    print("\nDEBUG red-row presence (before dropping):")
+    print("excel_row_col:", excel_row_col)
+    print("DROP_EXCEL_ROWS:", drop_rows)
+    print("Count present:", int(present_mask.sum()))
+    if len(present) > 0:
+        print(present[cols_to_show].sort_values(by=excel_row_col).to_string(index=False))
+    else:
+        print("(none found)")
+
+
 # -------------------------
 # Main
 # -------------------------
@@ -109,7 +141,7 @@ df = pd.read_csv(
     header=hdr_idx,
     engine="python",
     encoding="latin1",
-    dtype=object
+    dtype=object,
 )
 
 original_rows = len(df)
@@ -145,15 +177,25 @@ for c in df.columns:
         break
 
 if excel_row_col is not None:
+    # DEBUG: show what is present before dropping
+    print_red_row_presence(df, excel_row_col, DROP_EXCEL_ROWS)
+
     df[excel_row_col] = pd.to_numeric(df[excel_row_col], errors="coerce")
     before = len(df)
     df = df[~df[excel_row_col].isin(DROP_EXCEL_ROWS)].copy()
     print("\nDropped red rows using {}: {} rows removed".format(excel_row_col, before - len(df)))
 else:
     # reconstruct excel row numbers (best effort)
-    first_data_excel_row = (hdr_idx + 1) + 1  # header row (1-based) + 1
+    # Excel row number for first data row:
+    # header row is at hdr_idx (0-based) => Excel row = hdr_idx+1 (1-based)
+    # first data row Excel row = header_excel_row + 1 = (hdr_idx+1) + 1 = hdr_idx+2
+    first_data_excel_row = hdr_idx + 2
     df = df.reset_index(drop=True)
     df.insert(0, "__excel_row__", range(first_data_excel_row, first_data_excel_row + len(df)))
+
+    # DEBUG: show what is present before dropping
+    print_red_row_presence(df, "__excel_row__", DROP_EXCEL_ROWS)
+
     before = len(df)
     df = df[~df["__excel_row__"].isin(DROP_EXCEL_ROWS)].copy()
     print("\nDropped red rows using reconstructed __excel_row__: {} rows removed".format(before - len(df)))
@@ -178,6 +220,7 @@ else:
     print("\nWARNING: No Stage2 columns found.")
 
 # 11) Force ALL date-like columns to YYYY-MM-DD strings (no time)
+# NOTE: do this AFTER row filtering so parsing work is minimal.
 for c in df.columns:
     if looks_like_date_col(c):
         dt = pd.to_datetime(df[c], errors="coerce")
@@ -201,9 +244,14 @@ if final_rows > 0:
 else:
     print("No rows left.")
 
-# quick DOB peek
-if "DOB" in df.columns:
-    print("\nDOB sample (first 10):", df["DOB"].head(10).tolist())
+# quick DOB peek (case-insensitive)
+dob_col = None
+for c in df.columns:
+    if str(c).strip().lower() == "dob":
+        dob_col = c
+        break
+if dob_col is not None:
+    print("\nDOB sample (first 10):", df[dob_col].head(10).tolist())
 
 df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8")
 print("\nWrote:", OUTPUT_CSV)
