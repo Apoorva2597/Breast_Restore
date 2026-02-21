@@ -192,6 +192,15 @@ if final_rows > 0:
     print(df.iloc[0].to_dict())
 else:
     print("No rows left.")
+    
+# --- force date columns to clean YYYY-MM-DD strings ---
+for c in df.columns:
+    cl = str(c).lower()
+    if "dob" in cl or cl.endswith("_dt") or "date" in cl:
+        dt = pd.to_datetime(df[c], errors="coerce")
+        df[c] = dt.dt.strftime("%Y-%m-%d")
+        # keep missing as blank (instead of 'NaT')
+        df[c] = df[c].fillna("")
 
 df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8")
 print("\nWrote:", OUTPUT_CSV)
