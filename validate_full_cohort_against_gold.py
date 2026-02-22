@@ -14,7 +14,7 @@ import pandas as pd
 # -------------------------
 GOLD_CSV   = "gold_cleaned_for_cedar.csv"
 COHORT_CSV = "cohort_all_patient_level_final_gold_order.csv"
-BRIDGE_CSV = "pred_with_mrn.csv"   # this contains patient_id + MRN_from_encounters
+BRIDGE_CSV = "cohort_pid_to_mrn_from_encounters.csv"
 
 
 # -------------------------
