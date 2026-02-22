@@ -1,3 +1,5 @@
+# make_patient_level.py
+
 #!/usr/bin/env python3
 """
 Phase 3: aggregate Phase 2 note-level fields into a single
