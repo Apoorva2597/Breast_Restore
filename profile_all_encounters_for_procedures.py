@@ -23,10 +23,6 @@ FILES = [
     "/home/apokol/my_data_Breast/HPI-11526/HPI11526 Clinic Encounters.csv", "/home/apokol/my_data_Breast/HPI-11526/HPI11526 Operation Encounters.csv", "/home/apokol/my_data_Breast/HPI-11526/HPI11526 Inpatient Encounters.csv"
   ]
 
-# Option B: scan a folder for CSVs (set FOLDER, leave FILES empty)
-FOLDER = ""  # e.g. "/nfs/corenfs/CEDAR-Lab-data/Projects/eHailBreastCancer/data"
-FOLDER_RECURSIVE = False  # set True if needed
-
 MAX_SCAN_ROWS = 50000     # only scan first N rows per file to get top-values quickly
 TOPK = 25                 # print top N values per procedure-like column
 OUT_SUMMARY = "encounter_procedure_profile_summary.csv"
