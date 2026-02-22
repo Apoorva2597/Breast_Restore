@@ -26,7 +26,7 @@ import pandas as pd
 GOLD_CSV = "gold_cleaned_for_cedar.csv"
 
 # Use the Clinic Encounters file you showed (contains MRN + ENCRYPTED_PAT_ID)
-CLINIC_ENC_CSV = "/home/apokol/my_data_Breast/HPI-11526/HPI11526 Clinic Encounters.csv"
+CLINIC_ENC_CSV = "/home/apokol/my_data_Breast/HPI-11526/HPI11256/HPI11526 Clinic Encounters.csv"
 
 # Your prediction spine (or any pred file with patient_id)
 PRED_CSV = "pred_spine_stage1_stage2.csv"
