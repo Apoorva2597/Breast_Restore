@@ -1,118 +1,154 @@
 # validate_full_cohort_against_gold.py
 # Python 3.6.8 compatible
+#
+# Validates extracted cohort outputs (patient_id-based) against GOLD (MRN-based)
+# by bridging patient_id -> MRN using pred_with_mrn.csv (or similar).
 
+from __future__ import print_function
+import re
 import pandas as pd
-import numpy as np
-
-PRED_FILE = "cohort_all_patient_level_final.csv"
-GOLD_FILE = "gold_cleaned_for_cedar.csv"
-BRIDGE_FILE = "pred_with_mrn.csv"   # must contain patient_id + MRN
-
-OUT_FILE = "validation_metrics_summary.csv"
 
 
 # -------------------------
-# Utility
+# CONFIG (edit if needed)
 # -------------------------
+GOLD_CSV   = "gold_cleaned_for_cedar.csv"
+COHORT_CSV = "cohort_all_patient_level_final_gold_order.csv"
+BRIDGE_CSV = "pred_with_mrn.csv"   # this contains patient_id + MRN_from_encounters
 
+
+# -------------------------
+# Helpers
+# -------------------------
 def read_csv_safe(path):
+    # your environment often needs latin1/cp1252 for Epic exports
     try:
         return pd.read_csv(path, dtype=object, encoding="utf-8", engine="python")
-    except:
-        return pd.read_csv(path, dtype=object, encoding="latin1", engine="python")
+    except Exception:
+        return pd.read_csv(path, dtype=object, encoding="latin1", engine="python", errors="replace")
 
-def to_binary(series):
-    return series.fillna("").astype(str).str.strip().str.lower().isin(
-        ["1","true","yes","y"]
-    ).astype(int)
+def norm_colname(c):
+    return str(c).strip()
 
-def compute_metrics(df, gold_col, pred_col):
-    g = to_binary(df[gold_col])
-    p = to_binary(df[pred_col])
+def pick_col(cols, candidates):
+    """
+    Choose a column from `cols` matching candidates by:
+      1) exact case-insensitive match
+      2) substring match
+    """
+    cols_list = list(cols)
+    cols_upper = {c: norm_colname(c).upper() for c in cols_list}
 
-    tp = int(((g == 1) & (p == 1)).sum())
-    tn = int(((g == 0) & (p == 0)).sum())
-    fp = int(((g == 0) & (p == 1)).sum())
-    fn = int(((g == 1) & (p == 0)).sum())
+    # exact match
+    for want in candidates:
+        w = want.upper()
+        for c in cols_list:
+            if cols_upper[c] == w:
+                return c
 
-    sens = tp / (tp + fn) if (tp + fn) else np.nan
-    spec = tn / (tn + fp) if (tn + fp) else np.nan
-    ppv  = tp / (tp + fp) if (tp + fp) else np.nan
-    npv  = tn / (tn + fn) if (tn + fn) else np.nan
+    # substring match
+    for want in candidates:
+        w = want.upper()
+        for c in cols_list:
+            if w in cols_upper[c]:
+                return c
 
-    return {
-        "Gold_Var": gold_col,
-        "Pred_Var": pred_col,
-        "TP": tp,
-        "TN": tn,
-        "FP": fp,
-        "FN": fn,
-        "Sensitivity": round(sens, 4),
-        "Specificity": round(spec, 4),
-        "PPV": round(ppv, 4),
-        "NPV": round(npv, 4),
-    }
+    return None
+
+def norm_id(x):
+    if x is None:
+        return ""
+    s = str(x).strip()
+    if s.lower() in ("", "nan", "none", "null"):
+        return ""
+    return s
 
 
 # -------------------------
 # Main
 # -------------------------
+print("\n=== VALIDATION: FULL COHORT VS GOLD (via bridge) ===")
+print("GOLD  :", GOLD_CSV)
+print("COHORT:", COHORT_CSV)
+print("BRIDGE:", BRIDGE_CSV)
 
-print("\n=== VALIDATION: FULL COHORT VS GOLD ===")
+gold = read_csv_safe(GOLD_CSV)
+cohort = read_csv_safe(COHORT_CSV)
+bridge = read_csv_safe(BRIDGE_CSV)
 
-pred = read_csv_safe(PRED_FILE)
-gold = read_csv_safe(GOLD_FILE)
-bridge = read_csv_safe(BRIDGE_FILE)
+# Detect columns
+gold_mrn_col = pick_col(gold.columns, ["MRN", "PAT_MRN_ID", "MRN_ID"])
+bridge_pid_col = pick_col(bridge.columns, ["patient_id", "ENCRYPTED_PAT_ID", "PAT_ID", "PATIENT_ID"])
+bridge_mrn_col = pick_col(bridge.columns, ["MRN", "MRN_FROM_ENCOUNTERS", "PAT_MRN_ID", "MRN_ID"])
+cohort_pid_col = pick_col(cohort.columns, ["patient_id", "ENCRYPTED_PAT_ID", "PAT_ID", "PATIENT_ID"])
 
-# Ensure join columns exist
-assert "patient_id" in pred.columns
-assert "MRN" in gold.columns
-assert "patient_id" in bridge.columns and "MRN" in bridge.columns
+print("\nDetected columns:")
+print("  GOLD MRN col      :", gold_mrn_col)
+print("  BRIDGE patient_id :", bridge_pid_col)
+print("  BRIDGE MRN        :", bridge_mrn_col)
+print("  COHORT patient_id :", cohort_pid_col)
 
-# Link pred -> MRN
-pred = pred.merge(bridge[["patient_id","MRN"]], on="patient_id", how="left")
+if gold_mrn_col is None:
+    raise RuntimeError("Could not find MRN column in GOLD.")
+if bridge_pid_col is None or bridge_mrn_col is None:
+    raise RuntimeError("Could not find both patient_id and MRN columns in BRIDGE.")
+if cohort_pid_col is None:
+    raise RuntimeError("Could not find patient_id column in COHORT.")
 
-# Merge with gold
-df = gold.merge(pred, on="MRN", how="left", suffixes=("_gold","_pred"))
+# Normalize IDs
+gold["_MRN_"] = gold[gold_mrn_col].map(norm_id)
+bridge["_PID_"] = bridge[bridge_pid_col].map(norm_id)
+bridge["_MRN_"] = bridge[bridge_mrn_col].map(norm_id)
+cohort["_PID_"] = cohort[cohort_pid_col].map(norm_id)
 
-print("Gold rows:", gold.shape[0])
-print("Overlap rows:", df.shape[0])
+# Keep only usable bridge rows
+bridge2 = bridge[(bridge["_PID_"] != "") & (bridge["_MRN_"] != "")].copy()
 
-# -------------------------
-# Variable Mapping
-# -------------------------
+# Check bridge ambiguity (should be 0/0 ideally)
+pid_to_mrn_counts = bridge2.groupby("_PID_")["_MRN_"].nunique()
+mrn_to_pid_counts = bridge2.groupby("_MRN_")["_PID_"].nunique()
 
-VARIABLE_MAP = [
-    ("Stage1 MinorComp", "Stage1_MinorComp_pred"),
-    ("Stage1 MajorComp", "Stage1_MajorComp_pred"),
-    ("Stage1 Reoperation", "Stage1_Reoperation_pred"),
-    ("Stage1 Rehospitalization", "Stage1_Rehospitalization_pred"),
+n_pid_multi = int((pid_to_mrn_counts > 1).sum())
+n_mrn_multi = int((mrn_to_pid_counts > 1).sum())
 
-    ("Stage2 MinorComp", "Stage2_MinorComp"),
-    ("Stage2 MajorComp", "Stage2_MajorComp"),
-    ("Stage2 Reoperation", "Stage2_Reoperation"),
-    ("Stage2 Rehospitalization", "Stage2_Rehospitalization"),
-    ("Stage2 Failure", "Stage2_Failure"),
-    ("Stage2 Revision", "Stage2_Revision"),
-]
+print("\nBridge ambiguity checks:")
+print("  patient_id -> multiple MRNs:", n_pid_multi)
+print("  MRN -> multiple patient_ids:", n_mrn_multi)
 
-results = []
+# Build mapping patient_id -> MRN (take first if duplicates exist)
+pid_to_mrn = bridge2.drop_duplicates(subset=["_PID_"])[["_PID_", "_MRN_"]].set_index("_PID_")["_MRN_"].to_dict()
 
-for gold_var, pred_var in VARIABLE_MAP:
-    if gold_var not in df.columns:
-        print("Skip (missing gold col):", gold_var)
-        continue
-    if pred_var not in df.columns:
-        print("Skip (missing pred col):", pred_var)
-        continue
+# Attach MRN to cohort
+cohort["_MRN_"] = cohort["_PID_"].map(lambda x: pid_to_mrn.get(x, ""))
 
-    metrics = compute_metrics(df, gold_var, pred_var)
-    results.append(metrics)
+# Summary counts
+gold_mrns = set([m for m in gold["_MRN_"].tolist() if m != ""])
+cohort_mrns = set([m for m in cohort["_MRN_"].tolist() if m != ""])
 
-out = pd.DataFrame(results)
-out.to_csv(OUT_FILE, index=False)
+print("\nCounts:")
+print("  GOLD rows                :", int(len(gold)))
+print("  GOLD unique MRNs         :", int(len(gold_mrns)))
+print("  COHORT rows              :", int(len(cohort)))
+print("  COHORT patient_id nonblank:", int((cohort["_PID_"] != "").sum()))
+print("  COHORT rows w/ MRN linked:", int((cohort["_MRN_"] != "").sum()))
+print("  COHORT unique MRNs linked:", int(len(cohort_mrns)))
+print("  Overlap (GOLD ∩ COHORT MRN):", int(len(gold_mrns.intersection(cohort_mrns))))
 
-print("\nWrote:", OUT_FILE)
-print("\nPreview:\n")
-print(out)
-print("\nDone.\n")
+# Write overlap report (useful for debugging)
+overlap = gold_mrns.intersection(cohort_mrns)
+only_gold = gold_mrns.difference(cohort_mrns)
+only_cohort = cohort_mrns.difference(gold_mrns)
+
+out_rep = pd.DataFrame({
+    "metric": ["overlap_count", "only_gold_count", "only_cohort_count"],
+    "value": [len(overlap), len(only_gold), len(only_cohort)]
+})
+out_rep.to_csv("validation_overlap_counts.csv", index=False, encoding="utf-8")
+
+# Save row-level mapping for later joins/debug
+cohort[["_PID_", "_MRN_"]].drop_duplicates().to_csv("cohort_pid_to_mrn.csv", index=False, encoding="utf-8")
+
+print("\nWrote:")
+print("  - validation_overlap_counts.csv")
+print("  - cohort_pid_to_mrn.csv")
+print("Done.\n")
