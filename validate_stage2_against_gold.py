@@ -1,71 +1,81 @@
-# validate_stage2_full_cohort_against_gold_blank_as_zero.py
+#!/usr/bin/env python3
+# validate_stage2_full_cohort_against_gold.py
 # Python 3.6.8 compatible
 #
-# Validates Stage2 outcomes by linking:
-#   GOLD (MRN) <---> BRIDGE (patient_id <-> MRN) <---> COHORT (patient_id)
+# Goal:
+#   Validate Stage2 outcomes in your FULL cohort abstraction against GOLD,
+#   using a deterministic MRN<->patient_id bridge built from encounters.
 #
-# Key behavior:
-#   - Restrict scoring universe to GOLD Stage2_Applicable == 1
-#   - Treat BLANK in GOLD Stage2 outcome cols as 0 (optional + default ON here)
-#   - Does NOT modify the original gold CSV on disk
+# Key fix vs your prior script:
+#   - Resolve GOLD Stage2 columns from *gold.csv* only
+#   - Resolve PRED Stage2 columns from *cohort.csv* only
+#   - Handle merge suffixes explicitly (_gold / _pred) when they occur
+#   - Convert blanks/NA -> 0 ONLY for Stage2 outcome scoring (does NOT rewrite your input files)
+#
+# Inputs (edit if needed):
+#   GOLD   : gold_cleaned_for_cedar.csv
+#   COHORT : cohort_all_patient_level_final_gold_order.csv
+#   BRIDGE : cohort_pid_to_mrn_from_encounters.csv   (patient_id, MRN)
+#
+# Outputs:
+#   - stage2_validation_confusion_by_var.csv
+#   - stage2_validation_pairs_stage2.csv
 
 from __future__ import print_function
 import os
 import re
-import numpy as np
 import pandas as pd
+
 
 # -------------------------
 # CONFIG (edit if needed)
 # -------------------------
 GOLD_CSV   = "gold_cleaned_for_cedar.csv"
 COHORT_CSV = "cohort_all_patient_level_final_gold_order.csv"
-BRIDGE_CSV = "cohort_pid_to_mrn_from_encounters.csv"  # patient_id, MRN
+BRIDGE_CSV = "cohort_pid_to_mrn_from_encounters.csv"
 
-OUT_BY_VAR = "stage2_validation_confusion_by_var.csv"
+OUT_BYVAR  = "stage2_validation_confusion_by_var.csv"
 OUT_PAIRS  = "stage2_validation_pairs_stage2.csv"
 
-# Which Stage2 vars to validate (canonical names)
+# Stage2 variables to validate (canonical names used in reports)
 STAGE2_VARS = [
     "Stage2_MinorComp",
     "Stage2_MajorComp",
     "Stage2_Reoperation",
-    "Stage2_Rehospitalitalization",  # keep misspelling guard (we normalize)
     "Stage2_Rehospitalization",
     "Stage2_Failure",
     "Stage2_Revision",
 ]
 
-# Gold columns might have spaces; pred typically uses underscores.
-# We'll map by "canonicalized" versions anyway, but these help if you want explicit mapping.
-GOLD_COL_ALIASES = {
-    "Stage2_MinorComp": ["Stage2 MinorComp", "Stage2_MinorComp"],
-    "Stage2_MajorComp": ["Stage2 MajorComp", "Stage2_MajorComp"],
-    "Stage2_Reoperation": ["Stage2 Reoperation", "Stage2_Reoperation"],
-    "Stage2_Rehospitalization": ["Stage2 Rehospitalitalization", "Stage2 Rehospitalization", "Stage2_Rehospitalization"],
-    "Stage2_Failure": ["Stage2 Failure", "Stage2_Failure"],
-    "Stage2_Revision": ["Stage2 Revision", "Stage2_Revision"],
+# GOLD uses "Stage2 MinorComp" style (spaces). We support multiple aliases.
+GOLD_ALIASES = {
+    "Stage2_MinorComp":        ["Stage2 MinorComp", "Stage2_MinorComp", "Stage2-MinorComp"],
+    "Stage2_MajorComp":        ["Stage2 MajorComp", "Stage2_MajorComp", "Stage2-MajorComp"],
+    "Stage2_Reoperation":      ["Stage2 Reoperation", "Stage2_Reoperation", "Stage2-Reoperation"],
+    "Stage2_Rehospitalization":["Stage2 Rehospitalization", "Stage2_Rehospitalization", "Stage2-Rehospitalization",
+                                "Stage2 Rehospitalisation", "Stage2_Rehospitalisation"],
+    "Stage2_Failure":          ["Stage2 Failure", "Stage2_Failure", "Stage2-Failure"],
+    "Stage2_Revision":         ["Stage2 Revision", "Stage2_Revision", "Stage2-Revision"],
 }
 
-PRED_COL_ALIASES = {
-    "Stage2_MinorComp": ["Stage2_MinorComp", "Stage2_MinorComp_pred"],
-    "Stage2_MajorComp": ["Stage2_MajorComp", "Stage2_MajorComp_pred"],
-    "Stage2_Reoperation": ["Stage2_Reoperation", "Stage2_Reoperation_pred"],
-    "Stage2_Rehospitalization": ["Stage2_Rehospitalization", "Stage2_Rehospitalization_pred"],
-    "Stage2_Failure": ["Stage2_Failure", "Stage2_Failure_pred"],
-    "Stage2_Revision": ["Stage2_Revision", "Stage2_Revision_pred"],
+# COHORT often uses "_pred" suffix (e.g., Stage2_MinorComp_pred) but we support both.
+PRED_ALIASES = {
+    "Stage2_MinorComp":        ["Stage2_MinorComp_pred", "Stage2_MinorComp", "Stage2 MinorComp"],
+    "Stage2_MajorComp":        ["Stage2_MajorComp_pred", "Stage2_MajorComp", "Stage2 MajorComp"],
+    "Stage2_Reoperation":      ["Stage2_Reoperation_pred", "Stage2_Reoperation", "Stage2 Reoperation"],
+    "Stage2_Rehospitalization":["Stage2_Rehospitalization_pred", "Stage2_Rehospitalization", "Stage2 Rehospitalization",
+                                "Stage2_Rehospitalisation_pred", "Stage2_Rehospitalisation", "Stage2 Rehospitalisation"],
+    "Stage2_Failure":          ["Stage2_Failure_pred", "Stage2_Failure", "Stage2 Failure"],
+    "Stage2_Revision":         ["Stage2_Revision_pred", "Stage2_Revision", "Stage2 Revision"],
 }
 
-# IMPORTANT SWITCH:
-# If True: within the Stage2_Applicable==1 set, blank/NA in GOLD outcome cols => 0
-TREAT_GOLD_BLANK_AS_ZERO_FOR_STAGE2_OUTCOMES = True
+# GOLD applicability flag (must be 1 for Stage2 scoring)
+GOLD_STAGE2_APPLICABLE_COL_CANDIDATES = ["Stage2_Applicable", "Stage2 Applicable", "stage2_applicable"]
+
 
 # -------------------------
 # Helpers
 # -------------------------
-
-BLANK_TOKENS = set(["", "nan", "none", "null", "na", "n/a", ".", "-", "--"])
-
 def read_csv_safe(path, nrows=None):
     f = open(path, "r", encoding="latin1", errors="replace")
     try:
@@ -76,293 +86,314 @@ def read_csv_safe(path, nrows=None):
         except Exception:
             pass
 
-def norm_str(x):
-    if x is None:
-        return ""
-    s = str(x)
-    try:
-        s = s.replace("\xa0", " ")
-    except Exception:
-        pass
-    s = s.strip()
-    if s.lower() in BLANK_TOKENS:
-        return ""
-    return s
-
-def canon_colname(s):
-    """
-    Canonicalize column names so:
-      "Stage2 MinorComp" -> "stage2minorcomp"
-      "Stage2_MinorComp_pred" -> "stage2minorcomppred"
-    """
-    s = str(s)
+def norm_colname(c):
+    # canonicalize for matching: keep alnum only, lower
+    s = str(c)
     s = s.strip().lower()
-    s = re.sub(r"[^a-z0-9]+", "", s)  # remove spaces, underscores, punctuation
+    s = re.sub(r"\s+", "", s)
+    s = re.sub(r"[^a-z0-9_]+", "", s)
     return s
 
-def pick_col_by_alias(df_cols, alias_list):
+def resolve_column(df_cols, candidates):
     """
-    Return first matching col by exact alias, else by canonical match.
+    Deterministic resolver:
+      1) exact match (case sensitive)
+      2) case-insensitive exact
+      3) canonical normalized match (removes spaces/punct)
     """
     cols = list(df_cols)
-    cols_set = set(cols)
-    # exact first
-    for a in alias_list:
-        if a in cols_set:
-            return a
-    # canonical
-    want_can = [canon_colname(a) for a in alias_list]
-    cols_can = {c: canon_colname(c) for c in cols}
+
+    # 1) exact
+    for want in candidates:
+        if want in cols:
+            return want
+
+    # 2) case-insensitive exact
+    cols_upper = {str(c).upper(): c for c in cols}
+    for want in candidates:
+        w = str(want).upper()
+        if w in cols_upper:
+            return cols_upper[w]
+
+    # 3) canonical normalized
+    norm_map = {}
     for c in cols:
-        if cols_can[c] in want_can:
-            return c
+        norm_map[norm_colname(c)] = c
+    for want in candidates:
+        nw = norm_colname(want)
+        if nw in norm_map:
+            return norm_map[nw]
+
     return None
 
-def parse_binary_series(series):
+def to01_series(s):
     """
-    Parse values into {0,1,NaN} with robust handling:
-      - "1", 1, "yes", "y", "true" => 1
-      - "0", 0, "no", "n", "false" => 0
-      - blank/unknown => NaN
+    Convert a series to 0/1 for scoring.
+    IMPORTANT: blanks/NA -> 0 (only used inside validation).
+    Accepts: 1/0, True/False, yes/no, y/n, performed/denied (treated as 1/0),
+             and strings containing '1' or '0'.
     """
-    out = []
-    for v in series.tolist():
-        s = norm_str(v)
-        if s == "":
-            out.append(np.nan)
-            continue
-        sl = s.lower()
-        if sl in ("1", "y", "yes", "true", "t", "pos", "positive", "present"):
-            out.append(1)
-            continue
-        if sl in ("0", "n", "no", "false", "f", "neg", "negative", "absent"):
-            out.append(0)
-            continue
-        # numeric-ish fallback
-        try:
-            fv = float(sl)
-            if fv == 1.0:
-                out.append(1)
-            elif fv == 0.0:
-                out.append(0)
-            else:
-                out.append(np.nan)
-        except Exception:
-            out.append(np.nan)
-    return pd.Series(out, index=series.index)
+    if s is None:
+        return pd.Series([], dtype="int64")
 
-def safe_div(num, den):
-    try:
-        num = float(num)
-        den = float(den)
-        if den == 0.0:
-            return ""
-        return num / den
-    except Exception:
+    def _one(x):
+        if x is None:
+            return 0
+        if isinstance(x, float) and pd.isna(x):
+            return 0
+        # keep ints/bools
+        if isinstance(x, (int, bool)):
+            return 1 if int(x) == 1 else 0
+        # strings
+        t = str(x).strip().lower()
+        if t == "" or t in ("nan", "none", "null", "na", "n/a", ".", "-", "--"):
+            return 0
+        if t in ("1", "true", "t", "yes", "y", "positive", "pos", "performed", "present"):
+            return 1
+        if t in ("0", "false", "f", "no", "n", "negative", "neg", "denied", "absent"):
+            return 0
+        # last resort: if it contains a standalone 1/0
+        if re.search(r"(^|[^0-9])1([^0-9]|$)", t):
+            return 1
+        if re.search(r"(^|[^0-9])0([^0-9]|$)", t):
+            return 0
+        # otherwise unknown -> 0 (conservative for prediction validation)
+        return 0
+
+    return s.map(_one).astype(int)
+
+def confusion_counts(gold01, pred01):
+    tp = int(((gold01 == 1) & (pred01 == 1)).sum())
+    fp = int(((gold01 == 0) & (pred01 == 1)).sum())
+    fn = int(((gold01 == 1) & (pred01 == 0)).sum())
+    tn = int(((gold01 == 0) & (pred01 == 0)).sum())
+    return tp, fp, fn, tn
+
+def safe_div(n, d):
+    if d is None or d == 0:
         return ""
+    return float(n) / float(d)
+
 
 # -------------------------
 # Main
 # -------------------------
-
-print("\n=== VALIDATION: Stage2 (FULL COHORT VS GOLD; blank-as-zero on GOLD stage2 outcomes) ===")
+print("\n=== VALIDATION: STAGE 2 (FULL COHORT vs GOLD via bridge) ===")
 print("GOLD  :", GOLD_CSV)
 print("COHORT:", COHORT_CSV)
 print("BRIDGE:", BRIDGE_CSV)
 
-if not os.path.exists(GOLD_CSV):
-    raise RuntimeError("Missing GOLD_CSV: {}".format(GOLD_CSV))
-if not os.path.exists(COHORT_CSV):
-    raise RuntimeError("Missing COHORT_CSV: {}".format(COHORT_CSV))
-if not os.path.exists(BRIDGE_CSV):
-    raise RuntimeError("Missing BRIDGE_CSV: {}".format(BRIDGE_CSV))
+for p in (GOLD_CSV, COHORT_CSV, BRIDGE_CSV):
+    if not os.path.exists(p):
+        raise RuntimeError("Missing input file: {}".format(p))
 
 gold = read_csv_safe(GOLD_CSV)
-coh  = read_csv_safe(COHORT_CSV)
-br   = read_csv_safe(BRIDGE_CSV)
+cohort = read_csv_safe(COHORT_CSV)
+bridge = read_csv_safe(BRIDGE_CSV)
 
-# Detect key columns
-gold_mrn_col = pick_col_by_alias(gold.columns, ["MRN"])
-coh_pid_col  = pick_col_by_alias(coh.columns,  ["patient_id", "PATIENT_ID"])
-br_pid_col   = pick_col_by_alias(br.columns,   ["patient_id", "PATIENT_ID"])
-br_mrn_col   = pick_col_by_alias(br.columns,   ["MRN"])
-
-if gold_mrn_col is None:
-    raise RuntimeError("Could not find GOLD MRN column.")
-if coh_pid_col is None:
-    raise RuntimeError("Could not find COHORT patient_id column.")
-if br_pid_col is None or br_mrn_col is None:
-    raise RuntimeError("Could not find BRIDGE patient_id and MRN columns.")
+# detect key columns
+gold_mrn_col = resolve_column(gold.columns, ["MRN", "mrn"])
+bridge_pid_col = resolve_column(bridge.columns, ["patient_id", "ENCRYPTED_PAT_ID", "ENCRYPTED_PATID", "PATIENT_ID", "PAT_ID"])
+bridge_mrn_col = resolve_column(bridge.columns, ["MRN", "mrn"])
+cohort_pid_col = resolve_column(cohort.columns, ["patient_id", "ENCRYPTED_PAT_ID", "ENCRYPTED_PATID", "PATIENT_ID", "PAT_ID"])
 
 print("\nDetected columns:")
-print("  GOLD MRN col :", gold_mrn_col)
-print("  BRIDGE pid   :", br_pid_col)
-print("  BRIDGE MRN   :", br_mrn_col)
-print("  COHORT pid   :", coh_pid_col)
+print("  GOLD MRN col   :", gold_mrn_col)
+print("  BRIDGE pid col :", bridge_pid_col)
+print("  BRIDGE MRN col :", bridge_mrn_col)
+print("  COHORT pid col :", cohort_pid_col)
 
-# Normalize IDs
-gold["_MRN_"] = gold[gold_mrn_col].map(norm_str)
-coh["_PID_"]  = coh[coh_pid_col].map(norm_str)
-br["_PID_"]   = br[br_pid_col].map(norm_str)
-br["_MRN_"]   = br[br_mrn_col].map(norm_str)
+if not gold_mrn_col or not bridge_pid_col or not bridge_mrn_col or not cohort_pid_col:
+    raise RuntimeError("Could not detect required key columns (MRN/patient_id).")
 
-# Stage2_Applicable in gold
-gold_stage2_app_col = pick_col_by_alias(gold.columns, ["Stage2_Applicable", "Stage2 Applicable", "stage2_applicable"])
-if gold_stage2_app_col is None:
-    raise RuntimeError("Could not find GOLD Stage2_Applicable column.")
+# Stage2 applicable col in GOLD
+gold_stage2_app_col = resolve_column(gold.columns, GOLD_STAGE2_APPLICABLE_COL_CANDIDATES)
+if not gold_stage2_app_col:
+    raise RuntimeError("Could not find Stage2_Applicable column in GOLD. Checked: {}".format(GOLD_STAGE2_APPLICABLE_COL_CANDIDATES))
 
-# Coerce Stage2_Applicable to int-like
-gold["_S2APP_"] = pd.to_numeric(gold[gold_stage2_app_col], errors="coerce").fillna(0).astype(int)
+# normalize keys
+gold["_MRN_"] = gold[gold_mrn_col].astype(str).str.strip()
+bridge["_MRN_"] = bridge[bridge_mrn_col].astype(str).str.strip()
+bridge["_PID_"] = bridge[bridge_pid_col].astype(str).str.strip()
+cohort["_PID_"] = cohort[cohort_pid_col].astype(str).str.strip()
 
-# Filter gold to Stage2 Applicable == 1
-gold_s2 = gold[gold["_S2APP_"] == 1].copy()
+# clean empties
+gold = gold[gold["_MRN_"] != ""].copy()
+bridge = bridge[(bridge["_MRN_"] != "") & (bridge["_PID_"] != "")].copy()
+cohort = cohort[cohort["_PID_"] != ""].copy()
+
+# ambiguity checks on bridge
+pid_to_mrn_counts = bridge.groupby("_PID_")["_MRN_"].nunique()
+mrn_to_pid_counts = bridge.groupby("_MRN_")["_PID_"].nunique()
+pid_multi_mrn = int((pid_to_mrn_counts > 1).sum())
+mrn_multi_pid = int((mrn_to_pid_counts > 1).sum())
 
 print("\nCounts:")
-print("  GOLD rows:", len(gold))
-print("  GOLD Stage2_Applicable==1:", int((gold['_S2APP_'] == 1).sum()))
-print("  COHORT rows:", len(coh))
-print("  COHORT pid nonblank:", int((coh["_PID_"] != "").sum()))
-print("  BRIDGE pid nonblank:", int((br["_PID_"] != "").sum()))
-print("  BRIDGE MRN nonblank:", int((br["_MRN_"] != "").sum()))
+print("  GOLD rows                 :", int(len(gold)))
+print("  GOLD Stage2_Applicable==1 :", int((to01_series(gold[gold_stage2_app_col]) == 1).sum()))
+print("  COHORT rows               :", int(len(cohort)))
+print("  BRIDGE rows               :", int(len(bridge)))
 
-# Bridge ambiguity checks
-tmp = br[(br["_PID_"] != "") & (br["_MRN_"] != "")]
-pid_to_mrn_mult = int(tmp.groupby("_PID_")["_MRN_"].nunique().gt(1).sum())
-mrn_to_pid_mult = int(tmp.groupby("_MRN_")["_PID_"].nunique().gt(1).sum())
 print("\nBridge ambiguity checks:")
-print("  patient_id -> multiple MRNs:", pid_to_mrn_mult)
-print("  MRN -> multiple patient_ids:", mrn_to_pid_mult)
-if pid_to_mrn_mult != 0 or mrn_to_pid_mult != 0:
-    print("  WARNING: bridge is not 1:1; results may be ambiguous.")
+print("  patient_id -> multiple MRNs:", pid_multi_mrn)
+print("  MRN -> multiple patient_ids:", mrn_multi_pid)
+if pid_multi_mrn or mrn_multi_pid:
+    print("  WARNING: Bridge has ambiguity. Validation may be unreliable until resolved.")
 
-# Attach MRN onto cohort
-coh_br = coh.merge(br[["_PID_", "_MRN_"]], on="_PID_", how="left", suffixes=("", "_br"))
-coh_br = coh_br.rename(columns={"_MRN_": "MRN_from_bridge"})
+# Use a de-duplicated bridge (pick first occurrence if duplicates exist)
+bridge_dedup = bridge.drop_duplicates(subset=["_PID_"], keep="first").copy()
 
-# Join gold stage2-applicable to cohort via MRN
-joined = gold_s2.merge(coh_br, left_on="_MRN_", right_on="MRN_from_bridge", how="inner", suffixes=("_gold", "_pred"))
+# Restrict GOLD to Stage2 applicable only
+gold_app = gold[to01_series(gold[gold_stage2_app_col]) == 1].copy()
 
-print("\nJoined rows for Stage2 scoring (gold Stage2_applicable only):", len(joined))
+# Join: GOLD(MRN) -> BRIDGE(MRN->PID) -> COHORT(PID)
+j1 = gold_app.merge(bridge_dedup[["_MRN_", "_PID_"]], on="_MRN_", how="left")
+joined = j1.merge(cohort, on="_PID_", how="left", suffixes=("_gold", "_pred"))
 
-# Resolve column mapping for Stage2 vars
-def resolve_cols_for_var(varname):
-    gold_alias = GOLD_COL_ALIASES.get(varname, [varname])
-    pred_alias = PRED_COL_ALIASES.get(varname, [varname])
-    gcol = pick_col_by_alias(joined.columns, gold_alias)  # joined has gold columns directly
-    pcol = pick_col_by_alias(joined.columns, pred_alias)  # joined has cohort columns directly
-    return gcol, pcol
+# report join success
+n_gold_app = int(len(gold_app))
+n_join_pid = int(joined["_PID_"].notnull().sum())
+n_join_cohort = int(joined[cohort.columns[0]].notnull().sum())  # crude but ok
+# Better: count where we have at least one non-null cohort field (excluding _PID_)
+cohort_nonnull = int(joined.drop(columns=[c for c in joined.columns if c in ("_MRN_", "_PID_")], errors="ignore").notnull().any(axis=1).sum())
 
+print("\nJoined rows for Stage2 scoring (gold Stage2_applicable only):", int(len(joined)))
+print("  with PID linked:", int(joined["_PID_"].notnull().sum()))
+print("  with COHORT row linked (any non-null):", cohort_nonnull)
+
+# Resolve GOLD and PRED Stage2 columns deterministically
 resolved = []
-for v in ["Stage2_MinorComp","Stage2_MajorComp","Stage2_Reoperation","Stage2_Rehospitalization","Stage2_Failure","Stage2_Revision"]:
-    gcol, pcol = resolve_cols_for_var(v)
-    resolved.append((v, gcol, pcol))
+print("\nResolved Stage2 column matches (source-based, deterministic):")
+for v in STAGE2_VARS:
+    g_col = resolve_column(gold.columns, GOLD_ALIASES.get(v, [v]))
+    p_col = resolve_column(cohort.columns, PRED_ALIASES.get(v, [v]))
 
-print("\nResolved Stage2 column matches:")
-for v, gcol, pcol in resolved:
-    print("  {:<22} GOLD -> {:<30} | PRED -> {}".format(v, str(gcol), str(pcol)))
+    # Determine the actual column names inside `joined` after merges:
+    # - GOLD columns may appear as original name or "<name>_gold" depending on overlap
+    # - COHORT columns may appear as original name or "<name>_pred"
+    g_join = None
+    p_join = None
 
-# Build paired dataset for debugging + scoring
-pairs = joined[["_MRN_", "_PID_", "MRN_from_bridge"]].copy()
-pairs = pairs.rename(columns={"_MRN_": "MRN_gold", "_PID_": "patient_id_pred", "MRN_from_bridge": "MRN_pred"})
+    if g_col is not None:
+        if g_col in joined.columns:
+            g_join = g_col
+        elif (g_col + "_gold") in joined.columns:
+            g_join = g_col + "_gold"
 
-results = []
+    if p_col is not None:
+        if p_col in joined.columns:
+            p_join = p_col
+        elif (p_col + "_pred") in joined.columns:
+            p_join = p_col + "_pred"
 
-for var, gcol, pcol in resolved:
-    row = {
-        "var": var,
-        "gold_col": gcol if gcol is not None else "",
-        "pred_col": pcol if pcol is not None else "",
-        "status": "",
-        "gold_col_present": int(gcol is not None),
-        "pred_col_present": int(pcol is not None),
-        "n_applicable_overlap": int(len(joined)),
-        "n_scorable": 0,
-        "gold_missing": 0,
-        "pred_missing": 0,
-        "TP": "",
-        "FP": "",
-        "FN": "",
-        "TN": "",
-        "sensitivity": "",
-        "specificity": "",
-        "ppv": "",
-        "npv": "",
-    }
+    print("  {:<22} GOLD -> {:<28} | PRED -> {}".format(v, str(g_join), str(p_join)))
+    resolved.append((v, g_col, p_col, g_join, p_join))
 
-    if gcol is None or pcol is None:
-        row["status"] = "SKIP_missing_column"
-        results.append(row)
+# Build per-var validation
+rows = []
+pair_rows = []
+
+for (v, g_src, p_src, g_col_join, p_col_join) in resolved:
+    gold_present = 1 if (g_col_join is not None and g_col_join in joined.columns) else 0
+    pred_present = 1 if (p_col_join is not None and p_col_join in joined.columns) else 0
+
+    n_applicable_overlap = int(len(joined))  # by construction: gold Stage2_applicable only
+
+    if not gold_present or not pred_present:
+        rows.append({
+            "var": v,
+            "gold_col": g_src if g_src else "",
+            "pred_col": p_src if p_src else "",
+            "status": "SKIP_missing_column",
+            "gold_col_present": gold_present,
+            "pred_col_present": pred_present,
+            "n_applicable_overlap": n_applicable_overlap,
+            "n_scorable": 0,
+            "gold_missing": "",
+            "pred_missing": "",
+            "TP": "",
+            "FP": "",
+            "FN": "",
+            "TN": "",
+            "sensitivity": "",
+            "specificity": "",
+            "ppv": "",
+            "npv": "",
+        })
         continue
 
-    gold_raw = joined[gcol]
-    pred_raw = joined[pcol]
+    g_raw = joined[g_col_join]
+    p_raw = joined[p_col_join]
 
-    # Parse to binary
-    gold_bin = parse_binary_series(gold_raw)
-    pred_bin = parse_binary_series(pred_raw)
+    # Scorable rows: where we have a cohort row linked (PID exists in cohort merge)
+    # We consider a row scorable if PRED column exists (it will) AND PID is present AND at least one cohort field is non-null.
+    # Minimal requirement: PID exists and pred_raw notnull OR blank (we treat blank as 0), so we can score.
+    # We'll score ALL joined rows, but keep diagnostics on how many were missing in source.
+    g01 = to01_series(g_raw)  # blanks -> 0 for scoring
+    p01 = to01_series(p_raw)
 
-    # Apply blank-as-zero ONLY to GOLD stage2 outcome columns if configured
-    if TREAT_GOLD_BLANK_AS_ZERO_FOR_STAGE2_OUTCOMES:
-        gold_bin = gold_bin.fillna(0)
+    # Missing diagnostics (before conversion)
+    gold_missing = int(pd.isna(g_raw).sum()) + int((g_raw.astype(str).str.strip() == "").sum())
+    pred_missing = int(pd.isna(p_raw).sum()) + int((p_raw.astype(str).str.strip() == "").sum())
 
-    # missing counts (after parsing; gold after optional fill)
-    row["gold_missing"] = int(gold_bin.isna().sum())
-    row["pred_missing"] = int(pred_bin.isna().sum())
+    n_scorable = int(len(joined))
 
-    # scorable = both sides non-missing
-    mask = (~gold_bin.isna()) & (~pred_bin.isna())
-    n_sc = int(mask.sum())
-    row["n_scorable"] = n_sc
+    tp, fp, fn, tn = confusion_counts(g01, p01)
 
-    # Add to pairs output for debugging
-    pairs[var + "_gold"] = gold_bin
-    pairs[var + "_pred"] = pred_bin
+    sens = safe_div(tp, (tp + fn))
+    spec = safe_div(tn, (tn + fp))
+    ppv  = safe_div(tp, (tp + fp))
+    npv  = safe_div(tn, (tn + fn))
 
-    if n_sc == 0:
-        row["status"] = "SKIP_no_scorable_rows"
-        results.append(row)
-        continue
+    rows.append({
+        "var": v,
+        "gold_col": g_col_join,
+        "pred_col": p_col_join,
+        "status": "OK",
+        "gold_col_present": gold_present,
+        "pred_col_present": pred_present,
+        "n_applicable_overlap": n_applicable_overlap,
+        "n_scorable": n_scorable,
+        "gold_missing": gold_missing,
+        "pred_missing": pred_missing,
+        "TP": tp,
+        "FP": fp,
+        "FN": fn,
+        "TN": tn,
+        "sensitivity": sens,
+        "specificity": spec,
+        "ppv": ppv,
+        "npv": npv,
+    })
 
-    g = gold_bin[mask].astype(int)
-    p = pred_bin[mask].astype(int)
-
-    TP = int(((g == 1) & (p == 1)).sum())
-    FP = int(((g == 0) & (p == 1)).sum())
-    FN = int(((g == 1) & (p == 0)).sum())
-    TN = int(((g == 0) & (p == 0)).sum())
-
-    row["TP"] = TP
-    row["FP"] = FP
-    row["FN"] = FN
-    row["TN"] = TN
-
-    sens = safe_div(TP, TP + FN)
-    spec = safe_div(TN, TN + FP)
-    ppv  = safe_div(TP, TP + FP)
-    npv  = safe_div(TN, TN + FN)
-
-    row["sensitivity"] = sens if sens != "" else ""
-    row["specificity"] = spec if spec != "" else ""
-    row["ppv"] = ppv if ppv != "" else ""
-    row["npv"] = npv if npv != "" else ""
-
-    row["status"] = "OK"
-    results.append(row)
+    # Pairwise output (one row per patient in overlap, per var)
+    tmp = pd.DataFrame({
+        "MRN": joined["_MRN_"],
+        "patient_id": joined["_PID_"],
+        "var": v,
+        "gold_raw": g_raw,
+        "pred_raw": p_raw,
+        "gold_01": g01,
+        "pred_01": p01,
+    })
+    pair_rows.append(tmp)
 
 # Write outputs
-out_df = pd.DataFrame(results)
-out_df.to_csv(OUT_BY_VAR, index=False, encoding="utf-8")
-pairs.to_csv(OUT_PAIRS, index=False, encoding="utf-8")
+out_byvar = pd.DataFrame(rows)
+out_byvar.to_csv(OUT_BYVAR, index=False, encoding="utf-8")
 
-print("\nWrote:", OUT_BY_VAR)
+if pair_rows:
+    out_pairs = pd.concat(pair_rows, axis=0, ignore_index=True)
+else:
+    out_pairs = pd.DataFrame(columns=["MRN", "patient_id", "var", "gold_raw", "pred_raw", "gold_01", "pred_01"])
+out_pairs.to_csv(OUT_PAIRS, index=False, encoding="utf-8")
+
+print("\nWrote:", OUT_BYVAR)
 print("Wrote:", OUT_PAIRS)
 
-# Pretty print key lines
+# Print a compact terminal summary
 print("\n=== Stage2 validation summary (by var) ===")
 show_cols = ["var","status","n_applicable_overlap","n_scorable","TP","FP","FN","TN","sensitivity","specificity","ppv","npv"]
-try:
-    print(out_df[show_cols].to_string(index=False))
-except Exception:
-    print(out_df[show_cols].head(20))
+print(out_byvar[show_cols].to_string(index=False))
 
 print("\nDone.\n")
