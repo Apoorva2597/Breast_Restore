@@ -33,15 +33,15 @@ GOLD_MRN_COL = "MRN"
 GOLD_APPLICABLE_COL = "Stage2_Applicable"
 
 # Stage2 outcomes to validate (must exist in BOTH files to score)
-STAGE2_VARS = [
-    "Stage2_MinorComp",
-    "Stage2_MajorComp",
-    "Stage2_Reoperation",
-    "Stage2_Rehospitalization",
-    "Stage2_Failure",
-    "Stage2_Revision",
-]
-
+STAGE2_VAR_MAP = {
+    # gold_col_name           : cohort_col_name
+    "Stage2 MinorComp"        : "Stage2_MinorComp",
+    "Stage2 MajorComp"        : "Stage2_MajorComp",
+    "Stage2 Reoperation"      : "Stage2_Reoperation",
+    "Stage2 Rehospitalization": "Stage2_Rehospitalization",
+    "Stage2 Failure"          : "Stage2_Failure",
+    "Stage2 Revision"         : "Stage2_Revision",
+}
 # COHORT columns
 COHORT_PID_COL = "patient_id"  # in cohort
 BRIDGE_PID_COL = "patient_id"  # in bridge
@@ -207,7 +207,7 @@ conf_rows = []
 present_gold = set(gold.columns)
 present_cohort = set(cohort.columns)
 
-for var in STAGE2_VARS:
+for var_gold, var_pred in STAGE2_VAR_MAP.items():
     var_gold = var  # in GOLD
     var_pred = var  # in COHORT (you aligned to gold-friendly names)
 
