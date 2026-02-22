@@ -2,8 +2,8 @@
 # Python 3.6.8 compatible
 #
 # Robust Stage2 validation (FULL cohort vs GOLD) via patient_id->MRN bridge.
-# Fixes "missing column" issues caused by hidden header differences (BOM, NBSP, trailing spaces, etc.)
-#
+# Fixes NOT FOUND caused by merge suffixes (_gold/_pred) + header style differences.
+
 from __future__ import print_function
 import re
 import pandas as pd
@@ -20,8 +20,7 @@ OUT_PAIRWISE  = "stage2_validation_pairwise_rows.csv"  # row-level audit
 
 GOLD_STAGE2_APPLICABLE_COL_CANDIDATES = ["Stage2_Applicable", "Stage2 Applicable", "stage2_applicable"]
 
-# Desired mapping (logical names)
-# We will match these "targets" robustly (ignoring spaces/_/case/punct).
+# Logical Stage2 variables (gold name style, cohort name style)
 STAGE2_VAR_TARGETS = [
     ("Stage2 MinorComp",         "Stage2_MinorComp"),
     ("Stage2 MajorComp",         "Stage2_MajorComp"),
@@ -45,7 +44,6 @@ def read_csv_safe(path):
         return pd.read_csv(path, dtype=object, engine="python", encoding="latin1", errors="replace")
 
 def clean_header(s):
-    # normalize BOM, NBSP, newlines, whitespace
     s = "" if s is None else str(s)
     s = s.replace("\ufeff", "")         # BOM
     s = s.replace("\xa0", " ")          # NBSP
@@ -55,8 +53,7 @@ def clean_header(s):
     return s
 
 def canonical(s):
-    # strip to alnum only, lowercase
-    # Example: "Stage2 MinorComp" == "Stage2_MinorComp" == " stage2-minorcomp "
+    # normalize to lowercase alnum only: ignores spaces, underscores, punctuation
     s = clean_header(s).lower()
     s = re.sub(r"[^a-z0-9]+", "", s)
     return s
@@ -65,17 +62,21 @@ def norm_str(x):
     if x is None:
         return ""
     s = str(x)
+    s = s.replace("\ufeff", "")
     try:
         s = s.replace("\xa0", " ")
     except Exception:
         pass
-    s = s.replace("\ufeff", "")
     s = s.strip()
     if s.lower() in ("", "nan", "none", "null"):
         return ""
     return s
 
 def to_binary_or_missing(x):
+    """
+    Convert typical 0/1 fields to int 0/1.
+    Keep missing/blank as None (do NOT coerce to 0).
+    """
     s = norm_str(x)
     if s == "":
         return None
@@ -84,6 +85,7 @@ def to_binary_or_missing(x):
         return 1
     if sl in FALSE_TOKENS:
         return 0
+    # accept numeric-looking 0/1
     if re.match(r"^\d+(\.0+)?$", s):
         try:
             v = int(float(s))
@@ -95,14 +97,14 @@ def to_binary_or_missing(x):
 
 def pick_col_robust(cols, candidates):
     """
-    Pick a column by matching canonical forms.
+    Pick a column by canonical matching.
     """
     col_map = {canonical(c): c for c in cols}
     for want in candidates:
         w = canonical(want)
         if w in col_map:
             return col_map[w]
-    # fallback: contains (canonical substring)
+    # fallback: contains
     for want in candidates:
         w = canonical(want)
         for ck, orig in col_map.items():
@@ -110,15 +112,66 @@ def pick_col_robust(cols, candidates):
                 return orig
     return None
 
-def find_col_by_target(df_cols, target_name):
+def find_cols_by_role(df_cols, gold_name, pred_name):
     """
-    Return the actual column name in df_cols matching target_name by canonical equality.
+    In the merged/joined df, columns may be:
+      - unsuffixed (unique)
+      - suffixed due to name collision: *_gold and *_pred
+
+    Also, cohort may use:
+      - underscore style (Stage2_MinorComp)
+      - space style (Stage2 MinorComp) if you made it gold-friendly
+
+    We return (gold_col_actual, pred_col_actual).
     """
-    target_key = canonical(target_name)
-    for c in df_cols:
-        if canonical(c) == target_key:
-            return c
-    return None
+    # Candidate base names for gold/pred in both style variants
+    # Gold base: gold_name (space style) + underscore variant
+    gold_base1 = gold_name
+    gold_base2 = gold_name.replace(" ", "_")
+
+    # Pred base: pred_name (underscore style) + space variant
+    pred_base1 = pred_name
+    pred_base2 = pred_name.replace("_", " ")
+
+    # Build a canonical -> actual map
+    col_map = {canonical(c): c for c in df_cols}
+
+    def try_candidates(cands):
+        for nm in cands:
+            k = canonical(nm)
+            if k in col_map:
+                return col_map[k]
+        return None
+
+    # GOLD candidates:
+    #  - exact base name in either style
+    #  - suffixed _gold
+    gold_candidates = [
+        gold_base1, gold_base2,
+        gold_base1 + "_gold", gold_base2 + "_gold",
+        gold_base1 + " gold", gold_base2 + " gold",
+    ]
+
+    # PRED candidates:
+    #  - exact base name in either style
+    #  - suffixed _pred
+    pred_candidates = [
+        pred_base1, pred_base2,
+        pred_base1 + "_pred", pred_base2 + "_pred",
+        pred_base1 + " pred", pred_base2 + " pred",
+    ]
+
+    gold_col = try_candidates(gold_candidates)
+    pred_col = try_candidates(pred_candidates)
+
+    # Extra fallback: if both sides used the GOLD base name and suffixes were applied
+    # e.g., "Stage2 MinorComp_gold" and "Stage2 MinorComp_pred"
+    if gold_col is None:
+        gold_col = try_candidates([gold_base1 + "_gold", gold_base2 + "_gold"])
+    if pred_col is None:
+        pred_col = try_candidates([gold_base1 + "_pred", gold_base2 + "_pred"])
+
+    return gold_col, pred_col
 
 def confusion_counts(gold_bin, pred_bin):
     tp = int(((gold_bin == 1) & (pred_bin == 1)).sum())
@@ -143,7 +196,7 @@ gold = read_csv_safe(GOLD_CSV)
 cohort = read_csv_safe(COHORT_CSV)
 bridge = read_csv_safe(BRIDGE_CSV)
 
-# Clean all headers up-front (THIS is the key fix)
+# Clean headers up-front
 gold.columns = [clean_header(c) for c in gold.columns]
 cohort.columns = [clean_header(c) for c in cohort.columns]
 bridge.columns = [clean_header(c) for c in bridge.columns]
@@ -173,17 +226,17 @@ bridge["_PID_"] = bridge[bridge_pid_col].map(norm_str)
 bridge["_MRN_"] = bridge[bridge_mrn_col].map(norm_str)
 cohort["_PID_"] = cohort[cohort_pid_col].map(norm_str)
 
-# Stage2_Applicable col
+# Stage2_Applicable in GOLD
 gold_app_col = pick_col_robust(gold.columns, GOLD_STAGE2_APPLICABLE_COL_CANDIDATES)
 if not gold_app_col:
     raise RuntimeError("Could not find Stage2_Applicable column in GOLD after header cleaning.")
 gold["_Stage2_Applicable_"] = gold[gold_app_col].map(to_binary_or_missing)
 
-# Attach MRN to cohort via bridge (1 row per patient_id)
+# Attach MRN to cohort via bridge
 bridge_slim = bridge[["_PID_", "_MRN_"]].drop_duplicates()
 cohort2 = cohort.merge(bridge_slim, on="_PID_", how="left")
 
-# Filter GOLD to Stage2 applicable
+# Filter GOLD to Stage2 applicable (do NOT coerce missing to 0)
 gold_scoring = gold[(gold["_MRN_"] != "") & (gold["_Stage2_Applicable_"] == 1)].copy()
 
 # Join on MRN
@@ -196,28 +249,27 @@ print("  COHORT rows:", int(len(cohort2)))
 print("  COHORT rows with MRN linked:", int((cohort2["_MRN_"].map(norm_str) != "").sum()))
 print("  Joined rows for Stage2 scoring:", int(len(joined)))
 
-# Resolve actual column names by canonical match (critical)
-resolved_pairs = []
+# Resolve actual column names (handles suffixes + style variants)
+resolved = []
 print("\nResolved Stage2 column matches (after cleaning + canonical matching):")
-for gold_target, pred_target in STAGE2_VAR_TARGETS:
-    gold_actual = find_col_by_target(joined.columns, gold_target)
-    pred_actual = find_col_by_target(joined.columns, pred_target)
-    print("  GOLD target '{}' -> {}".format(gold_target, gold_actual if gold_actual else "(NOT FOUND)"))
-    print("  PRED target '{}' -> {}".format(pred_target, pred_actual if pred_actual else "(NOT FOUND)"))
-    resolved_pairs.append((gold_target, pred_target, gold_actual, pred_actual))
+for gold_name, pred_name in STAGE2_VAR_TARGETS:
+    gold_col, pred_col = find_cols_by_role(joined.columns, gold_name, pred_name)
+    print("  GOLD target '{}' -> {}".format(gold_name, gold_col if gold_col else "(NOT FOUND)"))
+    print("  PRED target '{}' -> {}".format(pred_name, pred_col if pred_col else "(NOT FOUND)"))
+    resolved.append((gold_name, pred_name, gold_col, pred_col))
 
 # Validate each variable
 results = []
 pair_rows = []
 
-for gold_target, pred_target, gold_col, pred_col in resolved_pairs:
+for gold_name, pred_name, gold_col, pred_col in resolved:
     gold_present = 1 if gold_col else 0
     pred_present = 1 if pred_col else 0
 
     row = {
-        "var": pred_target,
-        "gold_col": gold_target,
-        "pred_col": pred_target,
+        "var": pred_name,
+        "gold_col": gold_col if gold_col else gold_name,
+        "pred_col": pred_col if pred_col else pred_name,
         "status": "",
         "gold_col_present": gold_present,
         "pred_col_present": pred_present,
@@ -278,10 +330,10 @@ for gold_target, pred_target, gold_col, pred_col in resolved_pairs:
     tmp = tmp.rename(columns={
         "_MRN_": "MRN",
         "_PID_": "patient_id",
-        gold_col: gold_target + "_gold",
-        pred_col: pred_target + "_pred",
+        gold_col: gold_name + "_gold",
+        pred_col: pred_name + "_pred",
     })
-    tmp["var"] = pred_target
+    tmp["var"] = pred_name
     pair_rows.append(tmp)
 
 # Write outputs
