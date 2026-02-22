@@ -21,8 +21,7 @@ import pandas as pd
 # Option A (recommended): list your encounter CSVs explicitly (paths can have spaces)
 FILES = [
     "/home/apokol/my_data_Breast/HPI-11526/HPI11526 Clinic Encounters.csv", "/home/apokol/my_data_Breast/HPI-11526/HPI11526 Operation Encounters.csv", "/home/apokol/my_data_Breast/HPI-11526/HPI11526 Inpatient Encounters.csv"
-  
-]
+  ]
 
 # Option B: scan a folder for CSVs (set FOLDER, leave FILES empty)
 FOLDER = ""  # e.g. "/nfs/corenfs/CEDAR-Lab-data/Projects/eHailBreastCancer/data"
