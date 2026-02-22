@@ -18,9 +18,9 @@ import pandas as pd
 # -------------------------
 
 FILES = [
-    "/home/apokol/my_data_Breast/HPI-11526/HPI11526 Clinic Encounters.csv",
-    "/home/apokol/my_data_Breast/HPI-11526/HPI11526 Operation Encounters.csv",
-    "/home/apokol/my_data_Breast/HPI-11526/HPI11526 Inpatient Encounters.csv",
+    "/home/apokol/my_data_Breast/HPI-11526/HPI11256/HPI11526 Clinic Encounters.csv",
+    "/home/apokol/my_data_Breast/HPI-11526/HPI11256/HPI11526 Operation Encounters.csv",
+    "/home/apokol/my_data_Breast/HPI-11526/HPI11256/HPI11526 Inpatient Encounters.csv",
 ]
 
 MAX_SCAN_ROWS = 50000     # only scan first N rows per file
