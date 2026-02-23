@@ -3,13 +3,13 @@
 # Python 3.6.8 compatible
 #
 # Usage examples (YOUR real files):
-#   python export_one_patient_deid_bundle.py \
-#       --inputs \
-#         "/home/apokol/Breast_Restore/DEID_FULLTEXT_HPI11526_Clinic_Notes_CTXWIPE_v3.csv" \
-#         "/home/apokol/Breast_Restore/DEID_FULLTEXT_HPI11526_NOTES_CTXWIPE_v4.csv" \
-#         "/home/apokol/Breast_Restore/DEID_FULLTEXT_HPI11526_NOTES_CTXWIPE_v5.csv" \
-#       --patient_id "63B0526207E98425D35E7EA737AB89AA" \
-#       --out_dir "/home/apokol/Breast_Restore/PATIENT_BUNDLES"
+ # python export_one_patient_deid_bundle.py \
+       --inputs \
+         "/home/apokol/Breast_Restore/DEID_FULLTEXT_HPI11526_Clinic_Notes_CTXWIPE_v3.csv" \
+         "/home/apokol/Breast_Restore/DEID_FULLTEXT_HPI11526_NOTES_CTXWIPE_v4.csv" \
+         "/home/apokol/Breast_Restore/DEID_FULLTEXT_HPI11526_NOTES_CTXWIPE_v5.csv" \
+       --patient_id "63B0526207E98425D35E7EA737AB89AA" \
+       --out_dir "/home/apokol/Breast_Restore/PATIENT_BUNDLES"
 #
 #   python export_one_patient_deid_bundle.py \
 #       --inputs \
