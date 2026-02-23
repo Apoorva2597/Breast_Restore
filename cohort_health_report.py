@@ -188,8 +188,8 @@ def main():
                 bridge_mrns = set(bridge[bridge_mrn].map(normalize_mrn))
                 overlap = len([m for m in gold_mrns if m in bridge_mrns and m != ""])
                 print("\n--- Gold overlap via bridge ---")
-                print("Gold MRNs:", len([m for m in gold_mrns if m != \"\"]))
-                print("Bridge MRNs:", len([m for m in bridge_mrns if m != \"\"]))
+                print("Gold MRNs:", len([m for m in gold_mrns if m != ""]))
+                print("Bridge MRNs:", len([m for m in bridge_mrns if m != ""]))
                 print("Overlap (gold ∩ bridge):", overlap)
             else:
                 print("\n(Skipping gold overlap: could not detect MRN/patient_id columns.)")
