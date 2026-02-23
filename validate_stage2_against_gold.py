@@ -48,15 +48,17 @@ import pandas as pd
 # Default to "same folder as this script" so you can run from anywhere safely.
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# NOTE: filenames must match what's actually in /home/apokol/Breast_Restore
+# (Your screenshot shows: cohort_all_patient_level_final_gold_order.csv and gold_cleaned_for_cedar.csv)
 GOLD_CSV   = os.path.join(SCRIPT_DIR, "gold_cleaned_for_cedar.csv")
 COHORT_CSV = os.path.join(SCRIPT_DIR, "cohort_all_patient_level_final_gold_order.csv")
 BRIDGE_CSV = os.path.join(SCRIPT_DIR, "cohort_pid_to_mrn_from_encounters.csv")
 
-OUT_COVER  = os.path.join(SCRIPT_DIR, "stage2_validation_coverage.csv")
+OUT_COVER      = os.path.join(SCRIPT_DIR, "stage2_validation_coverage.csv")
 OUT_BYVAR_COND = os.path.join(SCRIPT_DIR, "stage2_validation_confusion_by_var_conditional.csv")
 OUT_BYVAR_MISS0 = os.path.join(SCRIPT_DIR, "stage2_validation_confusion_by_var_missing_as_zero.csv")
-OUT_PAIRS  = os.path.join(SCRIPT_DIR, "stage2_validation_pairs_stage2.csv")
-OUT_SUMMARY = os.path.join(SCRIPT_DIR, "stage2_validation_summary.txt")
+OUT_PAIRS      = os.path.join(SCRIPT_DIR, "stage2_validation_pairs_stage2.csv")
+OUT_SUMMARY    = os.path.join(SCRIPT_DIR, "stage2_validation_summary.txt")
 
 # Stage2 variables to validate (canonical names used in reports)
 STAGE2_VARS = [
@@ -99,7 +101,7 @@ COHORT_STAGE2_COVERAGE_FIELDS = [
     "stage2_date_final",
     "stage2_date",
     "Stage2_Confirmed",
-    "Stage2_confirmed_flag"
+    "Stage2_confirmed_flag",
 ]
 
 
@@ -182,10 +184,10 @@ def to01_series_allow_missing(s, missing_to_zero=False):
     """
     Convert a series to 0/1 for scoring.
 
-    missing_to_zero=False (recommended for PRED in conditional scoring):
+    missing_to_zero=False:
       - blanks/NA -> NA
 
-    missing_to_zero=True (legacy / sensitivity analysis):
+    missing_to_zero=True:
       - blanks/NA -> 0
 
     Accepts: 1/0, True/False, yes/no, y/n, positive/negative, performed/denied, present/absent.
@@ -218,11 +220,9 @@ def to01_series_allow_missing(s, missing_to_zero=False):
         return 0 if missing_to_zero else None
 
     out = s.map(_conv)
-    # Use float so we can carry None/NaN safely
     return out.astype("float64")
 
 def confusion_counts(gold01, pred01):
-    # gold01/pred01 should be integer-like 0/1 with no missing after masking
     tp = int(((gold01 == 1) & (pred01 == 1)).sum())
     fp = int(((gold01 == 0) & (pred01 == 1)).sum())
     fn = int(((gold01 == 1) & (pred01 == 0)).sum())
@@ -246,8 +246,28 @@ def pick_joined_col(joined_cols, base_col, side_suffix):
     cand = base_col + side_suffix
     if cand in joined_cols:
         return cand
-    # Sometimes pandas only suffixes when collisions happen; this handles both cases.
     return None
+
+def resolve_cols_in_joined(joined, cols_from_df, prefer_suffix):
+    """
+    Given a list of column names from an original dataframe (e.g., cohort.columns),
+    return the list of *actual* column names present in joined after merge.
+
+    prefer_suffix should be "_pred" for cohort-side, "_gold" for gold-side.
+
+    Rules:
+      - if col exists in joined, keep it
+      - else if col+prefer_suffix exists in joined, use that
+      - else skip
+    """
+    out = []
+    joined_cols = set(joined.columns)
+    for c in cols_from_df:
+        if c in joined_cols:
+            out.append(c)
+        elif (c + prefer_suffix) in joined_cols:
+            out.append(c + prefer_suffix)
+    return out
 
 
 # -------------------------
@@ -327,7 +347,7 @@ def main():
     if pid_multi_mrn or mrn_multi_pid:
         print("  WARNING: Bridge has ambiguity. Validation may be unreliable until resolved.")
 
-    # Use a de-duplicated bridge (pick first occurrence if duplicates exist)
+    # de-duplicate bridge
     bridge_dedup = bridge.drop_duplicates(subset=["_PID_"], keep="first").copy()
     bridge_mrn_dedup = bridge_dedup.drop_duplicates(subset=["_MRN_"], keep="first").copy()
 
@@ -343,9 +363,21 @@ def main():
     missing_cohort = int((joined["_merge"] == "left_only").sum())
     joined = joined.drop(columns=["_merge"])
 
-    # Coverage: cohort merge success if any cohort column besides _PID_ is non-null
+    # -------------------------
+    # Coverage: cohort merge success
+    # -------------------------
+    # IMPORTANT FIX:
+    #   After merge, overlapping column names between GOLD and COHORT can be suffixed.
+    #   So we must resolve what cohort columns are actually called inside `joined`.
     cohort_cols_excluding_pid = [c for c in cohort.columns if c not in ("_PID_",)]
-    has_any_cohort = joined[cohort_cols_excluding_pid].notnull().any(axis=1)
+    cohort_join_cols = resolve_cols_in_joined(joined, cohort_cols_excluding_pid, prefer_suffix="_pred")
+
+    if cohort_join_cols:
+        has_any_cohort = joined[cohort_join_cols].notnull().any(axis=1)
+    else:
+        # fallback: at least a PID exists
+        has_any_cohort = joined["_PID_"].notnull()
+
     n_has_cohort = int(has_any_cohort.sum())
 
     print("\nJoined rows for Stage2 scoring (gold Stage2_applicable only):", int(len(joined)))
@@ -360,7 +392,6 @@ def main():
         g_base = resolve_column(gold.columns, GOLD_ALIASES.get(v, [v]))
         p_base = resolve_column(cohort.columns, PRED_ALIASES.get(v, [v]))
 
-        # Determine the actual column names inside `joined` after merges:
         g_join = pick_joined_col(joined.columns, g_base, "_gold")
         p_join = pick_joined_col(joined.columns, p_base, "_pred")
 
@@ -447,11 +478,9 @@ def main():
         g_raw = joined[g_col_join]
         p_raw = joined[p_col_join]
 
-        # Raw missing diagnostics
         gold_missing = int(g_raw.map(is_blank).sum())
         pred_missing = int(p_raw.map(is_blank).sum())
 
-        # Conditional scoring mask: only score when pred is nonblank AND cohort row exists
         pred_has_value = (~p_raw.map(is_blank))
         mask = pred_has_value & has_any_cohort
 
@@ -473,10 +502,9 @@ def main():
             })
             continue
 
-        g01 = to01_series_allow_missing(g_raw[mask], missing_to_zero=True)   # gold blanks -> 0 (gold should be complete anyway)
-        p01 = to01_series_allow_missing(p_raw[mask], missing_to_zero=True)   # pred values exist by mask, so safe
+        g01 = to01_series_allow_missing(g_raw[mask], missing_to_zero=True)
+        p01 = to01_series_allow_missing(p_raw[mask], missing_to_zero=True)
 
-        # Ensure no missing in masked vectors
         g01 = g01.fillna(0).astype(int)
         p01 = p01.fillna(0).astype(int)
 
@@ -502,7 +530,6 @@ def main():
             "sensitivity": sens, "specificity": spec, "ppv": ppv, "npv": npv
         })
 
-        # Pairwise rows (only for conditional scorable mask)
         tmp = pd.DataFrame({
             "MRN": joined.loc[mask, "_MRN_"],
             "patient_id": joined.loc[mask, "_PID_"],
@@ -517,7 +544,6 @@ def main():
     out_byvar_cond = pd.DataFrame(rows_cond)
     out_byvar_cond.to_csv(OUT_BYVAR_COND, index=False, encoding="utf-8")
 
-    # Pairwise output
     if pair_rows:
         out_pairs = pd.concat(pair_rows, axis=0, ignore_index=True)
     else:
@@ -552,7 +578,6 @@ def main():
             g_raw = joined[g_col_join]
             p_raw = joined[p_col_join]
 
-            # Score only rows that have a cohort row (but allow missing pred -> 0)
             mask = has_any_cohort
             n_scorable = int(mask.sum())
             if n_scorable == 0:
@@ -637,8 +662,7 @@ def main():
 
     print("\n=== Stage2 validation summary (conditional; by var) ===")
     show_cols = ["var", "status", "n_eval_gold_stage2_applicable", "n_scorable_conditional",
-                "TP", "FP", "FN", "TN", "sensitivity", "specificity", "ppv", "npv"]
-    # Avoid KeyError if user edits columns later
+                 "TP", "FP", "FN", "TN", "sensitivity", "specificity", "ppv", "npv"]
     show_cols = [c for c in show_cols if c in out_byvar_cond.columns]
     print(out_byvar_cond[show_cols].to_string(index=False))
 
