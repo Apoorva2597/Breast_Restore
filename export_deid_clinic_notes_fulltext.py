@@ -15,11 +15,11 @@ import re
 import argparse
 import pandas as pd
 
-DEFAULT_INPUT  = "/home/apokol/my_data_Breast/HPI-11526/HPI11256/HPI11526 Operation Notes.csv"
-DEFAULT_OUTPUT = "/home/apokol/Breast_Restore/DEID_FULLTEXT_HPI11526_NOTES_CTXWIPE_v4.csv"
-DEFAULT_QA     = "/home/apokol/Breast_Restore/DEID_QA_ctxwipe_report_v4.txt"
-DEFAULT_LEAKS  = "/home/apokol/Breast_Restore/DEID_QA_possible_name_leaks_v4.txt"
-DEFAULT_NAMES  = "/home/apokol/Breast_Restore/DEID_learned_name_list_v4.txt"
+DEFAULT_INPUT  = "/home/apokol/my_data_Breast/HPI-11526/HPI11256/HPI11526 Inpatient Notes.csv"
+DEFAULT_OUTPUT = "/home/apokol/Breast_Restore/DEID_FULLTEXT_HPI11526_NOTES_CTXWIPE_v5.csv"
+DEFAULT_QA     = "/home/apokol/Breast_Restore/DEID_QA_ctxwipe_report_v5.txt"
+DEFAULT_LEAKS  = "/home/apokol/Breast_Restore/DEID_QA_possible_name_leaks_v5.txt"
+DEFAULT_NAMES  = "/home/apokol/Breast_Restore/DEID_learned_name_list_v5.txt"
 
 DROP_SIGNATURE_BLOCK = True
 
