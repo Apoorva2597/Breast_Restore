@@ -8,13 +8,14 @@
 #   - NOTE_TYPE (if present)
 #   - NOTE_TEXT_DEID
 #
-# Removes:
-#   - MRN / IDs
-#   - dates are NOT removed (but note_date column is NOT exported)
-#   - names (patient + staff/provider) via strong cue-based patterns
+# Removes / redacts:
+#   - MRN / long numeric IDs / account numbers
 #   - phone numbers / emails / addresses
+#   - patient & staff/provider names via cue-based patterns
+#   - signature blocks (optional but recommended)
 #
-# ALSO: optionally drops signature blocks ("Electronically signed by...") onward.
+# Note: This is heuristic redaction (not a certified de-id system).
+# It is designed to remove common direct identifiers in Epic-style notes.
 
 from __future__ import print_function
 import os
@@ -25,8 +26,8 @@ INPUT_PATH  = "/home/apokol/my_data_Breast/HPI-11526/HPI11256/HPI11526 Clinic No
 OUTPUT_PATH = "/home/apokol/Breast_Restore/DEID_FULLTEXT_HPI11526_Clinic_Notes.csv"
 QA_REPORT   = "/home/apokol/Breast_Restore/DEID_QA_name_hits_sample.txt"
 
-MAX_ROWS = None            # e.g. 500 for quick test
-DROP_SIGNATURE_BLOCK = True  # Highly recommended
+MAX_ROWS = None               # set e.g. 500 for quick test
+DROP_SIGNATURE_BLOCK = True   # highly recommended
 
 
 def _safe_str(x):
@@ -37,11 +38,6 @@ def _safe_str(x):
     except Exception:
         return ""
 
-def is_blank(x):
-    if x is None:
-        return True
-    t = _safe_str(x).strip()
-    return t == "" or t.lower() in ("nan", "none", "null", "na", "n/a")
 
 def auto_detect_columns(columns):
     text_col = None
@@ -68,14 +64,16 @@ def redact_phi_strong(text):
     # Normalize newlines
     t = t.replace("\r\n", "\n").replace("\r", "\n")
 
-    # --- OPTIONAL: drop signature block onward (removes lots of names) ---
+    # ------------------------------------------------------------
+    # 0) Drop signature block onward (removes lots of trailing PHI)
+    # ------------------------------------------------------------
     if DROP_SIGNATURE_BLOCK:
-        # Common markers that begin signature / authentication metadata
         sig_markers = [
             r"(?im)^\s*electronically\s+signed\s+by\b.*$",
             r"(?im)^\s*signed\s+by\b.*$",
             r"(?im)^\s*signature\s*:\b.*$",
             r"(?im)^\s*authenticated\s+by\b.*$",
+            r"(?im)^\s*dictated\s+by\b.*$",
         ]
         for pat in sig_markers:
             m = re.search(pat, t)
@@ -83,17 +81,26 @@ def redact_phi_strong(text):
                 t = t[:m.start()].rstrip() + "\n[SIGNATURE_BLOCK_REDACTED]\n"
                 break
 
-    # Emails / phones
+    # -----------------------
+    # 1) Non-name identifiers
+    # -----------------------
+    # Emails
     t = re.sub(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", "[EMAIL]", t)
+
+    # Phones
     t = re.sub(r"\b(\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b", "[PHONE]", t)
 
-    # SSN
+    # SSN (rare but possible)
     t = re.sub(r"\b\d{3}-\d{2}-\d{4}\b", "[SSN]", t)
 
-    # Long numeric IDs (6+ digits)
+    # Long numeric IDs (6+ digits) => MRN/account/etc.
     t = re.sub(r"\b\d{6,}\b", "[ID]", t)
 
-    # Address-ish patterns (heuristic)
+    # Explicit MRN / Account / Encounter / CSN patterns
+    t = re.sub(r"(?i)\b(MRN|Medical Record Number)\s*[:#]?\s*[A-Za-z0-9\-]+\b", "MRN: [ID]", t)
+    t = re.sub(r"(?i)\b(Account|Acct|Encounter|CSN)\s*[:#]?\s*[A-Za-z0-9\-]+\b", r"\1: [ID]", t)
+
+    # Addresses (heuristic)
     t = re.sub(
         r"\b\d{1,5}\s+[A-Za-z0-9\s]+\s+(Street|St|Avenue|Ave|Road|Rd|Blvd|Lane|Ln|Drive|Dr)\b",
         "[ADDRESS]",
@@ -101,7 +108,10 @@ def redact_phi_strong(text):
         flags=re.IGNORECASE
     )
 
-    # --- Header field redaction (very common in Epic text) ---
+    # ------------------------------------------------------------
+    # 2) Header-style fields (common Epic templates)
+    #    Redact full lines like "Patient: Jane Doe"
+    # ------------------------------------------------------------
     header_fields = [
         "Patient", "Patient Name", "Name", "MRN", "DOB", "Date of Birth",
         "Sex", "Gender", "Address", "Phone", "Email",
@@ -109,46 +119,100 @@ def redact_phi_strong(text):
         "Ordering Provider", "Referring Provider",
         "Encounter", "Account", "CSN",
     ]
-    # Example: "Patient: Jane Doe"
     for fld in header_fields:
         t = re.sub(r"(?im)^\s*%s\s*:\s*.*$" % re.escape(fld), "%s: [REDACTED]" % fld, t)
 
-    # --- Strong provider/staff cue patterns ---
-    # Lastname, Firstname (often provider lists)
+    # Inline Patient: <name> patterns (not just full-line headers)
+    t = re.sub(r"(?i)\bpatient\s*name\s*:\s*[A-Za-z ,.'\-]+\b", "Patient Name: [NAME]", t)
+    t = re.sub(r"(?i)\bpatient\s*:\s*[A-Za-z ,.'\-]+\b", "Patient: [NAME]", t)
+
+    # ------------------------------------------------------------
+    # 3) Name patterns (cue-based to avoid over-redaction)
+    # ------------------------------------------------------------
+
+    # 3a) Lastname, Firstname (very common for providers)
     t = re.sub(r"\b([A-Z][a-zA-Z'\-]+),\s*([A-Z][a-zA-Z'\-]+)\b", "[NAME]", t)
 
-    # Titles (Dr, MD, RN, PA, NP etc.) followed by likely name
-    t = re.sub(r"\b(Dr|Doctor)\.?\s+[A-Z][a-zA-Z'\-]+(?:\s+[A-Z][a-zA-Z'\-]+)?\b", r"\1 [NAME]", t)
+    # 3b) Titles: Dr/Doctor + Name
+    t = re.sub(r"\b(Dr|Doctor)\.?\s+[A-Z][a-zA-Z'\-]+(?:\s+[A-Z][a-zA-Z'\-]+){0,2}\b", r"\1 [NAME]", t)
+
+    # 3c) Honorifics: Ms/Mr/Mrs/Miss + Name
+    # NOTE: you said there is a space after "Ms" then the name (e.g., "Ms Jane Doe").
+    # This pattern covers both "Ms Jane Doe" and "Ms. Jane Doe".
+    t = re.sub(
+        r"\b(Ms|Mr|Mrs|Miss)\.?\s+[A-Z][a-zA-Z'\-]+(?:\s+[A-Z][a-zA-Z'\-]+){1,2}\b",
+        r"\1 [NAME]",
+        t
+    )
+
+    # 3d) Credential formats: "Firstname Lastname, MD"
     t = re.sub(r"\b([A-Z][a-zA-Z'\-]+(?:\s+[A-Z][a-zA-Z'\-]+)?)\s*,\s*(MD|DO|RN|PA|NP|MBBS)\b", "[NAME], \\2", t)
 
-    # "Signed by/Author/Attending/Provider/PCP: First Last"
-    cue_words = [
-        "signed by", "electronically signed by", "author", "attending", "provider", "pcp",
-        "referring provider", "ordering provider", "reviewed by", "discussed with",
-        "seen by", "cc", "copied to"
-    ]
-    cue_pat = r"(?i)\b(" + "|".join([re.escape(x) for x in cue_words]) + r")\s*[:\-]\s*"
-    # Replace cue + (First Last[ Middle]?) with cue + [NAME]
-    t = re.sub(cue_pat + r"([A-Z][a-zA-Z'\-]+(?:\s+[A-Z][a-zA-Z'\-]+){1,2})\b", r"\1: [NAME]", t)
-
-    # "Dear First Last," greetings
+    # 3e) “Dear First Last,” greetings
     t = re.sub(r"(?im)^\s*dear\s+[A-Z][a-zA-Z'\-]+(?:\s+[A-Z][a-zA-Z'\-]+){1,2}\s*,", "Dear [NAME],", t)
 
-    # Family member labels sometimes include names: "Mother: Jane Doe"
-    t = re.sub(r"(?im)^\s*(mother|father|husband|wife|daughter|son|sister|brother)\s*:\s*.*$",
-               r"\1: [NAME]", t)
+    # 3f) Family member labels that often include names
+    t = re.sub(
+        r"(?im)^\s*(mother|father|husband|wife|daughter|son|sister|brother)\s*:\s*.*$",
+        r"\1: [NAME]",
+        t
+    )
+
+    # ------------------------------------------------------------
+    # 4) Cue phrases inside prose (your “pleasure of seeing Jane Doe” case)
+    # ------------------------------------------------------------
+    # Strong, narrative cues that usually precede the patient's name.
+    narrative_cues = [
+        "we had the pleasure of seeing",
+        "we had the pleasure to see",
+        "it was a pleasure seeing",
+        "it was a pleasure to see",
+        "it was a pleasure meeting",
+        "i had the pleasure of seeing",
+        "i had the pleasure to see",
+        "i saw",
+        "we saw",
+        "seen today is",
+        "today we saw",
+        "patient is",
+        "this is",
+        "met with",
+        "spoke with",
+        "spoke to",
+        "discussed with",
+    ]
+
+    for cue in narrative_cues:
+        t = re.sub(
+            r"(?i)\b(" + re.escape(cue) + r")\s+([A-Z][a-zA-Z'\-]+(?:\s+[A-Z][a-zA-Z'\-]+){1,2})\b",
+            r"\1 [NAME]",
+            t
+        )
+
+    # ------------------------------------------------------------
+    # 5) Administrative cue fields (Author/Attending/PCP/etc.) inline
+    # ------------------------------------------------------------
+    cue_words = [
+        "signed by", "electronically signed by", "author", "attending", "provider", "pcp",
+        "referring provider", "ordering provider", "reviewed by", "copied to", "cc"
+    ]
+    cue_pat = r"(?i)\b(" + "|".join([re.escape(x) for x in cue_words]) + r")\s*[:\-]\s*"
+    t = re.sub(
+        cue_pat + r"([A-Z][a-zA-Z'\-]+(?:\s+[A-Z][a-zA-Z'\-]+){1,2})\b",
+        r"\1: [NAME]",
+        t
+    )
 
     return t
 
 
-def find_remaining_name_like_hits(text, max_hits=20):
+def find_remaining_name_like_hits(text, max_hits=25):
     """
-    QA helper: find suspicious remaining "First Last" capitalized pairs.
-    This will over-fire, but it's useful to sanity check.
+    QA helper: finds suspicious remaining "First Last" capitalized pairs.
+    This will include false alarms (e.g., "Plastic Surgery"), but it's useful to spot leaks.
     """
     t = _safe_str(text)
     hits = []
-    # Two capitalized words in a row (not at sentence start only; heuristic)
     pat = re.compile(r"\b[A-Z][a-zA-Z'\-]+\s+[A-Z][a-zA-Z'\-]+\b")
     for m in pat.finditer(t):
         hits.append(m.group(0))
@@ -181,7 +245,7 @@ def main():
     qa_lines = []
     n = 0
 
-    for i, row in df.iterrows():
+    for _, row in df.iterrows():
         if MAX_ROWS is not None and n >= MAX_ROWS:
             break
 
@@ -198,8 +262,8 @@ def main():
         })
 
         # QA: sample suspicious leftover name-like hits for first few notes
-        if n < 25:
-            hits = find_remaining_name_like_hits(deid, max_hits=10)
+        if n < 30:
+            hits = find_remaining_name_like_hits(deid, max_hits=12)
             if hits:
                 qa_lines.append("ROW {} ENCRYPTED_PAT_ID={}\nHITS: {}\n".format(n, pid, hits))
 
@@ -214,7 +278,7 @@ def main():
         if qa_lines:
             f.write("\n---\n".join(qa_lines))
         else:
-            f.write("No suspicious hits found in first 25 notes.\n")
+            f.write("No suspicious hits found in first 30 notes.\n")
 
     print("Wrote:", OUTPUT_PATH)
     print("Wrote QA:", QA_REPORT)
