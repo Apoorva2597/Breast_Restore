@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-# export_deid_clinic_notes_fulltext_ctxwipe_v3.py
+# export_deid_notes_fulltext_ctxwipe_v4.py
 # Python 3.6.8 compatible
 #
-# v3 adds:
-#  - removes "Ms. ABC" / "Dr. XXX" / "Mr [REDACTED]" style remnants
-#  - defaults to ALL rows; optional --max_rows for testing
-#  - two-pass learned-name dictionary:
-#       pass1 learns candidate names, pass2 redacts them everywhere
+# v4 adds (critical for OP notes):
+#  - ALWAYS redact honorific + name (Ms/Dr/Mr + 1-3 CapWords) => [NAME]
+#  - OP note "time-out verified by name/DOB/reg number" & provider roster line removal
+#  - Safer aggressive CapCap learning: blocks common clinical CapCap phrases (Tissue Expander, Breast Cancer, etc.)
+#  - Optional --drop_dates to replace common date patterns with [DATE] for sharing
+#  - Keeps full note text (no snippets)
 
 from __future__ import print_function
 import os
@@ -14,11 +15,11 @@ import re
 import argparse
 import pandas as pd
 
-DEFAULT_INPUT  = "/home/apokol/my_data_Breast/HPI-11526/HPI11256/HPI11526 Clinic Notes.csv"
-DEFAULT_OUTPUT = "/home/apokol/Breast_Restore/DEID_FULLTEXT_HPI11526_Clinic_Notes_CTXWIPE_v3.csv"
-DEFAULT_QA     = "/home/apokol/Breast_Restore/DEID_QA_ctxwipe_report_v3.txt"
-DEFAULT_LEAKS  = "/home/apokol/Breast_Restore/DEID_QA_possible_name_leaks_v3.txt"
-DEFAULT_NAMES  = "/home/apokol/Breast_Restore/DEID_learned_name_list_v3.txt"
+DEFAULT_INPUT  = "/home/apokol/my_data_Breast/HPI-11526/HPI11256/HPI11526 Operation Notes.csv"
+DEFAULT_OUTPUT = "/home/apokol/Breast_Restore/DEID_FULLTEXT_HPI11526_NOTES_CTXWIPE_v4.csv"
+DEFAULT_QA     = "/home/apokol/Breast_Restore/DEID_QA_ctxwipe_report_v4.txt"
+DEFAULT_LEAKS  = "/home/apokol/Breast_Restore/DEID_QA_possible_name_leaks_v4.txt"
+DEFAULT_NAMES  = "/home/apokol/Breast_Restore/DEID_learned_name_list_v4.txt"
 
 DROP_SIGNATURE_BLOCK = True
 
@@ -29,6 +30,9 @@ CTX_WORDS_AFTER  = 3
 # detect standalone "First Last" everywhere
 AGGRESSIVE_PAIR_WIPE = True
 
+# ------------------------------------------------------------
+# Allowlist phrases that should NOT be treated as person names
+# ------------------------------------------------------------
 PAIR_ALLOWLIST = set([
     "Plastic Surgery",
     "Breast Clinic",
@@ -51,15 +55,29 @@ PAIR_ALLOWLIST = set([
     "Follow Up",
 ])
 
-CRED_SUFFIX = set(["md","do","phd","rn","np","pa","pac","pa-c","crna","msw","lcsw","dnp","mba","mph"])
-
-# remnants we want to fully collapse when preceded by titles (Ms. ABC)
-PLACEHOLDER_TOKENS = set([
-    "abc", "xyz", "xxx", "xxxx", "redacted", "removed", "name", "patient", "pt", "unknown"
+# ------------------------------------------------------------
+# Block common clinical CapCap pairs from being learned as names
+# (OP notes are full of these)
+# ------------------------------------------------------------
+NON_NAME_SECOND_TOKENS = set([
+    "expander", "implant", "implants", "surgery", "clinic", "anesthesia",
+    "cancer", "carcinoma", "reconstruction", "mastectomy", "biopsy",
+    "procedure", "procedures", "diagnosis", "findings", "indications",
+    "pathology", "specimen", "specimens", "drain", "drains", "incision",
+    "breast", "axilla", "node", "nodes", "therapy", "radiation", "chemo",
+    "hospital", "medicine", "service", "services", "operation", "operative",
+    "note", "notes", "report", "reports", "board", "team"
 ])
 
-HONORIFICS = ("mr", "mrs", "ms", "miss", "dr", "doctor")
+NON_NAME_FIRST_TOKENS = set([
+    "tissue", "breast", "general", "regional", "local", "post", "pre",
+    "operative", "operation", "operative", "estimated", "final", "routine",
+    "right", "left", "bilateral"
+])
 
+CRED_SUFFIX = set(["md","do","phd","rn","np","pa","pac","pa-c","crna","msw","lcsw","dnp","mba","mph"])
+
+HONORIFICS = ("mr", "mrs", "ms", "miss", "dr", "doctor")
 
 def _safe_str(x):
     if x is None:
@@ -70,6 +88,12 @@ def _safe_str(x):
         return ""
 
 def auto_detect_columns(columns):
+    """
+    Tries to detect:
+      - encrypted patient id col: contains 'encrypt'
+      - note text col: contains 'text'
+      - note type col: contains 'type'
+    """
     text_col = None
     type_col = None
     enc_id_col = None
@@ -83,20 +107,194 @@ def auto_detect_columns(columns):
             type_col = c
     return text_col, type_col, enc_id_col
 
-def is_blank(x):
-    if x is None:
+def is_cap_word(tok):
+    if not tok:
+        return False
+    if not re.match(r"^[A-Za-z][A-Za-z'\-]*$", tok):
+        return False
+    return tok[0].isupper()
+
+def looks_like_credential(tok):
+    tl = tok.lower().strip().strip(".").replace("–","-")
+    return tl in CRED_SUFFIX
+
+def tokenize_with_spans(text):
+    tokens = []
+    for m in re.finditer(r"[A-Za-z0-9][A-Za-z0-9'\-]*|[^\s]", text):
+        tokens.append((m.group(0), m.start(), m.end()))
+    return tokens
+
+def merge_ranges(ranges):
+    if not ranges:
+        return []
+    ranges = sorted(ranges, key=lambda x: (x[0], x[1]))
+    merged = [list(ranges[0])]
+    for a, b in ranges[1:]:
+        if a <= merged[-1][1] + 1:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    return [(x[0], x[1]) for x in merged]
+
+def normalize_name_string(s):
+    s = s.strip()
+    s = re.sub(r"\s+", " ", s)
+    s = s.strip(" ,.;:-")
+    return s
+
+def capcap_looks_like_clinical(a, b):
+    """
+    Blocks common OP-note CapCap pairs from being learned as names.
+    """
+    al = a.lower()
+    bl = b.lower()
+    if (al in NON_NAME_FIRST_TOKENS) or (bl in NON_NAME_SECOND_TOKENS):
         return True
-    if isinstance(x, float) and pd.isna(x):
-        return True
-    t = str(x).strip()
-    if t == "":
-        return True
-    if t.lower() in ("nan", "none", "null", "na", "n/a", ".", "-", "--"):
+    phrase = a + " " + b
+    if phrase in PAIR_ALLOWLIST:
         return True
     return False
 
-def redact_nonname_phi(t):
+def extract_candidate_names_from_tokens(tokens):
+    """
+    Returns list of name strings extracted from token patterns:
+      - Honorific + capwords
+      - Last, First
+      - First M. Last
+      - Aggressive Cap Cap (+ optional credential), with clinical blocklist
+    """
+    names = []
+    n = len(tokens)
+
+    # Honorific + 1-3 cap words (store only the name words, not honorific)
+    for i in range(n):
+        tl = tokens[i][0].lower().rstrip(".")
+        if tl in HONORIFICS:
+            parts = []
+            j = i + 1
+            cap = 0
+            while j < n and cap < 3:
+                if is_cap_word(tokens[j][0]):
+                    parts.append(tokens[j][0])
+                    cap += 1
+                    j += 1
+                else:
+                    break
+            if cap >= 1:
+                names.append(normalize_name_string(" ".join(parts)))
+
+    # Last, First (optionally middle)
+    for i in range(n - 2):
+        if is_cap_word(tokens[i][0]) and tokens[i+1][0] == "," and is_cap_word(tokens[i+2][0]):
+            parts = [tokens[i+2][0], tokens[i][0]]  # normalize to First Last
+            if i + 3 < n and is_cap_word(tokens[i+3][0]):
+                parts = [tokens[i+2][0], tokens[i+3][0], tokens[i][0]]
+            names.append(normalize_name_string(" ".join(parts)))
+
+    # First M. Last
+    for i in range(n - 2):
+        if is_cap_word(tokens[i][0]) and re.match(r"^[A-Z]\.?$", tokens[i+1][0]) and is_cap_word(tokens[i+2][0]):
+            names.append(normalize_name_string(tokens[i][0] + " " + tokens[i+2][0]))
+
+    # Aggressive Cap Cap (with clinical blocklist)
+    if AGGRESSIVE_PAIR_WIPE:
+        for i in range(n - 1):
+            a = tokens[i][0]
+            b = tokens[i+1][0]
+            if is_cap_word(a) and is_cap_word(b):
+                if capcap_looks_like_clinical(a, b):
+                    continue
+                phrase = a + " " + b
+                names.append(normalize_name_string(phrase))
+
+    # Filter obvious non-names
+    out = []
+    for nm in names:
+        if not nm:
+            continue
+        if nm in PAIR_ALLOWLIST:
+            continue
+        if len(nm.split()) < 2:
+            continue
+        if re.match(r"^[A-Z\s\-]{4,}$", nm):
+            continue
+        out.append(nm)
+
+    return out
+
+def learn_name_dictionary(df, text_col, max_rows=None):
+    seen = set()
+    total = 0
+    learned = 0
+
+    for idx, raw in enumerate(df[text_col].values):
+        if max_rows is not None and idx >= max_rows:
+            break
+        t = _safe_str(raw)
+        if not t.strip():
+            continue
+        t = t.replace("\r\n", "\n").replace("\r", "\n")
+        toks = tokenize_with_spans(t)
+        cands = extract_candidate_names_from_tokens(toks)
+        total += 1
+        for nm in cands:
+            key = nm.lower()
+            if key not in seen:
+                seen.add(key)
+                learned += 1
+
+    names = sorted(list(seen), key=lambda x: (-len(x), x))
+    return names, total, learned
+
+def build_global_name_regex(learned_names_lower):
+    patterns = []
+    for nm in learned_names_lower:
+        parts = nm.split()
+        esc_parts = [re.escape(p) for p in parts]
+        pat = r"\b" + r"\s+".join(esc_parts) + r"\b"
+        patterns.append(pat)
+        if len(patterns) >= 4000:
+            break
+    if not patterns:
+        return None
+    big = "(" + "|".join(patterns) + ")"
+    return re.compile(big, flags=re.IGNORECASE)
+
+def apply_global_name_redaction(text, name_re):
+    if name_re is None:
+        return text
+    return name_re.sub("[NAME]", text)
+
+def drop_common_opnote_verification_lines(t):
+    """
+    Remove the highest-risk OP note lines without harming clinical meaning.
+    """
+    patterns = [
+        # time-out / verification lines
+        r"(?im)^\s*(time\s*-?\s*out|timeout)\b.*$",
+        r"(?im)^\s*verified\s+by\b.*$",
+        r"(?im)^\s*verified\s+correct\s+patient\b.*$",
+        r"(?im)^\s*patient\s+was\s+verified\s+by\b.*$",
+        r"(?im)^\s*verified\s+by\s+name.*$",
+        r"(?im)^\s*verified\s+by\s+name,\s*age.*$",
+        r"(?im)^\s*verified\s+by\s+name,\s*date\s+of\s+birth.*$",
+        r"(?im)^\s*verified\s+by\s+name,\s*dob.*$",
+        r"(?im)^\s*verified\s+by\s+.*reg\s*number.*$",
+        r"(?im)^\s*verified\s+by\s+.*medical\s*record.*$",
+
+        # provider roster lines that often contain names
+        r"(?im)^\s*(attending|surgeon|assistant|resident|fellow|anesthesiologist|circulator|scrub|author|provider)\s*:\s*.*$",
+        r"(?im)^\s*(primary\s+surgeon|assistant\s+surgeon|dictated\s+by|transcribed\s+by)\s*:\s*.*$",
+    ]
+    for pat in patterns:
+        t = re.sub(pat, "[LINE_REDACTED]", t)
+    return t
+
+def redact_nonname_phi(t, drop_dates=False):
     t = t.replace("\r\n", "\n").replace("\r", "\n")
+
+    # OP note verification/provider roster lines
+    t = drop_common_opnote_verification_lines(t)
 
     if DROP_SIGNATURE_BLOCK:
         sig_markers = [
@@ -121,20 +319,28 @@ def redact_nonname_phi(t):
     # SSN
     t = re.sub(r"\b\d{3}-\d{2}-\d{4}\b", "[SSN]", t)
 
-    # Long numeric IDs (6+ digits)
-    t = re.sub(r"\b\d{6,}\b", "[ID]", t)
-
     # Explicit MRN/Account/Encounter/CSN patterns
     t = re.sub(r"(?i)\b(MRN|Medical Record Number)\s*[:#]?\s*[A-Za-z0-9\-]+\b", "MRN: [ID]", t)
     t = re.sub(r"(?i)\b(Account|Acct|Encounter|CSN)\s*[:#]?\s*[A-Za-z0-9\-]+\b", r"\1: [ID]", t)
 
-    # Addresses
+    # Long numeric IDs (6+ digits) AFTER the explicit patterns above
+    t = re.sub(r"\b\d{6,}\b", "[ID]", t)
+
+    # Addresses (simple)
     t = re.sub(
         r"\b\d{1,5}\s+[A-Za-z0-9\s]+\s+(Street|St|Avenue|Ave|Road|Rd|Blvd|Lane|Ln|Drive|Dr)\b",
         "[ADDRESS]",
         t,
         flags=re.IGNORECASE
     )
+
+    # Optional: drop dates for sharing (you asked "lets not keep note dates")
+    if drop_dates:
+        # 09/05/2019, 9/5/19, 2019-09-05
+        t = re.sub(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b", "[DATE]", t)
+        t = re.sub(r"\b\d{4}-\d{1,2}-\d{1,2}\b", "[DATE]", t)
+        # "September 5, 2019"
+        t = re.sub(r"\b(Jan|January|Feb|February|Mar|March|Apr|April|May|Jun|June|Jul|July|Aug|August|Sep|Sept|September|Oct|October|Nov|November|Dec|December)\s+\d{1,2},\s+\d{4}\b", "[DATE]", t, flags=re.IGNORECASE)
 
     # Header fields (full-line)
     header_fields = [
@@ -147,190 +353,22 @@ def redact_nonname_phi(t):
     for fld in header_fields:
         t = re.sub(r"(?im)^\s*%s\s*:\s*.*$" % re.escape(fld), "%s: [REDACTED]" % fld, t)
 
-    # Kill "Ms. ABC" / "Dr XYZ" / "Mr [REDACTED]" remnants aggressively:
-    # - title + placeholder/allcaps token -> [NAME]
-    # - title + [NAME]/[REDACTED] -> [NAME]
-    t = re.sub(
-        r"(?i)\b(Mr|Mrs|Ms|Miss|Dr|Doctor)\.?\s+(\[[A-Za-z_]+\]|[A-Z]{2,}|[A-Za-z]{2,})\b",
-        lambda m: "[NAME]" if (m.group(2).strip("[]").lower() in PLACEHOLDER_TOKENS
-                               or re.match(r"^\[[A-Za-z_]+\]$", m.group(2))
-                               or re.match(r"^[A-Z]{2,}$", m.group(2)))
-                  else m.group(0),
-        t
-    )
-
     return t
 
-def tokenize_with_spans(text):
-    tokens = []
-    for m in re.finditer(r"[A-Za-z0-9][A-Za-z0-9'\-]*|[^\s]", text):
-        tokens.append((m.group(0), m.start(), m.end()))
-    return tokens
-
-def is_cap_word(tok):
-    if not tok:
-        return False
-    if not re.match(r"^[A-Za-z][A-Za-z'\-]*$", tok):
-        return False
-    return tok[0].isupper()
-
-def looks_like_credential(tok):
-    tl = tok.lower().strip().strip(".").replace("–","-")
-    return tl in CRED_SUFFIX
-
-def merge_ranges(ranges):
-    if not ranges:
-        return []
-    ranges = sorted(ranges, key=lambda x: (x[0], x[1]))
-    merged = [list(ranges[0])]
-    for a, b in ranges[1:]:
-        if a <= merged[-1][1] + 1:
-            merged[-1][1] = max(merged[-1][1], b)
-        else:
-            merged.append([a, b])
-    return [(x[0], x[1]) for x in merged]
-
-def normalize_name_string(s):
-    s = s.strip()
-    s = re.sub(r"\s+", " ", s)
-    s = s.strip(" ,.;:-")
-    return s
-
-def extract_candidate_names_from_tokens(tokens):
+def collapse_leftover_title_patterns(t):
     """
-    Returns list of name strings extracted from token patterns:
-      - Honorific + capwords
-      - Last, First
-      - First M. Last
-      - Aggressive Cap Cap (+ optional credential)
+    Hard rule: ANY honorific + (1-3) CapWords becomes [NAME].
+    This is what prevents 'Ms. Linda Hammond' leaking.
     """
-    names = []
-    n = len(tokens)
-
-    # Honorific + 1-3 cap words
-    for i in range(n):
-        tl = tokens[i][0].lower().rstrip(".")
-        if tl in HONORIFICS:
-            parts = []
-            j = i + 1
-            cap = 0
-            while j < n and cap < 3:
-                if is_cap_word(tokens[j][0]):
-                    parts.append(tokens[j][0])
-                    cap += 1
-                    j += 1
-                else:
-                    break
-            if cap >= 1:
-                names.append(normalize_name_string(" ".join(parts)))
-
-    # Last, First (optionally middle)
-    for i in range(n - 2):
-        if is_cap_word(tokens[i][0]) and tokens[i+1][0] == "," and is_cap_word(tokens[i+2][0]):
-            parts = [tokens[i+2][0], tokens[i][0]]  # normalize to First Last
-            if i + 3 < n and is_cap_word(tokens[i+3][0]):
-                # could be middle name; keep but won't hurt
-                parts = [tokens[i+2][0], tokens[i+3][0], tokens[i][0]]
-            names.append(normalize_name_string(" ".join(parts)))
-
-    # First M. Last
-    for i in range(n - 2):
-        if is_cap_word(tokens[i][0]) and re.match(r"^[A-Z]\.?$", tokens[i+1][0]) and is_cap_word(tokens[i+2][0]):
-            parts = [tokens[i][0], tokens[i+2][0]]
-            names.append(normalize_name_string(" ".join(parts)))
-
-    # Aggressive Cap Cap
-    if AGGRESSIVE_PAIR_WIPE:
-        for i in range(n - 1):
-            a = tokens[i][0]
-            b = tokens[i+1][0]
-            if is_cap_word(a) and is_cap_word(b):
-                phrase = a + " " + b
-                if phrase in PAIR_ALLOWLIST:
-                    continue
-                names.append(normalize_name_string(phrase))
-
-    # Filter obvious non-names
-    out = []
-    for nm in names:
-        if not nm:
-            continue
-        if nm in PAIR_ALLOWLIST:
-            continue
-        # avoid single-word things
-        if len(nm.split()) < 2:
-            continue
-        # avoid all-uppercase common headers
-        if re.match(r"^[A-Z\s\-]{4,}$", nm):
-            continue
-        out.append(nm)
-
-    return out
-
-def learn_name_dictionary(df, text_col, max_rows=None):
-    """
-    Pass 1: learn candidate names from the whole corpus.
-    Returns:
-      - list of names (unique, sorted by length desc)
-    """
-    seen = set()
-    total = 0
-    learned = 0
-
-    for idx, raw in enumerate(df[text_col].values):
-        if max_rows is not None and idx >= max_rows:
-            break
-        t = _safe_str(raw)
-        if not t.strip():
-            continue
-        # minimal cleanup so tokens are reasonable
-        t = t.replace("\r\n", "\n").replace("\r", "\n")
-        toks = tokenize_with_spans(t)
-        cands = extract_candidate_names_from_tokens(toks)
-        total += 1
-        for nm in cands:
-            key = nm.lower()
-            if key not in seen:
-                seen.add(key)
-                learned += 1
-
-    # sort by length desc so longer names redact before shorter substrings
-    names = sorted(list(seen), key=lambda x: (-len(x), x))
-    return names, total, learned
-
-def build_global_name_regex(learned_names_lower):
-    """
-    Build a regex that matches any learned name as word tokens with flexible whitespace/punct.
-    We keep it conservative: match exact first/last sequences (case-insensitive).
-    """
-    patterns = []
-    for nm in learned_names_lower:
-        # nm is already lower, two+ tokens
-        parts = nm.split()
-        # allow middle initials etc between tokens? (we keep exact tokens to avoid nuking content)
-        # Build: \bFirst\s+Last\b (case-insensitive)
-        esc_parts = [re.escape(p) for p in parts]
-        pat = r"\b" + r"\s+".join(esc_parts) + r"\b"
-        patterns.append(pat)
-        if len(patterns) >= 4000:
-            # safety cap; still huge coverage
-            break
-
-    if not patterns:
-        return None
-    big = "(" + "|".join(patterns) + ")"
-    return re.compile(big, flags=re.IGNORECASE)
-
-def apply_global_name_redaction(text, name_re):
-    if name_re is None:
-        return text
-    return name_re.sub("[NAME]", text)
+    # Ms. First Last
+    t = re.sub(r"(?i)\b(Mr|Mrs|Ms|Miss|Dr|Doctor)\.?\s+([A-Z][a-zA-Z'\-]+(?:\s+[A-Z][a-zA-Z'\-]+){0,2})\b", "[NAME]", t)
+    # Surgeon: Dr. First Last -> Surgeon: [NAME]
+    t = re.sub(r"(?i)\b(Dr|Doctor)\.?\s+\[NAME\]\b", "[NAME]", t)
+    # Ms. [NAME] / Ms. [NAME_CTX_REDACTED] etc.
+    t = re.sub(r"(?i)\b(Mr|Mrs|Ms|Miss|Dr|Doctor)\.?\s+\[[A-Za-z_]+\]\b", "[NAME]", t)
+    return t
 
 def find_name_token_ranges(tokens):
-    """
-    Token-span detector used for context wipes.
-    Returns list of (i,j) token indices.
-    """
     ranges = []
     n = len(tokens)
 
@@ -362,14 +400,13 @@ def find_name_token_ranges(tokens):
         if is_cap_word(tokens[i][0]) and re.match(r"^[A-Z]\.?$", tokens[i+1][0]) and is_cap_word(tokens[i+2][0]):
             ranges.append((i, i+2))
 
-    # Aggressive: any "Cap Cap" pair (+ optional credential)
+    # Aggressive: Cap Cap pair (+ optional credential), but block clinical pairs
     if AGGRESSIVE_PAIR_WIPE:
         for i in range(n - 1):
             a = tokens[i][0]
             b = tokens[i+1][0]
             if is_cap_word(a) and is_cap_word(b):
-                phrase = a + " " + b
-                if phrase in PAIR_ALLOWLIST:
+                if capcap_looks_like_clinical(a, b):
                     continue
                 end = i + 1
                 if i + 2 < n and tokens[i+2][0] == "," and i + 3 < n and looks_like_credential(tokens[i+3][0]):
@@ -403,19 +440,6 @@ def apply_context_wipes(text, tokens, name_ranges, before_words, after_words):
         out = out[:start] + "[NAME_CTX_REDACTED]" + out[end:]
     return out, len(spans)
 
-def collapse_leftover_title_placeholders(t):
-    """
-    After all other redactions, remove lingering title+placeholder patterns again.
-    This catches cases introduced by earlier substitutions.
-    """
-    # Ms. [NAME] -> [NAME]
-    t = re.sub(r"(?i)\b(Mr|Mrs|Ms|Miss|Dr|Doctor)\.?\s+\[NAME\]\b", "[NAME]", t)
-    # Ms. [NAME_CTX_REDACTED] -> [NAME]
-    t = re.sub(r"(?i)\b(Mr|Mrs|Ms|Miss|Dr|Doctor)\.?\s+\[NAME_CTX_REDACTED\]\b", "[NAME]", t)
-    # Ms. ABC / Dr XYZ (allcaps) -> [NAME]
-    t = re.sub(r"(?i)\b(Mr|Mrs|Ms|Miss|Dr|Doctor)\.?\s+[A-Z]{2,}\b", "[NAME]", t)
-    return t
-
 def find_possible_name_leaks(text, max_hits=50):
     hits = []
     words = re.findall(r"[A-Za-z][A-Za-z'\-]*", text)
@@ -426,20 +450,22 @@ def find_possible_name_leaks(text, max_hits=50):
             phrase = a + " " + b
             if phrase in PAIR_ALLOWLIST:
                 continue
+            if capcap_looks_like_clinical(a, b):
+                continue
             hits.append(phrase)
             if len(hits) >= max_hits:
                 break
     return hits
 
-def deid_fulltext(raw_text, global_name_re):
+def deid_fulltext(raw_text, global_name_re, drop_dates=False):
     t = _safe_str(raw_text)
     if t.strip() == "":
         return "", 0
 
-    # A) non-name PHI
-    t = redact_nonname_phi(t)
+    # A) non-name PHI (+ OP note line drops)
+    t = redact_nonname_phi(t, drop_dates=drop_dates)
 
-    # B) narrative "pleasure seeing Jane Doe" style phrases
+    # B) narrative phrases
     narrative_regexes = [
         r"(?i)\bwe had the pleasure of seeing\s+([A-Z][a-zA-Z'\-]+(?:\s+[A-Z][a-zA-Z'\-]+){1,2})\b",
         r"(?i)\bit was a pleasure meeting\s+([A-Z][a-zA-Z'\-]+(?:\s+[A-Z][a-zA-Z'\-]+){1,2})\b",
@@ -449,19 +475,21 @@ def deid_fulltext(raw_text, global_name_re):
     for pat in narrative_regexes:
         t = re.sub(pat, lambda m: m.group(0).replace(m.group(1), "[NAME]"), t)
 
-    # C) global learned-name redaction (the big new feature)
+    # C) global learned-name redaction
     t = apply_global_name_redaction(t, global_name_re)
 
-    # D) token-based detection + context wipe
+    # D) ALWAYS collapse honorific+name patterns (fixes Ms. Linda Hammond)
+    t = collapse_leftover_title_patterns(t)
+
+    # E) token-based detection + context wipe
     tokens = tokenize_with_spans(t)
     name_ranges = find_name_token_ranges(tokens)
     t2, wipes = apply_context_wipes(t, tokens, name_ranges, CTX_WORDS_BEFORE, CTX_WORDS_AFTER)
 
-    # E) collapse "Ms. ABC" remnants (again, after wipes)
-    t2 = collapse_leftover_title_placeholders(t2)
+    # F) one more honorific collapse after wipes
+    t2 = collapse_leftover_title_patterns(t2)
 
     return t2, wipes
-
 
 def main():
     ap = argparse.ArgumentParser()
@@ -471,6 +499,7 @@ def main():
     ap.add_argument("--leaks", default=DEFAULT_LEAKS)
     ap.add_argument("--names_out", default=DEFAULT_NAMES)
     ap.add_argument("--max_rows", default=None, help="Optional: limit rows for quick test (e.g., 2000).")
+    ap.add_argument("--drop_dates", action="store_true", help="Replace common dates with [DATE] for sharing.")
     args = ap.parse_args()
 
     max_rows = None
@@ -499,15 +528,13 @@ def main():
     print("CTX wipe window:", CTX_WORDS_BEFORE, "before /", CTX_WORDS_AFTER, "after")
     print("AGGRESSIVE_PAIR_WIPE:", AGGRESSIVE_PAIR_WIPE)
     print("DROP_SIGNATURE_BLOCK:", DROP_SIGNATURE_BLOCK)
+    print("DROP_DATES:", bool(args.drop_dates))
     print("MAX_ROWS:", ("ALL" if max_rows is None else max_rows))
 
-    # -------------------------
     # PASS 1: learn names
-    # -------------------------
     learned_names, notes_scanned, learned_count = learn_name_dictionary(df, text_col, max_rows=max_rows)
     print("Pass1 learned name strings:", learned_count, "from notes scanned:", notes_scanned)
 
-    # Write learned names to file (safe: just strings, no note text)
     with open(args.names_out, "w") as f:
         f.write("Learned name dictionary (lowercased)\n")
         f.write("===================================\n\n")
@@ -518,18 +545,16 @@ def main():
     if global_name_re is None:
         print("WARNING: learned name regex is empty; proceeding without global-name redaction.")
 
-    # -------------------------
     # PASS 2: de-id export
-    # -------------------------
     out_rows = []
     total_wipes = 0
     notes_with_wipes = 0
     leak_examples = {}
     n_export = 0
 
-    values = df.itertuples(index=False, name=None)
     cols = list(df.columns)
     col_idx = {c: i for i, c in enumerate(cols)}
+    values = df.itertuples(index=False, name=None)
 
     for i, row in enumerate(values):
         if max_rows is not None and i >= max_rows:
@@ -539,7 +564,7 @@ def main():
         note_type = row[col_idx[type_col]] if type_col else ""
         raw = row[col_idx[text_col]]
 
-        deid, wipes = deid_fulltext(raw, global_name_re)
+        deid, wipes = deid_fulltext(raw, global_name_re, drop_dates=args.drop_dates)
         total_wipes += wipes
         if wipes > 0:
             notes_with_wipes += 1
@@ -565,7 +590,7 @@ def main():
     out.to_csv(args.output, index=False, encoding="utf-8")
 
     with open(args.qa, "w") as f:
-        f.write("CTXWIPE v3 QA report\n")
+        f.write("CTXWIPE v4 QA report\n")
         f.write("====================\n\n")
         f.write("INPUT: {}\n".format(args.input))
         f.write("OUTPUT: {}\n".format(args.output))
@@ -574,6 +599,7 @@ def main():
         f.write("CTX_WORDS_AFTER : {}\n".format(CTX_WORDS_AFTER))
         f.write("AGGRESSIVE_PAIR_WIPE: {}\n".format(AGGRESSIVE_PAIR_WIPE))
         f.write("DROP_SIGNATURE_BLOCK: {}\n".format(DROP_SIGNATURE_BLOCK))
+        f.write("DROP_DATES: {}\n".format(bool(args.drop_dates)))
         f.write("MAX_ROWS: {}\n\n".format("ALL" if max_rows is None else max_rows))
         f.write("Rows exported: {}\n".format(len(out)))
         f.write("Pass1 learned strings: {}\n".format(learned_count))
@@ -581,7 +607,7 @@ def main():
         f.write("Total wipe segments applied: {}\n".format(total_wipes))
 
     with open(args.leaks, "w") as f:
-        f.write("Possible leftover CapCap pairs after de-id (v3)\n")
+        f.write("Possible leftover CapCap pairs after de-id (v4)\n")
         f.write("==============================================\n\n")
         f.write("These are NOT guaranteed to be names.\n")
         f.write("Use to extend PAIR_ALLOWLIST or tighten rules.\n\n")
