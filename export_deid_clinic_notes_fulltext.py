@@ -1,18 +1,6 @@
 #!/usr/bin/env python3
-# export_deid_clinic_notes_fulltext_ctxwipe.py
+# export_deid_clinic_notes_fulltext_ctxwipe_v2.py
 # Python 3.6.8 compatible
-#
-# Export FULL clinic note text with strong PHI redaction and
-# an additional "context wipe" around suspected names:
-#   - remove N words before and after any suspected name-like span
-#   - replace wiped region with [NAME_CTX_REDACTED]
-#
-# Output columns:
-#   - ENCRYPTED_PAT_ID
-#   - NOTE_TYPE (if present)
-#   - NOTE_TEXT_DEID
-#
-# Writes QA report with wipe counts.
 
 from __future__ import print_function
 import os
@@ -20,19 +8,46 @@ import re
 import pandas as pd
 
 INPUT_PATH  = "/home/apokol/my_data_Breast/HPI-11526/HPI11256/HPI11526 Clinic Notes.csv"
-OUTPUT_PATH = "/home/apokol/Breast_Restore/DEID_FULLTEXT_HPI11526_Clinic_Notes_CTXWIPE.csv"
-QA_REPORT   = "/home/apokol/Breast_Restore/DEID_QA_ctxwipe_report.txt"
+OUTPUT_PATH = "/home/apokol/Breast_Restore/DEID_FULLTEXT_HPI11526_Clinic_Notes_CTXWIPE_v2.csv"
+QA_REPORT   = "/home/apokol/Breast_Restore/DEID_QA_ctxwipe_report_v2.txt"
+QA_LEAKS    = "/home/apokol/Breast_Restore/DEID_QA_possible_name_leaks_v2.txt"
 
 MAX_ROWS = None
 DROP_SIGNATURE_BLOCK = True
 
-# Context wipe window: N words before and after suspected name span
+# Wipe window around suspected names
 CTX_WORDS_BEFORE = 3
 CTX_WORDS_AFTER  = 3
 
-# If True, we also wipe around "Firstname Lastname" pairs even without cues.
-# More aggressive = safer, but may remove some non-PHI phrases like "Plastic Surgery".
-AGGRESSIVE_PAIR_WIPE = False
+# Turn ON: detect standalone "First Last" pairs anywhere
+AGGRESSIVE_PAIR_WIPE = True
+
+# Avoid wiping common clinical / org phrases that look like First Last
+# Add more as you discover false positives
+PAIR_ALLOWLIST = set([
+    "Plastic Surgery",
+    "Breast Clinic",
+    "General Surgery",
+    "Internal Medicine",
+    "Family Medicine",
+    "Radiation Oncology",
+    "Medical Oncology",
+    "Surgical Oncology",
+    "Oncology Clinic",
+    "University Hospital",
+    "Michigan Medicine",
+    "Ann Arbor",
+    "United States",
+    "Review Of",
+    "History Of",
+    "Physical Exam",
+    "Assessment Plan",
+    "Plan Of",
+    "Follow Up",
+])
+
+# Name suffixes/credentials often attached to names
+CRED_SUFFIX = set(["md","do","phd","rn","np","pa","pac","pa-c","crna","msw","lcsw","dnp","mba","mph"])
 
 
 def _safe_str(x):
@@ -47,7 +62,6 @@ def auto_detect_columns(columns):
     text_col = None
     type_col = None
     enc_id_col = None
-
     for c in columns:
         lc = c.lower()
         if enc_id_col is None and "encrypt" in lc:
@@ -56,14 +70,23 @@ def auto_detect_columns(columns):
             text_col = c
         if type_col is None and "type" in lc:
             type_col = c
-
     return text_col, type_col, enc_id_col
 
+def is_blank(x):
+    if x is None:
+        return True
+    if isinstance(x, float) and pd.isna(x):
+        return True
+    t = str(x).strip()
+    if t == "":
+        return True
+    if t.lower() in ("nan", "none", "null", "na", "n/a", ".", "-", "--"):
+        return True
+    return False
+
 def redact_nonname_phi(t):
-    # Normalize newlines
     t = t.replace("\r\n", "\n").replace("\r", "\n")
 
-    # Drop signature block onward
     if DROP_SIGNATURE_BLOCK:
         sig_markers = [
             r"(?im)^\s*electronically\s+signed\s+by\b.*$",
@@ -94,7 +117,7 @@ def redact_nonname_phi(t):
     t = re.sub(r"(?i)\b(MRN|Medical Record Number)\s*[:#]?\s*[A-Za-z0-9\-]+\b", "MRN: [ID]", t)
     t = re.sub(r"(?i)\b(Account|Acct|Encounter|CSN)\s*[:#]?\s*[A-Za-z0-9\-]+\b", r"\1: [ID]", t)
 
-    # Address-ish patterns
+    # Addresses
     t = re.sub(
         r"\b\d{1,5}\s+[A-Za-z0-9\s]+\s+(Street|St|Avenue|Ave|Road|Rd|Blvd|Lane|Ln|Drive|Dr)\b",
         "[ADDRESS]",
@@ -113,93 +136,24 @@ def redact_nonname_phi(t):
     for fld in header_fields:
         t = re.sub(r"(?im)^\s*%s\s*:\s*.*$" % re.escape(fld), "%s: [REDACTED]" % fld, t)
 
-    # Inline patient fields
-    t = re.sub(r"(?i)\bpatient\s*name\s*:\s*[A-Za-z ,.'\-]+\b", "Patient Name: [REDACTED]", t)
-    t = re.sub(r"(?i)\bpatient\s*:\s*[A-Za-z ,.'\-]+\b", "Patient: [REDACTED]", t)
-
     return t
 
 def tokenize_with_spans(text):
-    """
-    Return list of (token, start_idx, end_idx).
-    "Token" here is word-ish (letters/numbers/apostrophe/hyphen) or single punctuation.
-    """
     tokens = []
     for m in re.finditer(r"[A-Za-z0-9][A-Za-z0-9'\-]*|[^\s]", text):
         tokens.append((m.group(0), m.start(), m.end()))
     return tokens
 
-def is_capitalized_word(tok):
-    # Heuristic: "Jane" or "O'Neil" or "McDonald"
+def is_cap_word(tok):
     if not tok:
         return False
     if not re.match(r"^[A-Za-z][A-Za-z'\-]*$", tok):
         return False
     return tok[0].isupper()
 
-def find_name_token_windows(tokens):
-    """
-    Identify token index ranges [i, j] that likely represent names.
-    We keep it conservative by focusing on cue-based triggers + honorifics.
-    """
-    ranges = []
-
-    # Cue words (lowercase compare)
-    cues = set([
-        "author", "attending", "provider", "pcp", "signed", "by",
-        "cc", "copied", "to", "reviewed", "with", "seen", "met", "spoke",
-        "dear"
-    ])
-
-    # Honorifics/titles
-    honorifics = set(["mr", "mrs", "ms", "miss", "dr", "doctor"])
-
-    # Multi-word narrative cues handled at text-level with regex too,
-    # but token-level catches variations.
-    narrative_starts = set(["pleasure", "seeing", "meeting"])
-
-    n = len(tokens)
-
-    # 1) Honorific + 2-3 capitalized words
-    for i in range(n):
-        tok = tokens[i][0]
-        tl = tok.lower().rstrip(".")
-        if tl in honorifics:
-            j = i + 1
-            cap_count = 0
-            while j < n and cap_count < 3:
-                if is_capitalized_word(tokens[j][0]):
-                    cap_count += 1
-                    j += 1
-                    continue
-                break
-            if cap_count >= 1:
-                ranges.append((i, j - 1))
-
-    # 2) "Lastname, Firstname"
-    for i in range(n - 2):
-        if is_capitalized_word(tokens[i][0]) and tokens[i + 1][0] == "," and is_capitalized_word(tokens[i + 2][0]):
-            ranges.append((i, i + 2))
-
-    # 3) Cue-based "cue : First Last"
-    # look for cue then ":" or "-" then 2 capitalized words
-    for i in range(n - 4):
-        tok = tokens[i][0].lower().rstrip(".")
-        if tok in cues and tokens[i + 1][0] in (":", "-"):
-            if is_capitalized_word(tokens[i + 2][0]) and is_capitalized_word(tokens[i + 3][0]):
-                # allow optional third word
-                end = i + 3
-                if i + 4 < n and is_capitalized_word(tokens[i + 4][0]):
-                    end = i + 4
-                ranges.append((i + 2, end))
-
-    # 4) Optional aggressive: any "First Last" capitalized pair
-    if AGGRESSIVE_PAIR_WIPE:
-        for i in range(n - 1):
-            if is_capitalized_word(tokens[i][0]) and is_capitalized_word(tokens[i + 1][0]):
-                ranges.append((i, i + 1))
-
-    return ranges
+def looks_like_credential(tok):
+    tl = tok.lower().strip().strip(".").replace("–","-")
+    return tl in CRED_SUFFIX
 
 def merge_ranges(ranges):
     if not ranges:
@@ -213,65 +167,148 @@ def merge_ranges(ranges):
             merged.append([a, b])
     return [(x[0], x[1]) for x in merged]
 
-def apply_context_wipes(text, tokens, name_ranges, before_words, after_words):
+def find_name_token_ranges(tokens):
     """
-    For each suspected name token range, wipe N words before/after (by token index)
-    and replace wiped segment with [NAME_CTX_REDACTED].
-    Returns (new_text, wipes_applied_count).
+    Detect name-like token spans. Returns list of (i,j) token indices.
     """
-    if not name_ranges:
-        return text, 0
-
-    wipes = []
+    ranges = []
     n = len(tokens)
 
-    for (i, j) in name_ranges:
-        wipe_i = max(0, i - before_words)
-        wipe_j = min(n - 1, j + after_words)
-        wipes.append((wipe_i, wipe_j))
+    honorifics = set(["mr","mrs","ms","miss","dr","doctor"])
+    cues = set(["author","attending","provider","signed","by","pcp","referring","ordering"])
 
+    # 1) Honorific + 1-3 cap words
+    for i in range(n):
+        tl = tokens[i][0].lower().rstrip(".")
+        if tl in honorifics:
+            j = i + 1
+            cap = 0
+            while j < n and cap < 3:
+                if is_cap_word(tokens[j][0]):
+                    cap += 1
+                    j += 1
+                else:
+                    break
+            if cap >= 1:
+                ranges.append((i, j - 1))
+
+    # 2) "Last, First"
+    for i in range(n - 2):
+        if is_cap_word(tokens[i][0]) and tokens[i+1][0] == "," and is_cap_word(tokens[i+2][0]):
+            # maybe add middle name too
+            end = i + 2
+            if i + 3 < n and is_cap_word(tokens[i+3][0]):
+                end = i + 3
+            ranges.append((i, end))
+
+    # 3) cue ":" First Last
+    for i in range(n - 4):
+        tl = tokens[i][0].lower().rstrip(".")
+        if tl in cues and tokens[i+1][0] in (":", "-"):
+            if is_cap_word(tokens[i+2][0]) and is_cap_word(tokens[i+3][0]):
+                end = i + 3
+                if i + 4 < n and is_cap_word(tokens[i+4][0]):
+                    end = i + 4
+                ranges.append((i+2, end))
+
+    # 4) First M. Last (cap + cap initial + cap)
+    for i in range(n - 4):
+        if is_cap_word(tokens[i][0]) and re.match(r"^[A-Z]\.?$", tokens[i+1][0]) and is_cap_word(tokens[i+2][0]):
+            ranges.append((i, i+2))
+
+    # 5) Aggressive: any "Cap Cap" pair (standalone names)
+    if AGGRESSIVE_PAIR_WIPE:
+        for i in range(n - 1):
+            a = tokens[i][0]
+            b = tokens[i+1][0]
+            if is_cap_word(a) and is_cap_word(b):
+                phrase = a + " " + b
+                if phrase in PAIR_ALLOWLIST:
+                    continue
+
+                # allow "Cap Cap, MD/DO/..."
+                end = i + 1
+                if i + 2 < n and tokens[i+2][0] in (",",):
+                    if i + 3 < n and looks_like_credential(tokens[i+3][0]):
+                        end = i + 3
+                elif i + 2 < n and looks_like_credential(tokens[i+2][0]):
+                    end = i + 2
+
+                ranges.append((i, end))
+
+    return merge_ranges(ranges)
+
+def apply_context_wipes(text, tokens, name_ranges, before_words, after_words):
+    if not name_ranges:
+        return text, 0
+    n = len(tokens)
+
+    # Expand each detected name range by before/after words
+    wipes = []
+    for (i, j) in name_ranges:
+        wi = max(0, i - before_words)
+        wj = min(n - 1, j + after_words)
+        wipes.append((wi, wj))
     wipes = merge_ranges(wipes)
 
-    # Convert token wipe indices to character spans
+    # Convert to char spans
     spans = []
     for (wi, wj) in wipes:
         start = tokens[wi][1]
         end = tokens[wj][2]
         spans.append((start, end))
 
-    # Apply from end to start to preserve indices
     out = text
     for (start, end) in sorted(spans, key=lambda x: x[0], reverse=True):
         out = out[:start] + "[NAME_CTX_REDACTED]" + out[end:]
-
     return out, len(spans)
 
-def redact_phi_with_ctxwipe(text):
+def deid_fulltext(text):
     t = _safe_str(text)
     if t.strip() == "":
         return "", 0
 
-    # Step A: redact non-name PHI + some header-ish name fields
+    # A) non-name PHI
     t = redact_nonname_phi(t)
 
-    # Step B: explicit narrative regex wipes for "pleasure of seeing Jane Doe"
-    # This *directly* removes the name phrase (we still do ctxwipe too).
+    # B) explicit narrative patterns (direct name phrase)
+    # replaces the name-ish tail with [NAME]
     narrative_regexes = [
-        r"(?i)\bwe had the pleasure of seeing\s+[A-Z][a-zA-Z'\-]+(?:\s+[A-Z][a-zA-Z'\-]+){1,2}\b",
-        r"(?i)\bit was a pleasure meeting\s+[A-Z][a-zA-Z'\-]+(?:\s+[A-Z][a-zA-Z'\-]+){1,2}\b",
-        r"(?i)\bi saw\s+[A-Z][a-zA-Z'\-]+(?:\s+[A-Z][a-zA-Z'\-]+){1,2}\b",
-        r"(?i)\bwe saw\s+[A-Z][a-zA-Z'\-]+(?:\s+[A-Z][a-zA-Z'\-]+){1,2}\b",
+        r"(?i)\bwe had the pleasure of seeing\s+([A-Z][a-zA-Z'\-]+(?:\s+[A-Z][a-zA-Z'\-]+){1,2})\b",
+        r"(?i)\bit was a pleasure meeting\s+([A-Z][a-zA-Z'\-]+(?:\s+[A-Z][a-zA-Z'\-]+){1,2})\b",
+        r"(?i)\bwe saw\s+([A-Z][a-zA-Z'\-]+(?:\s+[A-Z][a-zA-Z'\-]+){1,2})\b",
+        r"(?i)\bi saw\s+([A-Z][a-zA-Z'\-]+(?:\s+[A-Z][a-zA-Z'\-]+){1,2})\b",
     ]
     for pat in narrative_regexes:
-        t = re.sub(pat, lambda m: re.sub(r"\s+[A-Z][a-zA-Z'\-]+(?:\s+[A-Z][a-zA-Z'\-]+){1,2}\b", " [NAME]", m.group(0)), t)
+        t = re.sub(pat, lambda m: m.group(0).replace(m.group(1), "[NAME]"), t)
 
-    # Step C: context wipe around suspected names
+    # C) token-based name detection + context wipe
     tokens = tokenize_with_spans(t)
-    name_ranges = find_name_token_windows(tokens)
-    name_ranges = merge_ranges(name_ranges)
+    name_ranges = find_name_token_ranges(tokens)
     t2, wipes = apply_context_wipes(t, tokens, name_ranges, CTX_WORDS_BEFORE, CTX_WORDS_AFTER)
 
     return t2, wipes
+
+def find_possible_name_leaks(text, max_hits=50):
+    """
+    After de-id, scan for leftover 'Cap Cap' pairs (excluding allowlist).
+    Returns list of strings.
+    """
+    hits = []
+    toks = re.findall(r"\b[A-Z][a-zA-Z'\-]+\b", text)
+    # very rough scan: look at adjacent CapWords in original word order by splitting
+    words = re.findall(r"[A-Za-z][A-Za-z'\-]*", text)
+    for i in range(len(words) - 1):
+        a = words[i]
+        b = words[i+1]
+        if is_cap_word(a) and is_cap_word(b):
+            phrase = a + " " + b
+            if phrase in PAIR_ALLOWLIST:
+                continue
+            hits.append(phrase)
+            if len(hits) >= max_hits:
+                break
+    return hits
 
 def main():
     if not os.path.exists(INPUT_PATH):
@@ -295,11 +332,12 @@ def main():
     print("DROP_SIGNATURE_BLOCK:", DROP_SIGNATURE_BLOCK)
 
     out_rows = []
-    qa_lines = []
     total_wipes = 0
     notes_with_wipes = 0
 
+    leak_examples = {}
     n = 0
+
     for _, row in df.iterrows():
         if MAX_ROWS is not None and n >= MAX_ROWS:
             break
@@ -308,10 +346,20 @@ def main():
         note_type = row.get(type_col, "") if type_col else ""
         raw = row.get(text_col, "")
 
-        deid, wipes = redact_phi_with_ctxwipe(raw)
+        deid, wipes = deid_fulltext(raw)
         total_wipes += wipes
         if wipes > 0:
             notes_with_wipes += 1
+
+        # collect leak hits for QA (no context)
+        leaks = find_possible_name_leaks(deid, max_hits=10)
+        if leaks:
+            leak_examples.setdefault(pid, [])
+            for x in leaks:
+                if x not in leak_examples[pid]:
+                    leak_examples[pid].append(x)
+                if len(leak_examples[pid]) >= 10:
+                    break
 
         out_rows.append({
             "ENCRYPTED_PAT_ID": pid,
@@ -319,17 +367,14 @@ def main():
             "NOTE_TEXT_DEID": deid
         })
 
-        if n < 30 and wipes > 0:
-            qa_lines.append("ROW {} PID={} wipes={}\n".format(n, pid, wipes))
-
         n += 1
 
     out = pd.DataFrame(out_rows)
     out.to_csv(OUTPUT_PATH, index=False, encoding="utf-8")
 
     with open(QA_REPORT, "w") as f:
-        f.write("Context-wipe De-ID QA report\n")
-        f.write("===========================\n\n")
+        f.write("CTXWIPE v2 QA report\n")
+        f.write("====================\n\n")
         f.write("INPUT: {}\n".format(INPUT_PATH))
         f.write("OUTPUT: {}\n\n".format(OUTPUT_PATH))
         f.write("CTX_WORDS_BEFORE: {}\n".format(CTX_WORDS_BEFORE))
@@ -338,13 +383,25 @@ def main():
         f.write("DROP_SIGNATURE_BLOCK: {}\n\n".format(DROP_SIGNATURE_BLOCK))
         f.write("Rows exported: {}\n".format(len(out)))
         f.write("Notes with wipes: {}\n".format(notes_with_wipes))
-        f.write("Total wipe segments applied: {}\n\n".format(total_wipes))
-        if qa_lines:
-            f.write("Sample (first 30 rows) wipe counts:\n")
-            f.write("".join(qa_lines))
+        f.write("Total wipe segments applied: {}\n".format(total_wipes))
+
+    # Write leak scan report (ONLY the suspected leftover pairs, no note text)
+    with open(QA_LEAKS, "w") as f:
+        f.write("Possible leftover CapCap pairs after de-id (v2)\n")
+        f.write("==============================================\n\n")
+        f.write("These are NOT guaranteed to be names (some are clinical phrases).\n")
+        f.write("Use this list to extend PAIR_ALLOWLIST or tighten rules.\n\n")
+        shown = 0
+        for pid in leak_examples:
+            f.write("ENCRYPTED_PAT_ID: {}\n".format(pid))
+            f.write("  pairs: {}\n\n".format(", ".join(leak_examples[pid][:10])))
+            shown += 1
+            if shown >= 200:
+                break
 
     print("Wrote:", OUTPUT_PATH)
     print("Wrote:", QA_REPORT)
+    print("Wrote:", QA_LEAKS)
     print("Rows exported:", len(out))
     print("Notes with wipes:", notes_with_wipes)
     print("Total wipe segments:", total_wipes)
