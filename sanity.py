@@ -1,29 +1,20 @@
-
 import pandas as pd
 
-path = "cohort_all_patient_level_final.csv"  # <-- change if your exact name differs
-df = pd.read_csv(path, dtype=str, engine="python")
-pid_col = None
-for c in df.columns:
-    if c.strip().upper() in ("ENCRYPTED_PAT_ID","ENCRYPTED_PATIENT_ID","PAT_ID","PATIENT_ID"):
-        pid_col = c
-        break
-if pid_col is None:
-    # heuristic fallback
-    for c in df.columns:
-        lc = c.lower()
-        if ("pat" in lc or "patient" in lc) and "id" in lc:
-            pid_col = c
-            break
+cohort = "/home/apokol/Breast_Restore/cohort_all_patient_level_final.csv"
+out    = "/home/apokol/Breast_Restore/MASTER__IDS_ONLY__vNEW.csv"
 
-if pid_col is None:
-    raise SystemExit("Could not detect patient id column. Columns:\n" + "\n".join(df.columns))
+df = pd.read_csv(cohort, dtype=object, engine="python", encoding="latin1", errors="replace")
 
-n_rows = len(df)
-n_unique = df[pid_col].dropna().astype(str).str.strip()
-n_unique = (n_unique[n_unique != ""]).nunique()
+# Keep only identifier-ish columns that actually exist
+keep_candidates = ["patient_id","ENCRYPTED_PAT_ID","MRN","mrn","PAT_ID","PATIENT_ID","ENCRYPTED_PATID"]
+keep = [c for c in keep_candidates if c in df.columns]
 
-print("FILE:", path)
-print("PID_COL:", pid_col)
-print("ROWS:", n_rows)
-print("UNIQUE_PATIENTS:", n_unique)
+# Guarantee patient_id exists
+assert "patient_id" in df.columns, "patient_id missing from cohort file"
+
+ids = df[keep].drop_duplicates(subset=["patient_id"], keep="first")
+ids.to_csv(out, index=False)
+
+print("Wrote:", out)
+print("Rows:", len(ids), "Unique patient_id:", ids["patient_id"].nunique())
+print("Columns kept:", keep)
