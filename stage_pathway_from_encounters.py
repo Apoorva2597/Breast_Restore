@@ -37,13 +37,19 @@ OUT_FILE = os.path.join(BREAST_RESTORE_DIR, "MASTER__STAGING_PATHWAY__vNEW.csv")
 
 
 # ----------------------------
-# CPT definitions (current best option)
+# CPT definitions (revised for implant-based Stage 2)
 # ----------------------------
 CPT_STAGE1_EXPANDER = set(["19357"])
-CPT_STAGE2_DEFINITIVE = set(["19364"])     # conservative + defensible for your dataset
+
+# Primary Stage 2 (implant pathway) — matches your screenshots (19340/19342 present)
+CPT_STAGE2_IMPLANT = set(["19340", "19342"])
+
+# Optional Stage 2 (autologous/free flap) — keep separately, not the default
+CPT_STAGE2_FLAP = set(["19364", "S2068"])
+
+# Secondary/QA flags
 CPT_REVISION = set(["19380"])
 CPT_NIPPLE = set(["19350"])
-
 
 # ----------------------------
 # Helpers
@@ -174,7 +180,18 @@ def std_cpt(x):
     # common cases: '19364', 'S2068'
     return s
 
-
+def min_dt_for_codes_after(pid, codeset, min_dt=None):
+    sub = enc[(enc["_PID_"] == pid) & (enc["CPT_CODE_STD"].isin(codeset))].copy()
+    if len(sub) == 0:
+        return pd.NaT
+    sub = sub[sub["BEST_EVENT_DT_PARSED"].notnull()]
+    if len(sub) == 0:
+        return pd.NaT
+    if min_dt is not None and pd.notnull(min_dt):
+        sub = sub[sub["BEST_EVENT_DT_PARSED"] >= min_dt]
+        if len(sub) == 0:
+            return pd.NaT
+    return sub["BEST_EVENT_DT_PARSED"].min()
 # ----------------------------
 # Main staging build
 # ----------------------------
@@ -301,12 +318,28 @@ def main():
             continue
 
         stage1_dt = min_dt_for_codes(pid, CPT_STAGE1_EXPANDER)
-        stage2_dt = min_dt_for_codes(pid, CPT_STAGE2_DEFINITIVE)
-        rev_dt = min_dt_for_codes(pid, CPT_REVISION)
-        nip_dt = min_dt_for_codes(pid, CPT_NIPPLE)
 
-        has_stage1 = pd.notnull(stage1_dt)
-        has_stage2 = pd.notnull(stage2_dt)
+# Stage 2 implant — prefer events on/after Stage1 if Stage1 exists
+stage2_implant_dt = min_dt_for_codes_after(pid, CPT_STAGE2_IMPLANT, min_dt=stage1_dt)
+
+# Optional flap dt (also enforce after Stage1 if you want it episode-aware)
+stage2_flap_dt = min_dt_for_codes_after(pid, CPT_STAGE2_FLAP, min_dt=stage1_dt)
+
+rev_dt = min_dt_for_codes(pid, CPT_REVISION)
+nip_dt = min_dt_for_codes(pid, CPT_NIPPLE)
+
+has_stage1 = pd.notnull(stage1_dt)
+
+# Define your "Stage2 definitive" as implant-based first
+has_stage2_implant = pd.notnull(stage2_implant_dt)
+has_stage2_flap = pd.notnull(stage2_flap_dt)
+
+# Choose a single Stage2 flag/date for downstream validation:
+# If your gold is implant-focused, make this implant only.
+has_stage2 = bool(has_stage2_implant)
+stage2_dt = stage2_implant_dt
+
+stage2_def_set = "implant_19340_19342"
 
         # Revision-only flag: has revision and/or nipple but no definitive stage2
         revision_only = (not has_stage2) and (pd.notnull(rev_dt) or pd.notnull(nip_dt))
@@ -317,8 +350,12 @@ def main():
             "has_expander": bool(has_stage1),
             "stage1_date": stage1_dt.strftime("%Y-%m-%d") if pd.notnull(stage1_dt) else "",
             "has_stage2_definitive": bool(has_stage2),
-            "stage2_date": stage2_dt.strftime("%Y-%m-%d") if pd.notnull(stage2_dt) else "",
-            "stage2_def_cpt_set": "19364_only",
+"stage2_date": stage2_dt.strftime("%Y-%m-%d") if pd.notnull(stage2_dt) else "",
+"stage2_def_cpt_set": stage2_def_set,
+"has_stage2_implant": bool(has_stage2_implant),
+"stage2_implant_date": stage2_implant_dt.strftime("%Y-%m-%d") if pd.notnull(stage2_implant_dt) else "",
+"has_stage2_flap": bool(has_stage2_flap),
+"stage2_flap_date": stage2_flap_dt.strftime("%Y-%m-%d") if pd.notnull(stage2_flap_dt) else "",
             "revision_only_flag": bool(revision_only),
             "first_revision_date": rev_dt.strftime("%Y-%m-%d") if pd.notnull(rev_dt) else "",
             "first_nipple_date": nip_dt.strftime("%Y-%m-%d") if pd.notnull(nip_dt) else "",
@@ -326,6 +363,8 @@ def main():
             "counts_19364": int((sub["CPT_CODE_STD"] == "19364").sum()),
             "counts_19380": int((sub["CPT_CODE_STD"] == "19380").sum()),
             "counts_19350": int((sub["CPT_CODE_STD"] == "19350").sum()),
+            "counts_19340": int((sub["CPT_CODE_STD"] == "19340").sum()),
+"counts_19342": int((sub["CPT_CODE_STD"] == "19342").sum()),
         })
 
     out = pd.DataFrame(out_rows)
