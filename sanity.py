@@ -1,27 +1,10 @@
-#!/usr/bin/env python3
-import os
-from collections import defaultdict
+import pandas as pd
 
-QA_DIR = "/home/apokol/Breast_Restore/QA_DEID_BUNDLES"
+master = pd.read_csv("MASTER__STAGING_PATHWAY__vNEW.csv", dtype=str)
+qa = pd.read_csv("qa_bundle_summary.csv", dtype=str)
 
-targets = [
-    "encounters_timeline.csv",
-    "timeline.csv",
-    "ALL_NOTES_COMBINED.txt",
-    "stage2_anchor_summary.txt",
-    "stage2_anchor_summary_v2.txt",
-]
+qa_pids = set(qa["patient_id"])
+sub = master[master["patient_id"].isin(qa_pids)]
 
-have = defaultdict(int)
-
-for pid in os.listdir(QA_DIR):
-    pdir = os.path.join(QA_DIR, pid)
-    if not os.path.isdir(pdir) or pid == "logs":
-        continue
-    for t in targets:
-        if os.path.exists(os.path.join(pdir, t)):
-            have[t] += 1
-
-print("Counts (patients with file):")
-for t in targets:
-    print("{:<28} {}".format(t, have[t]))
+print("QA Stage2 count:", sub["has_stage2_definitive"].astype(bool).sum())
+print(sub[["patient_id","has_stage2_definitive","stage2_date","counts_19364"]].head())
