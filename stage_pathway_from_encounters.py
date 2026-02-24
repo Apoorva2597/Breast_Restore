@@ -7,14 +7,10 @@
 #
 #   Stage 1 anchor: 19357 (tissue expander placement)
 #   Stage 2 (implant pathway): 19340, 19342 (implant insertion / replacement)
-#   Optional Stage 2 (flap pathway): 19364, S2068 (free flap / DIEP etc.)
+#   Stage 2 (flap pathway): 19364, S2068 (free flap / DIEP etc.)
 #
 #   Secondary/QA flags:
 #     19380 (revision), 19350 (nipple/areola reconstruction)
-#
-# Inputs (hardcoded per your paths):
-#   - Master cohort ids (patient_id only): ~/Breast_Restore/MASTER__IDS_ONLY__vNEW.csv
-#   - Encounter files: /home/apokol/my_data_Breast/HPI-11526/HPI11256/
 #
 # Output:
 #   - ~/Breast_Restore/MASTER__STAGING_PATHWAY__vNEW.csv
@@ -45,10 +41,10 @@ OUT_FILE = os.path.join(BREAST_RESTORE_DIR, "MASTER__STAGING_PATHWAY__vNEW.csv")
 # ----------------------------
 CPT_STAGE1_EXPANDER = set(["19357"])
 
-# Primary Stage 2 (implant pathway)
+# Implant pathway (primary)
 CPT_STAGE2_IMPLANT = set(["19340", "19342"])
 
-# Optional Stage 2 (autologous/free flap)
+# Flap pathway (also definitive stage2 for many patients)
 CPT_STAGE2_FLAP = set(["19364", "S2068"])
 
 # Secondary/QA flags
@@ -68,7 +64,6 @@ def _safe_str(x):
         return ""
 
 def read_csv_robust(path):
-    # Pandas on py3.6: try utf-8 then latin1
     try:
         return pd.read_csv(path, dtype=object, engine="python", encoding="utf-8")
     except Exception:
@@ -120,8 +115,6 @@ def detect_procedure_col(columns):
     return None
 
 def detect_date_cols(columns):
-    # best available per-row:
-    # OPERATION_DATE > RECONSTRUCTION_DATE > ADMIT_DATE > DISCHARGE_DATE_DT > CHECKOUT_TIME > others
     norm_map = {c: normalize_colname(c) for c in columns}
     ranked_keys = [
         "OPERATION_DATE",
@@ -193,12 +186,14 @@ def min_dt_for_codes_after(enc, pid, codeset, min_dt=None):
             return pd.NaT
     return sub["BEST_EVENT_DT_PARSED"].min()
 
+def fmt_dt(dt):
+    return dt.strftime("%Y-%m-%d") if pd.notnull(dt) else ""
+
 
 # ----------------------------
 # Main
 # ----------------------------
 def main():
-    # 1) Load master ids
     if not os.path.exists(MASTER_IDS_FILE):
         raise RuntimeError("Master IDs file not found: {}".format(MASTER_IDS_FILE))
 
@@ -209,10 +204,8 @@ def main():
 
     cohort_pids = set(master[pid_col_master].astype(str).str.strip().tolist())
     cohort_pids = set([p for p in cohort_pids if p and p.lower() not in ["nan", "none", "null"]])
-
     print("Loaded cohort pids:", len(cohort_pids))
 
-    # 2) Load encounter files and stack
     enc_files = [
         ("clinic_encounters", CLINIC_ENC),
         ("inpatient_encounters", INPATIENT_ENC),
@@ -236,7 +229,6 @@ def main():
         if cpt_col is None:
             raise RuntimeError("Could not detect CPT column in: {}".format(path))
 
-        # Filter to cohort early
         df["_PID_"] = df[pid_col].astype(str).str.strip()
         df = df[df["_PID_"].isin(cohort_pids)].copy()
 
@@ -244,7 +236,6 @@ def main():
             print("WARNING: 0 rows for cohort in", os.path.basename(path))
             continue
 
-        # Best event dt per row
         best_dt_raw = []
         best_dt_src = []
 
@@ -261,7 +252,6 @@ def main():
         df["BEST_EVENT_DT_PARSED"] = parse_dt(df["BEST_EVENT_DT_RAW"])
 
         df["CPT_CODE_STD"] = df[cpt_col].apply(std_cpt)
-
         df["SOURCE_FILE_TAG"] = tag
         df["SOURCE_FILE"] = os.path.basename(path)
 
@@ -275,7 +265,6 @@ def main():
             "BEST_EVENT_DT_RAW", "BEST_EVENT_DT_SRC", "BEST_EVENT_DT_PARSED",
             "SOURCE_FILE_TAG", "SOURCE_FILE"
         ]
-
         for extra in ["PAT_ENC_CSN_ID", "ENCOUNTER_TYPE", "DEPARTMENT", "OP_DEPARTMENT", "REASON_FOR_VISIT"]:
             if extra in df.columns:
                 keep_cols.append(extra)
@@ -291,7 +280,6 @@ def main():
 
     enc = pd.concat(all_enc, axis=0, ignore_index=True)
 
-    # 3) Stage per patient
     out_rows = []
     for pid in sorted(cohort_pids):
         sub = enc[enc["_PID_"] == pid]
@@ -322,30 +310,41 @@ def main():
             })
             continue
 
-        # Stage 1
         stage1_dt = min_dt_for_codes(enc, pid, CPT_STAGE1_EXPANDER)
 
-        # Stage 2 implant/flap constrained to be >= stage1_dt when stage1 exists
+        # Episode-aware: constrain stage2 evidence to be on/after stage1 when stage1 exists
         stage2_implant_dt = min_dt_for_codes_after(enc, pid, CPT_STAGE2_IMPLANT, min_dt=stage1_dt)
         stage2_flap_dt = min_dt_for_codes_after(enc, pid, CPT_STAGE2_FLAP, min_dt=stage1_dt)
 
-        # Secondary flags (not constrained)
         rev_dt = min_dt_for_codes(enc, pid, CPT_REVISION)
         nip_dt = min_dt_for_codes(enc, pid, CPT_NIPPLE)
 
         has_stage1 = pd.notnull(stage1_dt)
-
         has_stage2_implant = pd.notnull(stage2_implant_dt)
         has_stage2_flap = pd.notnull(stage2_flap_dt)
 
-        # Definitive stage2 for validation: implant-based
-        has_stage2 = bool(has_stage2_implant)
-        stage2_dt = stage2_implant_dt
-        stage2_def_set = "implant_19340_19342"
+        # CHANGE: definitive stage2 = implant OR flap
+        has_stage2_def = bool(has_stage2_implant or has_stage2_flap)
 
-        revision_only = (not has_stage2) and (pd.notnull(rev_dt) or pd.notnull(nip_dt))
+        # CHANGE: choose earliest stage2 date among implant/flap
+        candidate_dates = []
+        if pd.notnull(stage2_implant_dt):
+            candidate_dates.append(stage2_implant_dt)
+        if pd.notnull(stage2_flap_dt):
+            candidate_dates.append(stage2_flap_dt)
+        stage2_dt = min(candidate_dates) if candidate_dates else pd.NaT
 
-        # Source files for quick provenance
+        if has_stage2_implant and has_stage2_flap:
+            stage2_def_set = "implant_or_flap"
+        elif has_stage2_implant:
+            stage2_def_set = "implant_19340_19342"
+        elif has_stage2_flap:
+            stage2_def_set = "flap_19364_S2068"
+        else:
+            stage2_def_set = ""
+
+        revision_only = (not has_stage2_def) and (pd.notnull(rev_dt) or pd.notnull(nip_dt))
+
         src_files = sorted(list(set(sub["SOURCE_FILE"].astype(str).tolist())))
         src_files_str = "|".join([s for s in src_files if s and s.lower() != "nan"])
 
@@ -355,21 +354,21 @@ def main():
             "source_files": src_files_str,
 
             "has_expander": bool(has_stage1),
-            "stage1_date": stage1_dt.strftime("%Y-%m-%d") if pd.notnull(stage1_dt) else "",
+            "stage1_date": fmt_dt(stage1_dt),
 
-            "has_stage2_definitive": bool(has_stage2),
-            "stage2_date": stage2_dt.strftime("%Y-%m-%d") if pd.notnull(stage2_dt) else "",
+            "has_stage2_definitive": bool(has_stage2_def),
+            "stage2_date": fmt_dt(stage2_dt),
             "stage2_def_cpt_set": stage2_def_set,
 
             "has_stage2_implant": bool(has_stage2_implant),
-            "stage2_implant_date": stage2_implant_dt.strftime("%Y-%m-%d") if pd.notnull(stage2_implant_dt) else "",
+            "stage2_implant_date": fmt_dt(stage2_implant_dt),
 
             "has_stage2_flap": bool(has_stage2_flap),
-            "stage2_flap_date": stage2_flap_dt.strftime("%Y-%m-%d") if pd.notnull(stage2_flap_dt) else "",
+            "stage2_flap_date": fmt_dt(stage2_flap_dt),
 
             "revision_only_flag": bool(revision_only),
-            "first_revision_date": rev_dt.strftime("%Y-%m-%d") if pd.notnull(rev_dt) else "",
-            "first_nipple_date": nip_dt.strftime("%Y-%m-%d") if pd.notnull(nip_dt) else "",
+            "first_revision_date": fmt_dt(rev_dt),
+            "first_nipple_date": fmt_dt(nip_dt),
 
             "counts_19357": int((sub["CPT_CODE_STD"] == "19357").sum()),
             "counts_19340": int((sub["CPT_CODE_STD"] == "19340").sum()),
@@ -381,16 +380,15 @@ def main():
         })
 
     out = pd.DataFrame(out_rows)
-
-    # 4) Write output
     out.to_csv(OUT_FILE, index=False, encoding="utf-8")
+
     print("\nWROTE:", OUT_FILE)
     print("Rows:", len(out))
-    print("Stage1 present:", int(out["has_expander"].astype(bool).sum()) if "has_expander" in out.columns else "NA")
-    print("Stage2 definitive present:", int(out["has_stage2_definitive"].astype(bool).sum()) if "has_stage2_definitive" in out.columns else "NA")
-    print("Stage2 implant present:", int(out["has_stage2_implant"].astype(bool).sum()) if "has_stage2_implant" in out.columns else "NA")
-    print("Stage2 flap present:", int(out["has_stage2_flap"].astype(bool).sum()) if "has_stage2_flap" in out.columns else "NA")
-    print("Revision-only flagged:", int(out["revision_only_flag"].astype(bool).sum()) if "revision_only_flag" in out.columns else "NA")
+    print("Stage1 present:", int(out["has_expander"].astype(bool).sum()))
+    print("Stage2 definitive present:", int(out["has_stage2_definitive"].astype(bool).sum()))
+    print("Stage2 implant present:", int(out["has_stage2_implant"].astype(bool).sum()))
+    print("Stage2 flap present:", int(out["has_stage2_flap"].astype(bool).sum()))
+    print("Revision-only flagged:", int(out["revision_only_flag"].astype(bool).sum()))
 
 
 if __name__ == "__main__":
