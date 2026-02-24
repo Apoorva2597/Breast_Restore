@@ -1,32 +1,5 @@
-
 import pandas as pd
-
-cohort = "/home/apokol/Breast_Restore/cohort_all_patient_level_final_gold_order.csv"
-out    = "/home/apokol/Breast_Restore/MASTER__IDS_ONLY__vNEW.csv"
-
-# Python 3.6 compatible read
-df = pd.read_csv(cohort, dtype=object, engine="python", encoding="latin1")
-
-# Keep only identifier-like columns
-keep_candidates = [
-    "patient_id",
-    "ENCRYPTED_PAT_ID",
-    "MRN",
-    "mrn",
-    "PAT_ID",
-    "PATIENT_ID",
-    "ENCRYPTED_PATID"
-]
-
-keep = [c for c in keep_candidates if c in df.columns]
-
-assert "patient_id" in df.columns, "patient_id missing from cohort file"
-
-ids = df[keep].drop_duplicates(subset=["patient_id"], keep="first")
-
-ids.to_csv(out, index=False)
-
-print("Wrote:", out)
-print("Rows:", len(ids))
-print("Unique patient_id:", ids["patient_id"].nunique())
-print("Columns kept:", keep)
+df=pd.read_csv('/home/apokol/Breast_Restore/MASTER__STAGING_PATHWAY__vNEW.csv',dtype=str,engine='python'); 
+b=lambda s: s.fillna('').astype(str).str.strip().str.lower().isin(['true','t','1','yes','y']); 
+df['EXP']=b(df['has_expander']); df['S2']=b(df['has_stage2_definitive']); df['REV']=b(df['revision_only_flag']); 
+print(df.groupby(['S2','REV','EXP']).size().reset_index(name='patients').sort_values('patients',ascending=False).to_string(index=False))
