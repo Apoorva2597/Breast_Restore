@@ -1,20 +1,15 @@
+
 import pandas as pd
 
-path = "encounters_timeline.csv"
-df = pd.read_csv(path, dtype=str, engine="python")
+df = pd.read_csv("encounters_timeline.csv", dtype=str, engine="python")
 
-cands = [c for c in df.columns if c.strip().upper() in ("CPT_CODE","CPT","CPTCODE")]
-if not cands:
-    cands = [c for c in df.columns if "cpt" in c.lower()]
+# normalize date column
+date_col = [c for c in df.columns if "event" in c.lower() or "date" in c.lower()][0]
+cpt_col = [c for c in df.columns if "cpt" in c.lower()][0]
 
-print("Detected CPT column(s):", cands)
-cpt_col = cands[0]
+anchor_date = "6/28/2021"
 
-s = df[cpt_col].fillna("").astype(str).str.strip()
-s = s[s != ""]
+subset = df[df[date_col].str.startswith(anchor_date)]
 
-print("\nTop 10 CPT codes:")
-top = s.value_counts().head(10)
-for code, n in top.items():
-    print(f"{n:>5}  {code}")
-
+print("Rows on anchor date:")
+print(subset[[date_col, cpt_col, "PROCEDURE"]])
