@@ -112,8 +112,9 @@ def main():
     )
 
     # print summary
-    print("==== CROSSWALK COVERAGE ====")
-    mapped = int((~joined["patient_id"].isnull()) & (joined["patient_id"].astype(str).str.strip() != "")).sum()
+    print("==== CROSSWALK COVERAGE ====")pid_str = joined["patient_id"].astype(str).str.strip()
+    mapped = ((~joined["patient_id"].isnull()) & (pid_str != "") & (pid_str.str.lower() != "nan")).sum()
+    mapped = int(mapped)
     print("Gold rows:", len(joined))
     print("Gold rows mapped to patient_id:", mapped)
     print("Gold rows NOT mapped:", len(joined) - mapped)
