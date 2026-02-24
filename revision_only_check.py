@@ -49,7 +49,7 @@ def _to_bool_series(s):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--master_csv", required=True, help="Path to MASTER__STAGING_PATHWAY__vNEW.csv")
+    ap.add_argument("MASTER__STAGING_PATHWAY__vNEW.csv", required=True, help="Path to MASTER__STAGING_PATHWAY__vNEW.csv")
     args = ap.parse_args()
 
     path = args.master_csv
