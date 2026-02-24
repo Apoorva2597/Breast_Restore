@@ -73,7 +73,13 @@ def run_one(pid: str) -> int:
         "--out-dir", OUT_DIR,
         "--data-dir", DATA_DIR,
     ]
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+  
+proc = subprocess.run(
+    cmd,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    universal_newlines=True
+)
     # Stream output for logging visibility
     if proc.stdout:
         print(proc.stdout.rstrip())
