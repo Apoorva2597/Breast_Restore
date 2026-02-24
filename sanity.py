@@ -1,15 +1,20 @@
 
 import pandas as pd
+from pathlib import Path
 
-df = pd.read_csv("encounters_timeline.csv", dtype=str, engine="python")
+base = Path("PATIENT_BUNDLES")
 
-# normalize date column
-date_col = [c for c in df.columns if "event" in c.lower() or "date" in c.lower()][0]
-cpt_col = [c for c in df.columns if "cpt" in c.lower()][0]
+all_cpts = []
 
-anchor_date = "6/28/2021"
+for patient_dir in base.iterdir():
+    f = patient_dir / "encounters_timeline.csv"
+    if f.exists():
+        df = pd.read_csv(f, dtype=str, engine="python")
+        cpt_col = [c for c in df.columns if "cpt" in c.lower()][0]
+        all_cpts.extend(df[cpt_col].dropna().unique())
 
-subset = df[df[date_col].str.startswith(anchor_date)]
+unique_cpts = sorted(set([c.strip() for c in all_cpts if c.strip()]))
 
-print("Rows on anchor date:")
-print(subset[[date_col, cpt_col, "PROCEDURE"]])
+print("Unique CPT codes across cohort:")
+for c in unique_cpts:
+    print(c)
