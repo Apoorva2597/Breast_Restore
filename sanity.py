@@ -1,4 +1,3 @@
-python - <<'PY'
 import pandas as pd
 
 path = "encounters_timeline.csv"
@@ -18,4 +17,4 @@ print("\nTop 10 CPT codes:")
 top = s.value_counts().head(10)
 for code, n in top.items():
     print(f"{n:>5}  {code}")
-PY
+
