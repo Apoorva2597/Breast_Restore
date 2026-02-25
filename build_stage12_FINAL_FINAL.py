@@ -4,9 +4,9 @@
 build_stage12_FINAL_WITH_CLINIC.py (Python 3.6.8 compatible)
 
 UPDATED:
-- Now reads BOTH:
+- Now reads:
     - HPI11526 Operation Notes.csv
-    - HPI11526 Clinic Notes.csv
+    
   from ./_staging_inputs/
 - Combines rows before stage detection
 """
@@ -40,12 +40,11 @@ def _find_input_csvs():
     """
     Return list of relevant staging CSVs:
     - Operation Notes
-    - Clinic Notes
+    
     """
     files = []
     patterns = [
-        "HPI11526 Operation Notes.csv",
-        "HPI11526 Clinic Notes.csv"
+        "HPI11526 Operation Notes.csv"        
     ]
     for name in patterns:
         p = os.path.join(STAGING_DIR, name)
