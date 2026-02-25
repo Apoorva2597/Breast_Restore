@@ -24,8 +24,8 @@ What it does (high level):
 - Produces patient-level outcome flags + “best evidence” (date/source/note_id/snippet/pattern)
 
 Notes:
-- This is intentionally conservative: it does NOT infer complications from generic encounter reasons.
-- It only fires when it sees explicit complication terms in note text, plus reop/failure/revision cues.
+- Conservative: does NOT infer complications from encounter reasons.
+- Requires explicit complication/treatment language in note text (plus strong cues for reop/failure/revision).
 """
 
 from __future__ import print_function
@@ -33,7 +33,6 @@ from __future__ import print_function
 import os
 import glob
 import re
-import csv
 from datetime import datetime, timedelta
 
 import pandas as pd
@@ -53,6 +52,7 @@ def read_csv_robust(path, **kwargs):
 
 
 def normalize_cols(df):
+    # strips NBSP + whitespace
     df.columns = [str(c).replace(u"\xa0", " ").strip() for c in df.columns]
     return df
 
@@ -135,6 +135,45 @@ def pick_first_existing(df, options):
     return None
 
 
+def ensure_encpat_col(df, file_label=""):
+    """
+    Ensure a consistent ENCRYPTED_PAT_ID column exists.
+    This is the *proper* fix for your KeyError.
+    """
+    df = normalize_cols(df)
+    enc_col = pick_first_existing(df, [
+        "ENCRYPTED_PAT_ID",
+        "ENCRYPTED_PATID",
+        "ENCRYPTED_PATIENT_ID",
+        "Encrypted_Pat_ID",
+        "Encrypted_Patient_ID",
+        "encrypted_pat_id",
+        "encrypted_patient_id",
+    ])
+    if not enc_col:
+        raise ValueError(
+            "Missing encrypted patient id column in {}. Found columns: {}".format(
+                file_label if file_label else "notes file",
+                list(df.columns)
+            )
+        )
+    if enc_col != "ENCRYPTED_PAT_ID":
+        df = df.rename(columns={enc_col: "ENCRYPTED_PAT_ID"})
+    df["ENCRYPTED_PAT_ID"] = df["ENCRYPTED_PAT_ID"].map(normalize_id)
+    return df
+
+
+def ensure_note_text_col(df, file_label=""):
+    df = normalize_cols(df)
+    text_col = pick_first_existing(df, ["NOTE_TEXT", "Note_Text", "note_text", "NOTE_TEXT_DEID"])
+    if not text_col:
+        raise ValueError("Missing NOTE_TEXT column in {}. Found: {}".format(file_label, list(df.columns)))
+    if text_col != "NOTE_TEXT":
+        df = df.rename(columns={text_col: "NOTE_TEXT"})
+    df["NOTE_TEXT"] = df["NOTE_TEXT"].fillna("").map(str)
+    return df
+
+
 # -------------------------
 # File discovery
 # -------------------------
@@ -146,8 +185,7 @@ def find_latest_frozen_stage2_patient_clean(root):
     candidates = sorted(glob.glob(os.path.join(base, "*", "stage2_patient_clean.csv")))
     if not candidates:
         return None
-    # folders are timestamped; last is newest
-    return os.path.abspath(candidates[-1])
+    return os.path.abspath(candidates[-1])  # newest timestamp folder
 
 
 def find_patient_stage_summary(root):
@@ -156,9 +194,6 @@ def find_patient_stage_summary(root):
 
 
 def find_notes_files():
-    """
-    Auto-find your HPI11526 notes under ~/my_data_Breast/**.
-    """
     home = os.path.expanduser("~")
     base = os.path.join(home, "my_data_Breast")
     patterns = [
@@ -169,9 +204,8 @@ def find_notes_files():
     found = []
     for pat in patterns:
         found += glob.glob(os.path.join(base, pat), recursive=True)
-    # keep only existing files
     found = [os.path.abspath(p) for p in found if os.path.isfile(p)]
-    # de-dupe preserving order
+    # de-dupe preserve order
     seen = set()
     out = []
     for p in found:
@@ -185,7 +219,6 @@ def find_notes_files():
 # Signal dictionaries (regex)
 # -------------------------
 
-# Specific complication categories (for future expansion; currently used as evidence for Minor/Major etc.)
 COMPLICATION_PATTERNS = [
     ("hematoma", r"\bhematoma\b"),
     ("seroma", r"\bseroma\b"),
@@ -199,7 +232,6 @@ COMPLICATION_PATTERNS = [
     ("thromboembolism", r"\b(pulmonary embol(ism)?|\bpe\b|dvt|thromboembol(ism)?)\b"),
 ]
 
-# Treatment signals
 REOP_PATTERNS = [
     ("return_to_or", r"\b(return(ed)? to (the )?or|take\s*back|takeback)\b"),
     ("washout", r"\b(wash\s*out|irrigat(e|ion))\b"),
@@ -223,10 +255,9 @@ FAILURE_PATTERNS = [
 
 REVISION_PATTERNS = [
     ("revision", r"\b(revision|scar revision|dog[- ]?ear|contour deformit(y|ies)|asymmetr(y|ies)|fat graft(ing)?|lipofill(ing)?|capsulorrhaphy)\b"),
-    ("cpt_19380_hint", r"\b19380\b"),  # if CPT appears in note text
+    ("cpt_19380_hint", r"\b19380\b"),
 ]
 
-# fast combined regexes
 COMP_RX = re.compile("|".join(["({})".format(p[1]) for p in COMPLICATION_PATTERNS]))
 REOP_RX = re.compile("|".join(["({})".format(p[1]) for p in REOP_PATTERNS]))
 NONOP_RX = re.compile("|".join(["({})".format(p[1]) for p in NONOP_PATTERNS]))
@@ -255,33 +286,29 @@ def make_snippet(text, width=220):
 def load_notes_aggregated(path):
     """
     Aggregates multi-line notes into one row per NOTE_ID (when NOTE_ID exists).
-    If NOTE_ID is missing, falls back to row-level scanning.
-    Returns a DataFrame with:
+    Falls back to row-level scanning if NOTE_ID is missing.
+
+    Returns columns:
       ENCRYPTED_PAT_ID, NOTE_DATE, NOTE_ID, NOTE_TYPE, NOTE_TEXT, SOURCE_FILE
     """
-    df = normalize_cols(read_csv_robust(path, dtype=str, low_memory=False))
+    df = read_csv_robust(path, dtype=str, low_memory=False)
+    df = normalize_cols(df)
     src = os.path.basename(path)
 
-    enc_col = pick_first_existing(df, ["ENCRYPTED_PAT_ID", "ENCRYPTED_PATID", "ENCRYPTED_PATIENT_ID"])
-    if not enc_col:
-        raise ValueError("Notes file missing ENCRYPTED_PAT_ID: {}".format(path))
+    # Properly coerce id + text columns
+    df = ensure_encpat_col(df, file_label=src)
+    df = ensure_note_text_col(df, file_label=src)
 
     note_id_col = pick_first_existing(df, ["NOTE_ID", "Note_ID", "note_id"])
     note_type_col = pick_first_existing(df, ["NOTE_TYPE", "Note_Type", "note_type"])
-    text_col = pick_first_existing(df, ["NOTE_TEXT", "Note_Text", "note_text", "NOTE_TEXT_DEID"])
     dos_col = pick_first_existing(df, ["NOTE_DATE_OF_SERVICE", "NOTE_DATE", "DATE_OF_SERVICE", "SERVICE_DATE"])
     op_date_col = pick_first_existing(df, ["OPERATION_DATE", "OPER_DATE"])
 
-    # Normalize minimal columns
-    df[enc_col] = df[enc_col].map(normalize_id)
     if note_id_col:
         df[note_id_col] = df[note_id_col].map(normalize_id)
     if note_type_col:
         df[note_type_col] = df[note_type_col].fillna("").map(str)
-    if text_col:
-        df[text_col] = df[text_col].fillna("").map(str)
 
-    # Build NOTE_DATE
     def row_note_date(r):
         d = None
         if op_date_col and r.get(op_date_col):
@@ -290,56 +317,47 @@ def load_notes_aggregated(path):
             d = parse_date_any(r.get(dos_col))
         return d
 
-    if note_id_col and text_col:
-        # aggregate by NOTE_ID
-        grp_cols = [enc_col, note_id_col]
-        keep_cols = [enc_col, note_id_col]
-        if note_type_col:
-            keep_cols.append(note_type_col)
-
-        # sort by LINE if present for better concatenation
+    if note_id_col:
+        # Sort by LINE if present for better concat
         line_col = pick_first_existing(df, ["LINE", "Line", "line"])
         if line_col:
             try:
                 df[line_col] = pd.to_numeric(df[line_col], errors="coerce")
-                df = df.sort_values([enc_col, note_id_col, line_col])
+                df = df.sort_values(["ENCRYPTED_PAT_ID", note_id_col, line_col])
             except Exception:
                 pass
 
-        agg = df.groupby(grp_cols, as_index=False).agg({
-            (note_type_col if note_type_col else enc_col): "first",
-            text_col: lambda x: "\n".join([str(v) for v in x if str(v).strip() != ""])
+        agg = df.groupby(["ENCRYPTED_PAT_ID", note_id_col], as_index=False).agg({
+            (note_type_col if note_type_col else "ENCRYPTED_PAT_ID"): "first",
+            "NOTE_TEXT": lambda x: "\n".join([str(v) for v in x if str(v).strip() != ""])
         })
 
-        # rebuild columns cleanly
         out = pd.DataFrame()
-        out["ENCRYPTED_PAT_ID"] = agg[enc_col].map(normalize_id)
+        out["ENCRYPTED_PAT_ID"] = agg["ENCRYPTED_PAT_ID"].map(normalize_id)
         out["NOTE_ID"] = agg[note_id_col].map(normalize_id)
         out["NOTE_TYPE"] = agg[note_type_col] if note_type_col else ""
-        out["NOTE_TEXT"] = agg[text_col].fillna("").map(str)
+        out["NOTE_TEXT"] = agg["NOTE_TEXT"].fillna("").map(str)
 
-        # compute NOTE_DATE using earliest date among component rows
-        # (do a lightweight join for date computation)
-        tmp = df[[enc_col, note_id_col]].copy()
+        # Compute NOTE_DATE as earliest row date within the note_id
+        tmp = df[["ENCRYPTED_PAT_ID", note_id_col]].copy()
         tmp["NOTE_DATE"] = df.apply(row_note_date, axis=1)
         tmp = tmp.dropna(subset=["NOTE_DATE"])
         if len(tmp) > 0:
-            tmp2 = tmp.groupby([enc_col, note_id_col], as_index=False)["NOTE_DATE"].min()
-            tmp2.columns = [enc_col, note_id_col, "NOTE_DATE"]
-            out = out.merge(tmp2, left_on=["ENCRYPTED_PAT_ID", "NOTE_ID"], right_on=[enc_col, note_id_col], how="left")
-            out = out.drop([enc_col, note_id_col], axis=1)
+            tmp2 = tmp.groupby(["ENCRYPTED_PAT_ID", note_id_col], as_index=False)["NOTE_DATE"].min()
+            tmp2.columns = ["ENCRYPTED_PAT_ID", note_id_col, "NOTE_DATE"]
+            out = out.merge(tmp2, on=["ENCRYPTED_PAT_ID", "NOTE_ID"], how="left")
         else:
             out["NOTE_DATE"] = None
 
         out["SOURCE_FILE"] = src
         return out
 
-    # fallback: row-level
+    # Row-level fallback
     out = pd.DataFrame()
-    out["ENCRYPTED_PAT_ID"] = df[enc_col].map(normalize_id)
-    out["NOTE_ID"] = df[note_id_col].map(normalize_id) if note_id_col else ""
+    out["ENCRYPTED_PAT_ID"] = df["ENCRYPTED_PAT_ID"].map(normalize_id)
+    out["NOTE_ID"] = ""
     out["NOTE_TYPE"] = df[note_type_col] if note_type_col else ""
-    out["NOTE_TEXT"] = df[text_col].fillna("").map(str) if text_col else ""
+    out["NOTE_TEXT"] = df["NOTE_TEXT"].fillna("").map(str)
     out["NOTE_DATE"] = df.apply(row_note_date, axis=1)
     out["SOURCE_FILE"] = src
     return out
@@ -352,14 +370,12 @@ def load_notes_aggregated(path):
 def load_stage2_anchors(root):
     frozen = find_latest_frozen_stage2_patient_clean(root)
     if frozen:
-        df = normalize_cols(read_csv_robust(frozen, dtype=str, low_memory=False))
-        # expect ENCRYPTED_PAT_ID + STAGE2_DATE
-        if "ENCRYPTED_PAT_ID" not in df.columns:
-            raise ValueError("Frozen stage2_patient_clean.csv missing ENCRYPTED_PAT_ID: {}".format(frozen))
+        df = read_csv_robust(frozen, dtype=str, low_memory=False)
+        df = normalize_cols(df)
+        df = ensure_encpat_col(df, file_label=os.path.basename(frozen))
         if "STAGE2_DATE" not in df.columns:
             raise ValueError("Frozen stage2_patient_clean.csv missing STAGE2_DATE: {}".format(frozen))
-        df["ENCRYPTED_PAT_ID"] = df["ENCRYPTED_PAT_ID"].map(normalize_id)
-        df["STAGE2_DATE"] = df["STAGE2_DATE"].map(lambda x: parse_date_any(x))
+        df["STAGE2_DATE"] = df["STAGE2_DATE"].map(parse_date_any)
         df = df.dropna(subset=["STAGE2_DATE"])
         print("Using Stage2 anchors (frozen):", frozen)
         return df[["ENCRYPTED_PAT_ID", "STAGE2_DATE"]].drop_duplicates()
@@ -368,16 +384,14 @@ def load_stage2_anchors(root):
     if not summ:
         raise IOError("Could not find Stage2 anchor: frozen stage2_patient_clean.csv OR _outputs/patient_stage_summary.csv")
 
-    df = normalize_cols(read_csv_robust(summ, dtype=str, low_memory=False))
-    enc_col = pick_first_existing(df, ["ENCRYPTED_PAT_ID", "ENCRYPTED_PATID", "ENCRYPTED_PATIENT_ID"])
-    if not enc_col:
-        raise ValueError("patient_stage_summary missing ENCRYPTED_PAT_ID: {}".format(summ))
+    df = read_csv_robust(summ, dtype=str, low_memory=False)
+    df = normalize_cols(df)
+    df = ensure_encpat_col(df, file_label=os.path.basename(summ))
     if "STAGE2_DATE" not in df.columns:
         raise ValueError("patient_stage_summary missing STAGE2_DATE: {}".format(summ))
 
-    df = df.rename(columns={enc_col: "ENCRYPTED_PAT_ID"})
-    df["ENCRYPTED_PAT_ID"] = df["ENCRYPTED_PAT_ID"].map(normalize_id)
-    df["STAGE2_DATE"] = df["STAGE2_DATE"].map(lambda x: parse_date_any(x))
+    df["STAGE2_DATE"] = df["STAGE2_DATE"].map(parse_date_any)
+
     # filter to stage2 patients (HAS_STAGE2==1 if present, else STAGE2_DATE not null)
     if "HAS_STAGE2" in df.columns:
         df = df[df["HAS_STAGE2"].map(to01) == 1]
@@ -392,17 +406,16 @@ def load_stage2_anchors(root):
 
 def update_best(best, candidate):
     """
-    best: dict or None
-    candidate: dict with evidence_date (date or None), priority (int), etc.
     Preference:
       1) earlier evidence_date (if exists)
-      2) higher priority (lower int)
+      2) higher strength (lower priority)
       3) keep first otherwise
     """
     if best is None:
         return candidate
     bd = best.get("evidence_date")
     cd = candidate.get("evidence_date")
+
     if cd and bd:
         if cd < bd:
             return candidate
@@ -413,7 +426,6 @@ def update_best(best, candidate):
     elif bd and not cd:
         return best
 
-    # same date/none: compare priority
     bp = best.get("priority", 999)
     cp = candidate.get("priority", 999)
     if cp < bp:
@@ -438,13 +450,12 @@ def main():
     stage2_pids = set(anchors["ENCRYPTED_PAT_ID"].tolist())
     print("Stage2 patients (anchors):", len(stage2_pids))
 
-    # Map pid -> stage2_date
+    # Map pid -> stage2_date (keep earliest if duplicates)
     stage2_date_map = {}
     for _, r in anchors.iterrows():
         pid = r["ENCRYPTED_PAT_ID"]
         d = r["STAGE2_DATE"]
         if pid and d:
-            # keep earliest stage2 date if duplicates
             if (pid not in stage2_date_map) or (d < stage2_date_map[pid]):
                 stage2_date_map[pid] = d
 
@@ -460,7 +471,7 @@ def main():
     all_notes = []
     for nf in note_files:
         df = load_notes_aggregated(nf)
-        # keep only stage2 patients early to reduce memory
+        # filter to stage2 patients (fast)
         df = df[df["ENCRYPTED_PAT_ID"].isin(stage2_pids)]
         all_notes.append(df)
 
@@ -468,19 +479,17 @@ def main():
     if len(notes) == 0:
         raise IOError("No notes matched Stage2 patients after filtering.")
 
-    # Normalize and compute window membership
     notes["NOTE_TEXT_NORM"] = notes["NOTE_TEXT"].map(normalize_text)
-    # Some NOTE_DATE may be NaN/None
-    notes["NOTE_DATE"] = notes["NOTE_DATE"]
 
-    # Prepare per-patient outputs
+    # Initialize outputs per patient
     results = {}
     for pid in stage2_pids:
+        s2 = stage2_date_map.get(pid)
         results[pid] = {
             "ENCRYPTED_PAT_ID": pid,
-            "STAGE2_DATE": stage2_date_map.get(pid),
-            "WINDOW_START": stage2_date_map.get(pid),
-            "WINDOW_END": (stage2_date_map.get(pid) + timedelta(days=365)) if stage2_date_map.get(pid) else None,
+            "STAGE2_DATE": s2,
+            "WINDOW_START": s2,
+            "WINDOW_END": (s2 + timedelta(days=365)) if s2 else None,
 
             "Stage2_MinorComp_pred": 0,
             "Stage2_Reoperation_pred": 0,
@@ -489,7 +498,6 @@ def main():
             "Stage2_Failure_pred": 0,
             "Stage2_Revision_pred": 0,
 
-            # evidence blocks
             "minor_evidence_date": "",
             "minor_evidence_source": "",
             "minor_evidence_note_id": "",
@@ -521,15 +529,14 @@ def main():
             "revision_evidence_snippet": "",
         }
 
-    # Best evidence trackers
     best_minor = {}
     best_reop = {}
     best_rehosp = {}
     best_failure = {}
     best_revision = {}
 
-    # Scan row-by-row (already aggregated per NOTE_ID where possible)
-    for idx, r in notes.iterrows():
+    # Scan aggregated notes
+    for _, r in notes.iterrows():
         pid = normalize_id(r.get("ENCRYPTED_PAT_ID"))
         if not pid or pid not in stage2_date_map:
             continue
@@ -539,11 +546,10 @@ def main():
         win_end = s2 + timedelta(days=365)
 
         nd = r.get("NOTE_DATE")
-        # nd may be float NaN; handle safely
+        # Handle NaN
         if isinstance(nd, float):
             nd = None
 
-        # If date exists, enforce window. If date missing, still allow *only* for strong signals (reop/failure/revision)
         in_window = False
         if nd:
             try:
@@ -559,11 +565,9 @@ def main():
         note_id = normalize_id(r.get("NOTE_ID", ""))
         note_type = str(r.get("NOTE_TYPE", "") or "")
 
-        # Complication present?
         has_comp = bool(COMP_RX.search(t))
 
-        # -------- Minor complication (complication + nonop/no-op; no reop/rehosp implied)
-        # We flag minor if: in-window AND complication AND (nonop OR explicit "managed conservatively") AND NOT failure terms
+        # Minor complication: complication + non-op, no reop, no failure; must be in-window
         if in_window and has_comp:
             nonop = bool(NONOP_RX.search(t)) or ("conservative" in t) or ("managed with" in t and "antibi" in t)
             fail = bool(FAIL_RX.search(t))
@@ -580,17 +584,16 @@ def main():
                 }
                 best_minor[pid] = update_best(best_minor.get(pid), cand)
 
-        # -------- Reoperation (complication + reop terms) OR explicit implant/expander removal in OR context
-        # For date-missing notes, we require BOTH comp + reop/failure keyword to avoid false positives.
+        # Reoperation: in-window + comp + reop
+        # If NOTE_DATE missing, require comp + (reop OR failure) to reduce false positives
         if (in_window and has_comp and REOP_RX.search(t)) or ((not nd) and has_comp and (REOP_RX.search(t) or FAIL_RX.search(t))):
             lbl, pat = best_match(REOP_PATTERNS, t)
             if not pat:
-                # fallback to complication label if reop label missing
                 lbl2, pat2 = best_match(COMPLICATION_PATTERNS, t)
                 pat = pat2 or lbl2
             cand = {
                 "evidence_date": nd,
-                "priority": 1,  # strong
+                "priority": 1,
                 "source": src,
                 "note_id": note_id,
                 "pattern": pat if pat else lbl,
@@ -598,12 +601,12 @@ def main():
             }
             best_reop[pid] = update_best(best_reop.get(pid), cand)
 
-        # -------- Failure (implant/flap removal due to complication)
+        # Failure: in-window + failure OR (date-missing + failure + comp)
         if (in_window and FAIL_RX.search(t)) or ((not nd) and FAIL_RX.search(t) and has_comp):
             lbl, pat = best_match(FAILURE_PATTERNS, t)
             cand = {
                 "evidence_date": nd,
-                "priority": 0,  # strongest
+                "priority": 0,
                 "source": src,
                 "note_id": note_id,
                 "pattern": pat if pat else lbl,
@@ -611,7 +614,7 @@ def main():
             }
             best_failure[pid] = update_best(best_failure.get(pid), cand)
 
-        # -------- Revision (revision terms; separate from reop-for-complication)
+        # Revision: in-window + revision terms (not necessarily a complication)
         if in_window and REV_RX.search(t):
             lbl, pat = best_match(REVISION_PATTERNS, t)
             cand = {
@@ -624,10 +627,9 @@ def main():
             }
             best_revision[pid] = update_best(best_revision.get(pid), cand)
 
-        # -------- Rehospitalization (use inpatient note source + complication)
-        # Conservative: requires in-window + complication + inpatient source file
+        # Rehospitalization: conservative proxy (inpatient note source + complication) within window
         if in_window and has_comp:
-            if ("Inpatient Notes".lower() in src.lower()) or ("discharge" in note_type.lower()) or ("h&p" in note_type.lower()):
+            if ("inpatient notes" in src.lower()) or ("discharge" in note_type.lower()) or ("h&p" in note_type.lower()):
                 lbl, pat = best_match(COMPLICATION_PATTERNS, t)
                 cand = {
                     "evidence_date": nd,
@@ -639,7 +641,6 @@ def main():
                 }
                 best_rehosp[pid] = update_best(best_rehosp.get(pid), cand)
 
-    # Finalize per-patient flags + evidence
     def fmt_date(d):
         if not d:
             return ""
@@ -648,6 +649,7 @@ def main():
         except Exception:
             return ""
 
+    # Materialize flags + evidence into results
     for pid in results.keys():
         if pid in best_minor:
             results[pid]["Stage2_MinorComp_pred"] = 1
@@ -689,19 +691,17 @@ def main():
             results[pid]["revision_evidence_pattern"] = best_revision[pid].get("pattern", "")
             results[pid]["revision_evidence_snippet"] = best_revision[pid].get("snippet", "")
 
-        # MajorComp is derived: reop OR rehosp
+        # MajorComp derived: reop OR rehosp
         if results[pid]["Stage2_Reoperation_pred"] == 1 or results[pid]["Stage2_Rehospitalization_pred"] == 1:
             results[pid]["Stage2_MajorComp_pred"] = 1
 
-        # Ensure dates present in output
+        # serialize anchor dates
         results[pid]["STAGE2_DATE"] = fmt_date(results[pid]["STAGE2_DATE"])
         results[pid]["WINDOW_START"] = fmt_date(results[pid]["WINDOW_START"])
         results[pid]["WINDOW_END"] = fmt_date(results[pid]["WINDOW_END"])
 
-    # Write output
     out_path = os.path.join(out_dir, "stage2_outcomes_pred.csv")
 
-    # Stable column order
     cols = [
         "ENCRYPTED_PAT_ID",
         "STAGE2_DATE", "WINDOW_START", "WINDOW_END",
@@ -720,15 +720,12 @@ def main():
     ]
 
     out_df = pd.DataFrame(list(results.values()))
-    # Add any missing cols (safety)
     for c in cols:
         if c not in out_df.columns:
             out_df[c] = ""
     out_df = out_df[cols]
-
     out_df.to_csv(out_path, index=False)
 
-    # Console summary
     def cnt(c):
         return int(pd.to_numeric(out_df[c], errors="coerce").fillna(0).astype(int).sum())
 
