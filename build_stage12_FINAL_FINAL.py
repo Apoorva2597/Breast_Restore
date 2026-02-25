@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-build_stage12_FINAL_WITH_CLINIC.py (Python 3.6.8 compatible)
+build_stage12_FINAL_OP_ONLY.py (Python 3.6.8 compatible)
 
-UPDATED (balanced "scheduled"):
-- Scheduled Stage 2 now requires *tight co-occurrence*:
-  - "scheduled/planned" within same sentence AND within ~80 chars of a Stage2-procedure phrase
-  - Must include a procedure cue (surgery/procedure/operation/OR) OR explicit "for" + procedure phrase
-  - Excludes common non-surgical scheduling (follow-up, clinic, PT, imaging, etc.)
-- Still reads BOTH:
+TIGHTENED scheduled logic (more precision) + OP NOTES ONLY:
+- Reads ONLY:
     - ./_staging_inputs/HPI11526 Operation Notes.csv
-    - ./_staging_inputs/HPI11526 Clinic Notes.csv
+- Scheduled Stage2 requires:
+  1) schedule/planned/plan AND
+  2) "scheduled for" OR explicit OR/procedure cue AND
+  3) Stage2-specific procedure phrase (NOT generic implant) AND
+  4) proximity <= 50 chars AND
+  5) excludes non-surgical scheduling (follow-up/clinic/PT/imaging/labs/etc.)
+  6) excludes negated scheduling ("not scheduled", "no plans")
+  7) excludes counseling-only language ("discuss", "consider", "option", "candidate")
+- Writes:
+    - ./_outputs/patient_stage_summary.csv
 """
 
 from __future__ import print_function
@@ -30,15 +35,11 @@ def _safe_mkdir(path):
     if not os.path.isdir(path):
         os.makedirs(path)
 
-def _find_input_csvs():
-    files = []
-    for name in ["HPI11526 Operation Notes.csv", "HPI11526 Clinic Notes.csv"]:
-        p = os.path.join(STAGING_DIR, name)
-        if os.path.isfile(p):
-            files.append(p)
-    if not files:
-        raise IOError("No Operation/Clinic notes found in: {0}".format(STAGING_DIR))
-    return files
+def _find_op_csv():
+    p = os.path.join(STAGING_DIR, "HPI11526 Operation Notes.csv")
+    if not os.path.isfile(p):
+        raise IOError("Missing OP notes file: {0}".format(p))
+    return p
 
 def _normalize_text(s):
     if s is None:
@@ -83,30 +84,40 @@ RE_REMOVE = re.compile(r"\b(remove(d|al)?|explant(ed|ation)?|take\s*out|takedown
 RE_IMPLANT = re.compile(r"\b(implant(s)?|prosthesis|silicone|saline|gel)\b", re.I)
 RE_ACTION = re.compile(r"\b(place(d|ment)?|insert(ed|ion)?|exchange(d)?|replace(d|ment)?)\b", re.I)
 
+# Performed exchange (tight)
 RE_EXCHANGE = re.compile(
-    r"\b(implant|expander)\b.{0,60}\b(exchange|replace|replacement)\b"
-    r"|\b(exchange|replace|replacement)\b.{0,60}\b(implant|expander)\b",
+    r"\b(implant|expander)\b.{0,50}\b(exchange|replace|replacement)\b"
+    r"|\b(exchange|replace|replacement)\b.{0,50}\b(implant|expander)\b",
     re.I
 )
 
-# Scheduled balance
+# Scheduled (tight)
 RE_SCHEDULE = re.compile(r"\b(schedule(d)?|planned|plan)\b", re.I)
-RE_NOT_SCHEDULED = re.compile(r"\b(not|no|never)\s+(scheduled|plan(ned)?|planning)\b", re.I)
+RE_SCHEDULED_FOR = re.compile(r"\bscheduled\b.{0,12}\bfor\b", re.I)
 RE_PROC_CUE = re.compile(r"\b(surgery|procedure|operation|or|operative)\b", re.I)
 
-# Must be an actual stage2-ish procedure phrase (not generic "implant" alone)
-RE_STAGE2_PROC_PHRASE = re.compile(
-    r"\b(expander[- ]?to[- ]?implant)\b"
-    r"|\b(second stage|stage\s*2)\b.{0,40}\b(reconstruction|exchange|implant)\b"
-    r"|\b(expander)\b.{0,40}\b(exchange)\b"
-    r"|\b(expander)\b.{0,40}\b(remove|removal|explant)\b.{0,40}\b(implant)\b"
-    r"|\b(exchange|replace|replacement)\b.{0,40}\b(implant)\b",
+RE_NOT_SCHEDULED = re.compile(
+    r"\b(not|no|never)\s+(scheduled|plan(ned)?|planning)\b|\bno plans\b|\bnot planning\b",
     re.I
 )
 
-# Exclude common non-surgical scheduling contexts
+RE_COUNSEL_ONLY = re.compile(
+    r"\b(discuss(ed|ion)?|consider(ing)?|option(s)?|candidate|counsel(ing)?|risks? and benefits|review(ed)?)\b",
+    re.I
+)
+
 RE_BAD_SCHED_CONTEXT = re.compile(
     r"\b(follow[- ]?up|f/u|clinic|appt|appointment|visit|pt|ot|imaging|mri|ct|us|ultrasound|mammo|labs?)\b",
+    re.I
+)
+
+# Stage2-specific phrases (NOT generic implant alone)
+RE_STAGE2_PROC_PHRASE = re.compile(
+    r"\b(expander[- ]?to[- ]?implant)\b"
+    r"|\b(exchange)\b.{0,30}\b(expander|implant)\b"
+    r"|\b(expander)\b.{0,30}\b(exchange)\b"
+    r"|\b(second stage|stage\s*2)\b.{0,40}\b(reconstruction|exchange)\b"
+    r"|\b(expander)\b.{0,40}\b(remove|removal|explant)\b.{0,40}\b(implant)\b",
     re.I
 )
 
@@ -117,21 +128,10 @@ STAGE1_PATTERNS = [
     r"\b(stage\s*1)\b.*\b(reconstruction|tissue expander|expander|te)\b",
 ]
 
-def _scheduled_stage2_sentence_level(text_norm):
-    """
-    Balanced scheduled trigger:
-    - Find a sentence containing schedule/planned/plan
-    - In that sentence:
-        - NOT negated ("not scheduled")
-        - NOT dominated by clinic/follow-up context
-        - Must contain a Stage2 procedure phrase
-        - And schedule word must be within ~80 chars of that phrase
-        - And must have a procedure cue OR "scheduled for" pattern
-    """
+def _scheduled_stage2_sentence_level(text_norm, proximity=50):
     if not RE_SCHEDULE.search(text_norm):
         return False
 
-    # crude sentence split
     parts = re.split(r"[.;]\s+|\n+", text_norm)
     for sent in parts:
         s = sent.strip()
@@ -143,25 +143,26 @@ def _scheduled_stage2_sentence_level(text_norm):
             continue
         if RE_BAD_SCHED_CONTEXT.search(s):
             continue
+        if RE_COUNSEL_ONLY.search(s):
+            continue
 
         m_proc = RE_STAGE2_PROC_PHRASE.search(s)
         if not m_proc:
             continue
 
-        # proximity: schedule word within 80 chars of stage2 phrase (either direction)
         sched_positions = [m.start() for m in RE_SCHEDULE.finditer(s)]
         proc_start = m_proc.start()
         proc_end = m_proc.end()
+
         close = False
         for sp in sched_positions:
-            if abs(sp - proc_start) <= 80 or abs(sp - proc_end) <= 80:
+            if abs(sp - proc_start) <= proximity or abs(sp - proc_end) <= proximity:
                 close = True
                 break
         if not close:
             continue
 
-        # require procedure cue OR explicit "scheduled for ..."
-        if not (RE_PROC_CUE.search(s) or re.search(r"\bscheduled\b.{0,15}\bfor\b", s)):
+        if not (RE_SCHEDULED_FOR.search(s) or RE_PROC_CUE.search(s)):
             continue
 
         return True
@@ -169,8 +170,7 @@ def _scheduled_stage2_sentence_level(text_norm):
     return False
 
 def _stage2_bucket(text_norm):
-
-    # 1) Performed exchange (tight window)
+    # 1) Performed exchange (tight)
     if RE_EXCHANGE.search(text_norm):
         return True, "EXCHANGE"
 
@@ -178,9 +178,9 @@ def _stage2_bucket(text_norm):
     if RE_TE.search(text_norm) and RE_REMOVE.search(text_norm) and RE_IMPLANT.search(text_norm) and RE_ACTION.search(text_norm):
         return True, "EXPANDER_TO_IMPLANT"
 
-    # 3) Scheduled Stage 2 (balanced)
-    if _scheduled_stage2_sentence_level(text_norm):
-        return True, "SCHEDULED_STAGE2_BALANCED"
+    # 3) Scheduled Stage2 (tight)
+    if _scheduled_stage2_sentence_level(text_norm, proximity=50):
+        return True, "SCHEDULED_STAGE2_TIGHT"
 
     return False, ""
 
@@ -209,16 +209,13 @@ def read_rows(csv_path):
             rows.append(r)
     return rows
 
-def build(outputs_dir, input_csvs):
+def build(outputs_dir, op_csv):
     _safe_mkdir(outputs_dir)
-
-    all_rows = []
-    for path in input_csvs:
-        all_rows.extend(read_rows(path))
+    rows = read_rows(op_csv)
 
     patients = {}
 
-    for r in all_rows:
+    for r in rows:
         pid = (r.get("ENCRYPTED_PAT_ID") or "").strip()
         if not pid:
             continue
@@ -276,8 +273,8 @@ def build(outputs_dir, input_csvs):
 def main():
     if not os.path.isdir(STAGING_DIR):
         raise IOError("Staging dir not found: {0}".format(STAGING_DIR))
-    input_csvs = _find_input_csvs()
-    build(OUT_DIR, input_csvs)
+    op_csv = _find_op_csv()
+    build(OUT_DIR, op_csv)
 
 if __name__ == "__main__":
     main()
