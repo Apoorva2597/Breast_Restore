@@ -1,23 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-build_stage12_FINAL_WITH_CLINIC_reduceFN_v2.py (Python 3.6.8 compatible)
-
-Goal: reduce FN by adding NOTE_TYPE-aware performed Stage2 detection.
-Key idea:
-- In OP/operative-type notes, Stage2 can be documented without explicit "expander" wording.
-- Add OPERATIVE-ONLY performed buckets:
-  A) implant + (exchange/replace)  (even without expander)
-  B) implant + (placed/inserted/placement) + (reconstruction OR stage2 hint)
-  C) (capsulectomy/capsulotomy) + implant (often stage2 revision/exchange context)
-Scheduled logic unchanged except it stays sentence-scoped + guards.
+build_stage12_WITH_AUDIT.py (Python 3.6.8 compatible)
 
 Inputs:
 - ./_staging_inputs/HPI11526 Operation Notes.csv
 - ./_staging_inputs/HPI11526 Clinic Notes.csv
 
-Output:
+Outputs:
 - ./_outputs/patient_stage_summary.csv
+- ./_outputs/stage_event_level.csv   (audit file: note_type + trigger bucket + evidence snippet + pattern)
 """
 
 from __future__ import print_function
@@ -81,11 +73,15 @@ def _best_note_date(row):
         return op
     return _parse_date_any(row.get("NOTE_DATE_OF_SERVICE", ""))
 
+def _make_snippet(text_norm, start, end, width=150):
+    lo = max(0, start - width)
+    hi = min(len(text_norm), end + width)
+    return text_norm[lo:hi].strip()
+
 # -------------------------
-# Stage detection logic
+# Stage detection logic (current "good but higher FP" version)
 # -------------------------
 
-# NOTE TYPE heuristic: treat these as "operative context"
 RE_OPERATIVE_TYPE = re.compile(
     r"\b(operative|op note|brief op|operation|surgical|procedure|or note)\b",
     re.I
@@ -94,7 +90,6 @@ RE_OPERATIVE_TYPE = re.compile(
 RE_TE = re.compile(r"\b(expander|expanders|tissue expander|te)\b", re.I)
 RE_REMOVE = re.compile(r"\b(remove(d|al)?|explant(ed|ation)?|take\s*out|takedown|retrieve)\b", re.I)
 
-# broaden implant device terms (keep conservative, avoid "implant" only as future plan by using operative gating)
 RE_IMPLANT = re.compile(
     r"\b(implant(s)?|prosthesis|silicone|saline|gel|mentor|allergan|sientra)\b",
     re.I
@@ -105,17 +100,14 @@ RE_EXCH_WORD = re.compile(r"\b(exchange|exchanged|replace|replaced|replacement)\
 
 RE_RECON = re.compile(r"\b(breast reconstruction|reconstruction)\b", re.I)
 RE_STAGE2_HINT = re.compile(r"\b(second stage|stage\s*2)\b", re.I)
-
 RE_CAPSULE = re.compile(r"\b(capsulectomy|capsulotomy)\b", re.I)
 
-# Performed exchange (tight)
 RE_EXCHANGE_TIGHT = re.compile(
     r"\b(implant|expander)\b.{0,50}\b(exchange|exchanged|replace|replaced|replacement)\b"
     r"|\b(exchange|exchanged|replace|replaced|replacement)\b.{0,50}\b(implant|expander)\b",
     re.I
 )
 
-# Scheduled (same as your tight version)
 RE_SCHEDULE = re.compile(r"\b(schedule(d)?|planned|plan)\b", re.I)
 RE_SCHEDULED_FOR = re.compile(r"\bscheduled\b.{0,12}\bfor\b", re.I)
 RE_PROC_CUE = re.compile(r"\b(surgery|procedure|operation|or|operative)\b", re.I)
@@ -153,24 +145,31 @@ STAGE1_PATTERNS = [
 
 def _scheduled_stage2_sentence_level(text_norm, proximity=50):
     if not RE_SCHEDULE.search(text_norm):
-        return False
+        return False, "", "", 0, 0
 
     parts = re.split(r"[.;]\s+|\n+", text_norm)
+    offset = 0
     for sent in parts:
         s = sent.strip()
         if not s:
+            offset += len(sent) + 1
             continue
         if not RE_SCHEDULE.search(s):
+            offset += len(sent) + 1
             continue
         if RE_NOT_SCHEDULED.search(s):
+            offset += len(sent) + 1
             continue
         if RE_BAD_SCHED_CONTEXT.search(s):
+            offset += len(sent) + 1
             continue
         if RE_COUNSEL_ONLY.search(s):
+            offset += len(sent) + 1
             continue
 
         m_proc = RE_STAGE2_PROC_PHRASE.search(s)
         if not m_proc:
+            offset += len(sent) + 1
             continue
 
         sched_positions = [m.start() for m in RE_SCHEDULE.finditer(s)]
@@ -183,57 +182,64 @@ def _scheduled_stage2_sentence_level(text_norm, proximity=50):
                 close = True
                 break
         if not close:
+            offset += len(sent) + 1
             continue
 
         if not (RE_SCHEDULED_FOR.search(s) or RE_PROC_CUE.search(s)):
+            offset += len(sent) + 1
             continue
 
-        return True
+        # evidence bounds in full text (approx; since we normalized spacing, use sentence-local indices)
+        return True, "SCHEDULED_STAGE2_TIGHT", "SCHEDULED_SENTENCE", (offset + m_proc.start()), (offset + m_proc.end())
 
-    return False
+    return False, "", "", 0, 0
 
 def _stage2_bucket(text_norm, note_type_norm):
-    is_operative = bool(RE_OPERATIVE_TYPE.search(note_type_norm))
+    is_operative = 1 if RE_OPERATIVE_TYPE.search(note_type_norm) else 0
 
-    # 1) Performed exchange (tight)
-    if RE_EXCHANGE_TIGHT.search(text_norm):
-        return True, "EXCHANGE_TIGHT"
+    m = RE_EXCHANGE_TIGHT.search(text_norm)
+    if m:
+        return True, "EXCHANGE_TIGHT", "EXCHANGE_TIGHT", m.start(), m.end(), is_operative
 
-    # 2) Performed TE removal + implant + action (classic)
     if RE_TE.search(text_norm) and RE_REMOVE.search(text_norm) and RE_IMPLANT.search(text_norm) and RE_ACTION.search(text_norm):
-        return True, "EXPANDER_TO_IMPLANT"
+        m2 = RE_REMOVE.search(text_norm) or RE_ACTION.search(text_norm)
+        st, en = (m2.start(), m2.end()) if m2 else (0, min(len(text_norm), 60))
+        return True, "EXPANDER_TO_IMPLANT", "TE+REMOVE+IMPLANT+ACTION", st, en, is_operative
 
-    # 3) NEW (operative-only): implant + exchange/replace (no expander required)
     if is_operative and RE_IMPLANT.search(text_norm) and RE_EXCH_WORD.search(text_norm):
-        return True, "OPONLY_IMPLANT_EXCHANGE"
+        m3 = RE_EXCH_WORD.search(text_norm) or RE_IMPLANT.search(text_norm)
+        st, en = (m3.start(), m3.end()) if m3 else (0, min(len(text_norm), 60))
+        return True, "OPONLY_IMPLANT_EXCHANGE", "OPONLY_IMPLANT_EXCHANGE", st, en, is_operative
 
-    # 4) NEW (operative-only): implant placement + reconstruction/stage2 hint
     if is_operative and RE_IMPLANT.search(text_norm) and re.search(r"\b(place(d|ment)?|insert(ed|ion)?)\b", text_norm, re.I) and (RE_RECON.search(text_norm) or RE_STAGE2_HINT.search(text_norm)):
-        return True, "OPONLY_IMPLANT_PLACEMENT_RECON"
+        m4 = re.search(r"\b(place(d|ment)?|insert(ed|ion)?)\b", text_norm, re.I) or RE_IMPLANT.search(text_norm)
+        st, en = (m4.start(), m4.end()) if m4 else (0, min(len(text_norm), 60))
+        return True, "OPONLY_IMPLANT_PLACEMENT_RECON", "OPONLY_IMPLANT_PLACEMENT_RECON", st, en, is_operative
 
-    # 5) NEW (operative-only): capsule work + implant (common revision/exchange patterns)
     if is_operative and RE_CAPSULE.search(text_norm) and RE_IMPLANT.search(text_norm):
-        return True, "OPONLY_CAPSULE_PLUS_IMPLANT"
+        m5 = RE_CAPSULE.search(text_norm)
+        return True, "OPONLY_CAPSULE_PLUS_IMPLANT", "OPONLY_CAPSULE_PLUS_IMPLANT", m5.start(), m5.end(), is_operative
 
-    # 6) Scheduled Stage2 (tight, sentence scoped)
-    if _scheduled_stage2_sentence_level(text_norm, proximity=50):
-        return True, "SCHEDULED_STAGE2_TIGHT"
+    ok, bucket, patname, st, en = _scheduled_stage2_sentence_level(text_norm, proximity=50)
+    if ok:
+        return True, bucket, patname, st, en, is_operative
 
-    return False, ""
+    return False, "", "", 0, 0, is_operative
 
 def detect_stage(note_text, note_type):
     t = _normalize_text(note_text)
     nt = _normalize_text(note_type)
 
-    ok2, pat2 = _stage2_bucket(t, nt)
+    ok2, bucket, patname, st, en, isop = _stage2_bucket(t, nt)
     if ok2:
-        return "STAGE2", pat2
+        return "STAGE2", bucket, patname, st, en, isop
 
     for pat in STAGE1_PATTERNS:
-        if re.search(pat, t):
-            return "STAGE1", pat
+        m = re.search(pat, t)
+        if m:
+            return "STAGE1", "STAGE1", pat, m.start(), m.end(), 0
 
-    return "", ""
+    return "", "", "", 0, 0, 0
 
 # -------------------------
 # Main
@@ -255,6 +261,8 @@ def build(outputs_dir, input_csvs):
         rows.extend(read_rows(p))
 
     patients = {}
+    events = []
+    stage2_match_counts = {}
 
     for r in rows:
         pid = (r.get("ENCRYPTED_PAT_ID") or "").strip()
@@ -262,12 +270,16 @@ def build(outputs_dir, input_csvs):
             continue
 
         date = _best_note_date(r)
+        note_id = (r.get("NOTE_ID") or "").strip()
+        note_type = (r.get("NOTE_TYPE") or "").strip()
         text = r.get("NOTE_TEXT", "")
-        note_type = r.get("NOTE_TYPE", "")
 
-        stage, _ = detect_stage(text, note_type)
+        stage, bucket, patname, st, en, isop = detect_stage(text, note_type)
         if not stage:
             continue
+
+        tnorm = _normalize_text(text)
+        snippet = _make_snippet(tnorm, st, en, width=150) if tnorm else ""
 
         if pid not in patients:
             patients[pid] = {
@@ -286,8 +298,29 @@ def build(outputs_dir, input_csvs):
 
         elif stage == "STAGE2":
             p["stage2_hits"] += 1
+            stage2_match_counts[pid] = stage2_match_counts.get(pid, 0) + 1
             if date and (not p["stage2_date"] or date < p["stage2_date"]):
                 p["stage2_date"] = date
+
+        events.append({
+            "ENCRYPTED_PAT_ID": pid,
+            "STAGE": stage,
+            "EVENT_DATE": date,
+            "NOTE_ID": note_id,
+            "NOTE_TYPE": note_type,
+            "DETECTION_BUCKET": bucket,
+            "PATTERN_NAME": patname,
+            "IS_OPERATIVE_CONTEXT": int(isop),
+            "EVIDENCE_SNIPPET": snippet
+        })
+
+    # add derived columns per patient
+    for pid, p in patients.items():
+        p["stage2_match_count"] = stage2_match_counts.get(pid, 0)
+        if p["stage1_date"] and p["stage2_date"]:
+            p["has_stage1_before_stage2"] = 1 if p["stage1_date"] <= p["stage2_date"] else 0
+        else:
+            p["has_stage1_before_stage2"] = 0
 
     patient_out = os.path.join(outputs_dir, "patient_stage_summary.csv")
     with open(patient_out, "w", encoding="utf-8", newline="") as f:
@@ -295,7 +328,9 @@ def build(outputs_dir, input_csvs):
             "ENCRYPTED_PAT_ID",
             "STAGE1_DATE", "STAGE1_HITS",
             "STAGE2_DATE", "STAGE2_HITS",
-            "HAS_STAGE1", "HAS_STAGE2"
+            "HAS_STAGE1", "HAS_STAGE2",
+            "HAS_STAGE1_BEFORE_STAGE2",
+            "STAGE2_MATCH_COUNT_PER_PATIENT"
         ])
         w.writeheader()
         for pid in sorted(patients.keys()):
@@ -308,9 +343,25 @@ def build(outputs_dir, input_csvs):
                 "STAGE2_HITS": p["stage2_hits"],
                 "HAS_STAGE1": 1 if p["stage1_hits"] > 0 else 0,
                 "HAS_STAGE2": 1 if p["stage2_hits"] > 0 else 0,
+                "HAS_STAGE1_BEFORE_STAGE2": p["has_stage1_before_stage2"],
+                "STAGE2_MATCH_COUNT_PER_PATIENT": p["stage2_match_count"],
             })
 
+    event_out = os.path.join(outputs_dir, "stage_event_level.csv")
+    with open(event_out, "w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=[
+            "ENCRYPTED_PAT_ID", "STAGE", "EVENT_DATE",
+            "NOTE_ID", "NOTE_TYPE",
+            "DETECTION_BUCKET", "PATTERN_NAME",
+            "IS_OPERATIVE_CONTEXT",
+            "EVIDENCE_SNIPPET"
+        ])
+        w.writeheader()
+        for e in events:
+            w.writerow(e)
+
     print("OK: wrote", patient_out)
+    print("OK: wrote", event_out)
 
 def main():
     if not os.path.isdir(STAGING_DIR):
