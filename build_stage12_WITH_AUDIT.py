@@ -1,15 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-build_stage12_WITH_AUDIT.py (Python 3.6.8 compatible)
+build_stage12_WITH_AUDIT_tunedFP.py (Python 3.6.8 compatible)
+
+Goal: reduce FP while keeping the audit outputs.
+
+Key tuning (FP control):
+- OPONLY_IMPLANT_PLACEMENT_RECON now EXCLUDES likely direct-to-implant/immediate mastectomy cases
+  unless expander/TE is also mentioned.
+- OPONLY_IMPLANT_EXCHANGE now requires a stronger Stage2 anchor:
+  (expander/TE OR capsule-work) present somewhere in note.
+- Adds "HISTORY/PRIOR" guard at sentence-level for OPONLY + SCHEDULED triggers:
+  skips matches in sentences that look like past history rather than performed/current.
+- Keeps audit outputs:
+  - ./_outputs/patient_stage_summary.csv
+  - ./_outputs/stage_event_level.csv
 
 Inputs:
 - ./_staging_inputs/HPI11526 Operation Notes.csv
 - ./_staging_inputs/HPI11526 Clinic Notes.csv
-
-Outputs:
-- ./_outputs/patient_stage_summary.csv
-- ./_outputs/stage_event_level.csv   (audit file: note_type + trigger bucket + evidence snippet + pattern)
 """
 
 from __future__ import print_function
@@ -78,8 +87,12 @@ def _make_snippet(text_norm, start, end, width=150):
     hi = min(len(text_norm), end + width)
     return text_norm[lo:hi].strip()
 
+def _sentences(text_norm):
+    # crude but stable for normalized text
+    return re.split(r"[.;]\s+|\n+", text_norm)
+
 # -------------------------
-# Stage detection logic (current "good but higher FP" version)
+# Stage detection logic (tuned)
 # -------------------------
 
 RE_OPERATIVE_TYPE = re.compile(
@@ -102,12 +115,24 @@ RE_RECON = re.compile(r"\b(breast reconstruction|reconstruction)\b", re.I)
 RE_STAGE2_HINT = re.compile(r"\b(second stage|stage\s*2)\b", re.I)
 RE_CAPSULE = re.compile(r"\b(capsulectomy|capsulotomy)\b", re.I)
 
+# guard against direct-to-implant (DTI) / immediate implant at mastectomy (common FP)
+RE_MASTECTOMY = re.compile(r"\b(mastectomy)\b", re.I)
+RE_IMMEDIATE = re.compile(r"\b(immediate|direct[- ]?to[- ]?implant|dti)\b", re.I)
+
+# history / prior guard
+RE_HISTORY_GUARD = re.compile(
+    r"\b(history of|h/o|prior|previous(ly)?|s\/p|status post|had (an|a)|had (the)?|was|were)\b",
+    re.I
+)
+
+# Performed exchange (tight)
 RE_EXCHANGE_TIGHT = re.compile(
     r"\b(implant|expander)\b.{0,50}\b(exchange|exchanged|replace|replaced|replacement)\b"
     r"|\b(exchange|exchanged|replace|replaced|replacement)\b.{0,50}\b(implant|expander)\b",
     re.I
 )
 
+# Scheduled (as before)
 RE_SCHEDULE = re.compile(r"\b(schedule(d)?|planned|plan)\b", re.I)
 RE_SCHEDULED_FOR = re.compile(r"\bscheduled\b.{0,12}\bfor\b", re.I)
 RE_PROC_CUE = re.compile(r"\b(surgery|procedure|operation|or|operative)\b", re.I)
@@ -147,7 +172,7 @@ def _scheduled_stage2_sentence_level(text_norm, proximity=50):
     if not RE_SCHEDULE.search(text_norm):
         return False, "", "", 0, 0
 
-    parts = re.split(r"[.;]\s+|\n+", text_norm)
+    parts = _sentences(text_norm)
     offset = 0
     for sent in parts:
         s = sent.strip()
@@ -164,6 +189,9 @@ def _scheduled_stage2_sentence_level(text_norm, proximity=50):
             offset += len(sent) + 1
             continue
         if RE_COUNSEL_ONLY.search(s):
+            offset += len(sent) + 1
+            continue
+        if RE_HISTORY_GUARD.search(s):
             offset += len(sent) + 1
             continue
 
@@ -189,10 +217,31 @@ def _scheduled_stage2_sentence_level(text_norm, proximity=50):
             offset += len(sent) + 1
             continue
 
-        # evidence bounds in full text (approx; since we normalized spacing, use sentence-local indices)
         return True, "SCHEDULED_STAGE2_TIGHT", "SCHEDULED_SENTENCE", (offset + m_proc.start()), (offset + m_proc.end())
 
     return False, "", "", 0, 0
+
+def _oponly_implant_exchange_ok(text_norm):
+    # tighten: require implant + exchange AND (expander OR capsule-work) somewhere (strong stage2 anchor)
+    if not (RE_IMPLANT.search(text_norm) and RE_EXCH_WORD.search(text_norm)):
+        return False
+    if RE_TE.search(text_norm) or RE_CAPSULE.search(text_norm):
+        return True
+    return False
+
+def _oponly_implant_placement_recon_ok(text_norm):
+    # tighten: block likely DTI/immediate mastectomy implant cases unless expander present
+    if not (RE_IMPLANT.search(text_norm) and re.search(r"\b(place(d|ment)?|insert(ed|ion)?)\b", text_norm, re.I)):
+        return False
+    if not (RE_RECON.search(text_norm) or RE_STAGE2_HINT.search(text_norm)):
+        return False
+
+    # if mastectomy + immediate/DTI present AND no expander mention -> likely NOT stage2
+    if RE_MASTECTOMY.search(text_norm) and RE_IMMEDIATE.search(text_norm) and (not RE_TE.search(text_norm)):
+        return False
+
+    # also require NOT dominated by history language (note-level)
+    return True
 
 def _stage2_bucket(text_norm, note_type_norm):
     is_operative = 1 if RE_OPERATIVE_TYPE.search(note_type_norm) else 0
@@ -206,17 +255,18 @@ def _stage2_bucket(text_norm, note_type_norm):
         st, en = (m2.start(), m2.end()) if m2 else (0, min(len(text_norm), 60))
         return True, "EXPANDER_TO_IMPLANT", "TE+REMOVE+IMPLANT+ACTION", st, en, is_operative
 
-    if is_operative and RE_IMPLANT.search(text_norm) and RE_EXCH_WORD.search(text_norm):
+    # OPONLY (tightened)
+    if is_operative and _oponly_implant_exchange_ok(text_norm):
         m3 = RE_EXCH_WORD.search(text_norm) or RE_IMPLANT.search(text_norm)
         st, en = (m3.start(), m3.end()) if m3 else (0, min(len(text_norm), 60))
-        return True, "OPONLY_IMPLANT_EXCHANGE", "OPONLY_IMPLANT_EXCHANGE", st, en, is_operative
+        return True, "OPONLY_IMPLANT_EXCHANGE_TIGHT", "OPONLY_IMPLANT_EXCHANGE_TIGHT", st, en, is_operative
 
-    if is_operative and RE_IMPLANT.search(text_norm) and re.search(r"\b(place(d|ment)?|insert(ed|ion)?)\b", text_norm, re.I) and (RE_RECON.search(text_norm) or RE_STAGE2_HINT.search(text_norm)):
+    if is_operative and _oponly_implant_placement_recon_ok(text_norm) and (not RE_HISTORY_GUARD.search(text_norm)):
         m4 = re.search(r"\b(place(d|ment)?|insert(ed|ion)?)\b", text_norm, re.I) or RE_IMPLANT.search(text_norm)
         st, en = (m4.start(), m4.end()) if m4 else (0, min(len(text_norm), 60))
-        return True, "OPONLY_IMPLANT_PLACEMENT_RECON", "OPONLY_IMPLANT_PLACEMENT_RECON", st, en, is_operative
+        return True, "OPONLY_IMPLANT_PLACEMENT_RECON_TIGHT", "OPONLY_IMPLANT_PLACEMENT_RECON_TIGHT", st, en, is_operative
 
-    if is_operative and RE_CAPSULE.search(text_norm) and RE_IMPLANT.search(text_norm):
+    if is_operative and RE_CAPSULE.search(text_norm) and RE_IMPLANT.search(text_norm) and (not RE_HISTORY_GUARD.search(text_norm)):
         m5 = RE_CAPSULE.search(text_norm)
         return True, "OPONLY_CAPSULE_PLUS_IMPLANT", "OPONLY_CAPSULE_PLUS_IMPLANT", m5.start(), m5.end(), is_operative
 
@@ -314,7 +364,6 @@ def build(outputs_dir, input_csvs):
             "EVIDENCE_SNIPPET": snippet
         })
 
-    # add derived columns per patient
     for pid, p in patients.items():
         p["stage2_match_count"] = stage2_match_counts.get(pid, 0)
         if p["stage1_date"] and p["stage2_date"]:
