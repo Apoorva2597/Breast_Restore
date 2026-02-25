@@ -1,58 +1,146 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+debug_reop_mismatches.py  (Python 3.6.8 compatible)
+
+Run from:  ~/Breast_Restore
+Reads:
+  ./_outputs/validation_merged.csv
+Writes:
+  ./_outputs/reop_FN_sample.csv
+  ./_outputs/reop_FP_sample.csv
+
+Also prints a compact terminal view.
+
+Goal:
+- Reoperation FNs (gold=1 pred=0): include evidence fields (likely blank) + hint columns (STAGE2_DATE, window, sources/dates)
+- Reoperation FPs (gold=0 pred=1): include reop_evidence_snippet (+ pattern/source/date) + hint columns
+"""
 
 from __future__ import print_function
 import os
 import pandas as pd
 
-ROOT = os.path.abspath(".")
-MIS = os.path.join(ROOT, "_outputs", "validation_mismatches.csv")
 
-def pick_col(df, options):
-    for c in options:
-        if c in df.columns:
-            return c
-    return None
+def read_csv_robust(path, **kwargs):
+    for enc in ["utf-8", "utf-8-sig", "cp1252", "latin1"]:
+        try:
+            return pd.read_csv(path, encoding=enc, **kwargs)
+        except UnicodeDecodeError:
+            continue
+    raise IOError("Failed to read CSV with common encodings: {}".format(path))
+
+
+def to01(x):
+    if x is None:
+        return 0
+    s = str(x).strip().lower()
+    if s in ["1", "y", "yes", "true", "t"]:
+        return 1
+    if s in ["0", "n", "no", "false", "f", ""]:
+        return 0
+    try:
+        return 1 if float(s) != 0.0 else 0
+    except Exception:
+        return 0
+
+
+def pick_cols(df, preferred):
+    out = []
+    for c in preferred:
+        if c in df.columns and c not in out:
+            out.append(c)
+    return out
+
 
 def main():
-    df = pd.read_csv(MIS, dtype=str, low_memory=False)
-    # best guess column names
-    gold_fail = pick_col(df, ["GOLD_Stage2_Failure", "Stage2_Failure", "Stage2_Failure_gold"])
-    pred_fail = pick_col(df, ["Stage2_Failure_pred", "PRED_Stage2_Failure_pred"])
-    fail_snip = pick_col(df, ["failure_evidence_snippet", "failure_snippet"])
-    fail_src  = pick_col(df, ["failure_evidence_source", "failure_source"])
-    fail_pat  = pick_col(df, ["failure_evidence_pattern", "failure_pattern"])
-    pid_col   = pick_col(df, ["ENCRYPTED_PAT_ID", "encrypted_pat_id"])
+    root = os.path.abspath(".")
+    in_path = os.path.join(root, "_outputs", "validation_merged.csv")
+    out_fn = os.path.join(root, "_outputs", "reop_FN_sample.csv")
+    out_fp = os.path.join(root, "_outputs", "reop_FP_sample.csv")
 
-    print("Loaded:", MIS)
-    print("Columns:", len(df.columns))
+    if not os.path.isfile(in_path):
+        raise IOError("Missing input: {}".format(in_path))
 
-    if not gold_fail or not pred_fail:
-        print("Could not find required columns for failure in mismatches.")
-        print("Found gold_fail:", gold_fail, "pred_fail:", pred_fail)
-        return
+    df = read_csv_robust(in_path, dtype=str, low_memory=False)
 
-    # Failure FNs: gold=1 pred=0
-    fn = df[(df[gold_fail].astype(str) == "1") & (df[pred_fail].astype(str) == "0")].copy()
-    print("\nFAILURE FNs (gold=1, pred=0):", len(fn))
-    show_cols = [c for c in [pid_col, gold_fail, pred_fail, fail_src, fail_pat, fail_snip] if c]
-    if len(fn) > 0:
-        print(fn[show_cols].head(50).to_string(index=False))
+    # Columns we expect (but handle alternate naming)
+    gold_col = "GOLD_Stage2_Reoperation" if "GOLD_Stage2_Reoperation" in df.columns else None
+    pred_col = "Stage2_Reoperation_pred" if "Stage2_Reoperation_pred" in df.columns else None
 
-    # For debugging: top FP sources for reop/rehosp if present
-    for outcome, gold_cands, pred_cands, snip_cands in [
-        ("Reoperation", ["GOLD_Stage2_Reoperation"], ["Stage2_Reoperation_pred"], ["reop_evidence_snippet"]),
-        ("Rehospitalization", ["GOLD_Stage2_Rehospitalization"], ["Stage2_Rehospitalization_pred"], ["rehosp_evidence_snippet"]),
-    ]:
-        g = pick_col(df, gold_cands)
-        p = pick_col(df, pred_cands)
-        sn = pick_col(df, snip_cands)
-        if g and p:
-            fp = df[(df[g].astype(str) == "0") & (df[p].astype(str) == "1")].copy()
-            print("\n{} FPs (gold=0, pred=1): {}".format(outcome, len(fp)))
-            cols = [c for c in [pid_col, g, p, sn] if c]
-            if len(fp) > 0:
-                print(fp[cols].head(25).to_string(index=False))
+    if not gold_col:
+        raise ValueError("Could not find GOLD_Stage2_Reoperation in columns.")
+    if not pred_col:
+        raise ValueError("Could not find Stage2_Reoperation_pred in columns.")
+
+    df["_gold"] = df[gold_col].map(to01)
+    df["_pred"] = df[pred_col].map(to01)
+
+    fns = df[(df["_gold"] == 1) & (df["_pred"] == 0)].copy()
+    fps = df[(df["_gold"] == 0) & (df["_pred"] == 1)].copy()
+
+    # Build a useful column set (keep if exists)
+    hint_cols = pick_cols(df, [
+        "MRN",
+        "ENCRYPTED_PAT_ID", "ENCRYPTED_PATID", "ENCRYPTED_PATIENT_ID",
+        "PatientID",
+        "STAGE2_DATE", "WINDOW_START", "WINDOW_END",
+        gold_col, pred_col,
+        # Evidence fields (your validator tends to carry these through)
+        "reop_evidence_date", "reop_evidence_source", "reop_evidence_note_id",
+        "reop_evidence_pattern", "reop_evidence_snippet",
+        # Sometimes scripts used *_note_id naming variants
+        "reop_evidence_noteid", "reop_evidence_note",
+        # Any extra “signal” columns you might have
+        "Stage2_MajorComp_pred", "Stage2_Rehospitalization_pred", "Stage2_Failure_pred", "Stage2_Revision_pred",
+        "GOLD_Stage2_MajorComp", "GOLD_Stage2_Rehospitalization", "GOLD_Stage2_Failure", "GOLD_Stage2_Revision",
+    ])
+
+    # Save samples (all rows; you can open and filter, or limit later)
+    fns_out = fns[hint_cols] if len(hint_cols) else fns
+    fps_out = fps[hint_cols] if len(hint_cols) else fps
+
+    fns_out.to_csv(out_fn, index=False)
+    fps_out.to_csv(out_fp, index=False)
+
+    # Terminal summary + top rows
+    print("")
+    print("Loaded:", in_path)
+    print("Rows:", len(df))
+    print("Reoperation FNs (gold=1 pred=0):", len(fns_out))
+    print("Reoperation FPs (gold=0 pred=1):", len(fps_out))
+    print("")
+    print("Wrote:")
+    print(" ", out_fn)
+    print(" ", out_fp)
+    print("")
+
+    # Compact terminal preview (first 10)
+    pd.set_option("display.max_colwidth", 140)
+    pd.set_option("display.width", 200)
+
+    show_cols_fn = pick_cols(df, [
+        "MRN", "ENCRYPTED_PAT_ID", "STAGE2_DATE",
+        gold_col, pred_col,
+        "reop_evidence_date", "reop_evidence_source", "reop_evidence_pattern",
+        "reop_evidence_snippet",
+    ])
+    show_cols_fp = show_cols_fn
+
+    if len(fns_out) > 0:
+        print("=== FN preview (first 10) ===")
+        print(fns_out[show_cols_fn].head(10).to_string(index=False))
+        print("")
+    else:
+        print("No Reoperation FNs found.\n")
+
+    if len(fps_out) > 0:
+        print("=== FP preview (first 10) ===")
+        print(fps_out[show_cols_fp].head(10).to_string(index=False))
+        print("")
+    else:
+        print("No Reoperation FPs found.\n")
+
 
 if __name__ == "__main__":
     main()
