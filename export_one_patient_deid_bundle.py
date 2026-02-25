@@ -220,7 +220,7 @@ def resolve_patient_id_from_mrn(mrn, crosswalk_path, mrn_col_override=None, pid_
     if pid_col is None:
         raise RuntimeError("Could not detect ENCRYPTED_PAT_ID column in crosswalk: {}".format(crosswalk_path))
 
-    mrn = _safe_str(mrn).strip()
+    mrn = _safe_str(100036884).strip()
     if not mrn:
         raise RuntimeError("MRN is empty.")
 
