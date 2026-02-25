@@ -3,16 +3,11 @@
 """
 stage2_fn_qa_snippets.py  (Python 3.6.8 compatible)
 
-UPDATED VERSION:
-- Much broader Stage 2 keyword search
-- Designed for discovery (FN exploration), not precision
-- Extracts broad contextual snippets from ALL_NOTES_COMBINED.txt
+FIXED VERSION:
+- Robust ENCRYPTED_PAT_ID handling (no KeyError)
+- Handles missing crosswalk mappings safely
+- Broad Stage2 discovery search
 - Outputs NO MRN (safe to paste)
-
-Input assumptions:
-- validation_merged.csv exists
-- CROSSWALK__MRN_to_patient_id__vNEW.csv exists
-- PATIENT_BUNDLES/<ENCRYPTED_PAT_ID>/ALL_NOTES_COMBINED.txt exists
 """
 
 from __future__ import print_function
@@ -71,41 +66,24 @@ def pick_first_existing(df, options):
 # -------------------------
 
 STAGE2_PATTERNS = [
-
-    # direct exchange language
     r"\bimplant exchange\b",
     r"\bexpander exchange\b",
     r"\bexchange\b",
     r"\breplace(d|ment)?\b",
     r"\bre-implant\b",
-
-    # expander removal
     r"\bremove(d|al)?\b.*\b(expander|tissue expander|expanders|te)\b",
     r"\b(explant(ed)?|take\s*out)\b.*\b(expander|implant)\b",
-
-    # expander -> implant phrasing
     r"\bexpander[- ]?to[- ]?implant\b",
     r"\bconversion\b.*\bimplant\b",
-
-    # second stage language
     r"\bsecond stage\b",
     r"\bstage\s*2\b",
-
-    # permanent implant phrasing
     r"\bpermanent implant\b",
     r"\bfinal implant\b",
-
-    # implant after expander mention anywhere in note
     r"\b(expander|tissue expander|expanders|te)\b.*\b(implant|implants)\b",
     r"\b(implant|implants)\b.*\b(expander|tissue expander|expanders|te)\b",
-
-    # CPT hints sometimes written in notes
     r"\b19342\b",
     r"\b11970\b",
     r"\b11971\b",
-
-    # narrative phrasing
-    r"\bpatient returned for exchange\b",
     r"\bexchange of tissue expander\b",
     r"\bremoval of tissue expander\b",
     r"\bplacement of permanent implant\b",
@@ -150,7 +128,7 @@ def extract_snippets(text, rx, max_snips=8, ctx=350):
 
 
 # -------------------------
-# FN identification
+# Main
 # -------------------------
 
 def main():
@@ -165,9 +143,13 @@ def main():
     merged = normalize_cols(read_csv_robust(merged_path, dtype=str))
     cw = normalize_cols(read_csv_robust(crosswalk_path, dtype=str))
 
+    # ---- Identify columns safely
     mrn_col = pick_first_existing(merged, ["MRN", "mrn"])
     gold_col = pick_first_existing(merged, ["GOLD_HAS_STAGE2", "Stage2_Applicable"])
     pred_col = pick_first_existing(merged, ["PRED_HAS_STAGE2", "HAS_STAGE2"])
+
+    if not mrn_col or not gold_col or not pred_col:
+        raise ValueError("Missing required columns in validation_merged.csv")
 
     merged["MRN"] = merged[mrn_col].map(normalize_id)
     merged["GOLD_HAS_STAGE2"] = merged[gold_col].map(to01).astype(int)
@@ -176,8 +158,12 @@ def main():
     fn = merged[(merged["GOLD_HAS_STAGE2"] == 1) &
                 (merged["PRED_HAS_STAGE2"] == 0)].copy()
 
+    # ---- Crosswalk
     cw_mrn = pick_first_existing(cw, ["MRN", "mrn"])
     cw_pid = pick_first_existing(cw, ["ENCRYPTED_PAT_ID", "ENCRYPTED_PATID", "patient_id"])
+
+    if not cw_mrn or not cw_pid:
+        raise ValueError("Missing MRN or ENCRYPTED_PAT_ID in crosswalk")
 
     cw["MRN"] = cw[cw_mrn].map(normalize_id)
     cw["ENCRYPTED_PAT_ID"] = cw[cw_pid].map(normalize_id)
@@ -185,6 +171,12 @@ def main():
     cw = cw[["MRN", "ENCRYPTED_PAT_ID"]].drop_duplicates()
 
     fn = fn.merge(cw, on="MRN", how="left")
+
+    # ---- Safely handle missing ENCRYPTED_PAT_ID
+    if "ENCRYPTED_PAT_ID" not in fn.columns:
+        raise ValueError("ENCRYPTED_PAT_ID missing after merge.")
+
+    fn["ENCRYPTED_PAT_ID"] = fn["ENCRYPTED_PAT_ID"].fillna("").map(normalize_id)
     fn = fn[fn["ENCRYPTED_PAT_ID"] != ""].copy()
 
     rows = []
