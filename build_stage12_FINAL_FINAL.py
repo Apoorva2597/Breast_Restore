@@ -8,10 +8,15 @@ Input:    ./_staging_inputs/HPI11526 Operation Notes.csv (or first CSV in _stagi
 Outputs:  ./_outputs/patient_stage_summary_FINAL_FINAL.csv
           ./_outputs/stage_event_level_FINAL_FINAL.csv
 
-Stage2 logic (updated to reduce false positives from "planned/scheduled"):
+Stage2 logic (revised again to reduce FNs without opening the floodgates):
 Stage2 = strong exchange/expander->implant signal
-AND performed/operative context required (status post / underwent / post-op / POD / op-note cues).
-Planning/scheduling language is NOT sufficient evidence even if a date is present.
+AND one of:
+  A) performed/operative context (status post / underwent / postoperative / POD / op-note cues), OR
+  B) "anchored past-date" context near the exchange phrase:
+        exchange phrase + (on <date> / dated <date> / <Month> <d>, <yyyy>) in local window
+     AND NOT dominated by plan-only/future markers in that same local window.
+
+Planning/scheduling alone still excluded.
 """
 
 from __future__ import print_function
@@ -110,7 +115,6 @@ def _safe_int(x, default=0):
 # Context cues
 # -------------------------
 
-# Strong performed cues (expanded based on observed snippets)
 RE_PERFORMED = re.compile(
     r"\b("
     r"underwent|was performed|performed|completed|"
@@ -121,20 +125,19 @@ RE_PERFORMED = re.compile(
     re.I
 )
 
-# Operative note cues
 RE_OP_NOTE_CUES = re.compile(
     r"\b(operative report|op note|brief op note|procedure note|anesthesia|ebl|estimated blood loss|"
     r"specimen|drain|jp drain|implants?:|intraoperative|findings|complications|disposition|to pacu)\b",
     re.I
 )
 
-# Planning/scheduling cues (used as negatives unless performed cues also present)
+# Planning / future markers (local-window veto unless performed cues present)
 RE_PLAN = re.compile(
     r"\b("
     r"scheduled|schedule|will schedule|plan to|planning to|plans to|"
     r"will plan|we will|to be done|set up for|"
     r"candidate for|consider|discuss(ed|ion)|consent|pre[- ]?op|preoperative|"
-    r"will be performed|to be performed|upcoming"
+    r"will be performed|to be performed|upcoming|anticipated"
     r")\b",
     re.I
 )
@@ -155,44 +158,48 @@ RE_TE = re.compile(r"\b(tissue expander|tissue expanders|expander|expanders|\bte
 RE_REMOVE = re.compile(r"\b(remov(e|al|ed)?|explant(ed)?|take out)\b", re.I)
 RE_IMPLANT = re.compile(r"\bimplant(s)?\b", re.I)
 
-# Strong exchange phrase (expanded)
 RE_EXCHANGE_TE_FOR_IMPLANT = re.compile(
-    r"\bexchange(d)?\b.{0,80}\b(tissue expander|tissue expanders|expanders|expander|\bte\b)\b.{0,120}\b(for|to)\b.{0,80}\bimplant(s)?\b"
-    r"|\b(tissue expander|tissue expanders|expanders|expander|\bte\b)\b.{0,80}\bexchang(e|ed)\b.{0,80}\b(for|to)\b.{0,80}\bimplant(s)?\b",
+    r"\bexchange(d)?\b.{0,120}\b(tissue expander|tissue expanders|expanders|expander|\bte\b)\b.{0,220}\b(for|to)\b.{0,120}\bimplant(s)?\b"
+    r"|\b(tissue expander|tissue expanders|expanders|expander|\bte\b)\b.{0,120}\bexchang(e|ed)\b.{0,120}\b(for|to)\b.{0,120}\bimplant(s)?\b",
     re.I
 )
 
-# Implant exchange/replace language (kept)
 RE_IMPLANT_EXCHANGE = re.compile(
     r"\bimplant(s)?\b.*\b(exchange|exchang(e|ed)|replace|replaced|replacement)\b"
     r"|\b(exchange|exchang(e|ed)|replace|replaced|replacement)\b.*\bimplant(s)?\b",
     re.I
 )
 
-# Explicit "expander to implant" phrase
 RE_EXPANDER_TO_IMPLANT = re.compile(r"\bexpander[- ]?to[- ]?implant\b", re.I)
 
-# Additional stage2 performed phrasing seen in snippets
 RE_STATUS_POST_EXCHANGE = re.compile(
-    r"\b(status\s+post|s/p|post[- ]?op|postoperative)\b.{0,120}\b(exchange|exchang(ed)?|implant exchange)\b",
+    r"\b(status\s+post|s/p|post[- ]?op|postoperative)\b.{0,200}\b(exchange|exchang(ed)?|implant exchange)\b",
     re.I
 )
 
 RE_UNDERWENT_EXCHANGE = re.compile(
-    r"\bunderwent\b.{0,140}\b(exchange|exchang(ed)?)\b.{0,140}\b(expander|tissue expander|implant)\b",
+    r"\bunderwent\b.{0,240}\b(exchange|exchang(ed)?)\b.{0,240}\b(expander|tissue expander|implant)\b",
     re.I
 )
 
-# NOT Stage2: expander removed without implant
 RE_REMOVE_NO_IMPLANT = re.compile(
     r"\b(expander|expanders|tissue expander|tissue expanders|\bte\b)\b.*\b(remov(e|ed|al)?|explant(ed)?|take out)\b"
-    r".{0,160}\b(without|no)\b.{0,80}\b(implant|implants)\b",
+    r".{0,220}\b(without|no)\b.{0,120}\b(implant|implants)\b",
     re.I
 )
 
-# NOT Stage2: clearly future tense around key terms (unless performed cues are also present)
+# Past-date anchors (local window)
+RE_DATE_NUM = re.compile(r"\b(\d{1,2}/\d{1,2}/\d{2,4}|\d{4}-\d{1,2}-\d{1,2})\b", re.I)
+RE_DATE_ON = re.compile(r"\b(on|dated|date of)\s+(\d{1,2}/\d{1,2}/\d{2,4}|\d{4}-\d{1,2}-\d{1,2})\b", re.I)
+RE_DATE_MON = re.compile(
+    r"\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|"
+    r"sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{1,2}(?:st|nd|rd|th)?(?:,)?\s+\d{4}\b",
+    re.I
+)
+
+# Future words that usually mean "not yet" (local-window veto unless performed cues present)
 RE_FUTURE_TENSE = re.compile(
-    r"\b(will|to be performed|scheduled|plan(ned|ning)?|plans to|candidate for)\b",
+    r"\b(will|to be performed|scheduled|schedule(d)? for|plan(ned|ning)?|plans to|candidate for|upcoming|anticipated)\b",
     re.I
 )
 
@@ -204,59 +211,76 @@ STAGE1_PATTERNS = [
     r"\b(mastectomy|nipple[- ]?sparing mastectomy|skin[- ]?sparing mastectomy)\b",
 ]
 
-def _near_window(t, span_start, span_end, window=180):
+def _near_window(t, span_start, span_end, window=220):
     a = max(0, span_start - window)
     b = min(len(t), span_end + window)
     return t[a:b]
+
+def _anchored_past_date_context(local_ctx):
+    # Must show a date anchor AND not look like future-only wording in that same local window
+    if not (RE_DATE_ON.search(local_ctx) or RE_DATE_MON.search(local_ctx)):
+        # fallback: bare numeric date can be too noisy; require "on/dated/date of" or month-name format
+        return False
+    # If future tense dominates and no performed cues, reject
+    if RE_FUTURE_TENSE.search(local_ctx) and (not has_performed_context(local_ctx)):
+        return False
+    return True
 
 def _stage2_bucket(t):
     # hard negative
     if RE_REMOVE_NO_IMPLANT.search(t):
         return False, ""
 
-    # exclude planning-only notes globally
+    # global planning-only exclusion
     if planning_only(t):
         return False, ""
 
-    # stage2 signal (any)
+    # strong performed patterns can qualify even if signal is weak
+    strong_perf = True if (RE_STATUS_POST_EXCHANGE.search(t) or RE_UNDERWENT_EXCHANGE.search(t)) else False
+
+    # stage2 signal
     signal = ""
+    m = None
+
     m = RE_EXCHANGE_TE_FOR_IMPLANT.search(t)
     if m:
-        signal = r"EXCHANGE: exchange (TE) for/to implant"
-        ctx = _near_window(t, m.start(), m.end(), window=220)
-        # if this local context is future-tense and not performed, drop
-        if RE_FUTURE_TENSE.search(ctx) and (not has_performed_context(ctx)):
-            return False, ""
+        signal = "EXCHANGE: exchange (TE) for/to implant"
     else:
         m = RE_IMPLANT_EXCHANGE.search(t)
         if m:
-            signal = r"EXCHANGE: implant + (exchange|replace|replacement)"
-            ctx = _near_window(t, m.start(), m.end(), window=220)
-            if RE_FUTURE_TENSE.search(ctx) and (not has_performed_context(ctx)):
-                return False, ""
+            signal = "EXCHANGE: implant + (exchange|replace|replacement)"
         else:
             m = RE_EXPANDER_TO_IMPLANT.search(t)
             if m:
-                signal = r"PHRASE: expander-to-implant"
-                ctx = _near_window(t, m.start(), m.end(), window=220)
-                if RE_FUTURE_TENSE.search(ctx) and (not has_performed_context(ctx)):
-                    return False, ""
+                signal = "PHRASE: expander-to-implant"
             else:
-                # fallback: TE + remove + implant (but still require performed)
                 if (RE_TE.search(t) and RE_REMOVE.search(t) and RE_IMPLANT.search(t)):
-                    signal = r"EXPANDER->IMPLANT: (TE) + (remove/explant/take out) + implant"
+                    # weaker: requires performed context
+                    signal = "EXPANDER->IMPLANT: (TE) + (remove/explant/take out) + implant"
 
-    # extra strong performed patterns can qualify even if signal is weak
-    strong_perf = True if (RE_STATUS_POST_EXCHANGE.search(t) or RE_UNDERWENT_EXCHANGE.search(t)) else False
-
-    if not signal and (not strong_perf):
+    if (not signal) and (not strong_perf):
         return False, ""
 
-    # REQUIRE performed/operative context (removes the "scheduled with date" false positives)
+    # If we have a match span, do local context veto/allow
+    local_ctx = ""
+    if m is not None:
+        local_ctx = _near_window(t, m.start(), m.end(), window=260)
+
+        # If local context is clearly future-only and not performed, reject
+        if RE_FUTURE_TENSE.search(local_ctx) and (not has_performed_context(local_ctx)):
+            # BUT allow if anchored past-date context is present (often written without classic performed verbs)
+            if not _anchored_past_date_context(local_ctx):
+                return False, ""
+
+    # Accept if performed/operative context (global) or strong_perf
     if has_performed_context(t) or strong_perf:
         if strong_perf and (not signal):
             return True, "PERFORMED: status-post/underwent exchange pattern"
         return True, signal
+
+    # Secondary accept: anchored past-date context near exchange phrase (without classic performed words)
+    if local_ctx and _anchored_past_date_context(local_ctx):
+        return True, "PAST-DATE-ANCHORED: exchange + anchored date (non-future local ctx)"
 
     return False, ""
 
