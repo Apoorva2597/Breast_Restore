@@ -36,7 +36,7 @@ def _safe_mkdir(path):
         os.makedirs(path)
 
 def _find_op_csv():
-    p = os.path.join(STAGING_DIR, "HPI11526 Operation Notes.csv")
+    p = os.path.join(STAGING_DIR, "HPI11526 Operation Notes.csv", "HPI11526 Clinic Notes.csv" )
     if not os.path.isfile(p):
         raise IOError("Missing OP notes file: {0}".format(p))
     return p
