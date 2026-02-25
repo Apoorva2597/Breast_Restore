@@ -6,12 +6,14 @@
 # Supports:
 #   - direct --patient_id (ENCRYPTED_PAT_ID)
 #   - OR --mrn (will resolve MRN -> ENCRYPTED_PAT_ID via a crosswalk CSV)
+#   - OR pick an exemplar from validation_merged.csv using --outcome + --case_type (FP/FN/TP/TN)
 
 from __future__ import print_function
 import os
 import re
 import argparse
 import random
+import glob
 import pandas as pd
 
 
@@ -36,8 +38,10 @@ DEFAULT_ENCOUNTER_INPUTS = [
 ]
 
 # MRN -> ENCRYPTED_PAT_ID crosswalk
-# IMPORTANT: set this to your real crosswalk file path.
 DEFAULT_MRN_CROSSWALK = "/home/apokol/Breast_Restore/MRN_TO_ENCRYPTED_PAT_ID.csv"
+
+# Validation merged default
+DEFAULT_VALIDATION_MERGED = "/home/apokol/Breast_Restore/_outputs/validation_merged.csv"
 
 
 # ----------------------------
@@ -55,11 +59,9 @@ def _norm_col(c):
     return re.sub(r"\s+", "_", _safe_str(c).strip().upper())
 
 def detect_pid_col(columns):
-    # Prefer exact match if present
     for c in columns:
         if _norm_col(c) == "ENCRYPTED_PAT_ID":
             return c
-    # Otherwise heuristic
     for c in columns:
         lc = _safe_str(c).lower()
         if "encrypt" in lc and "id" in lc:
@@ -67,6 +69,16 @@ def detect_pid_col(columns):
     for c in columns:
         lc = _safe_str(c).lower()
         if ("pat" in lc or "patient" in lc) and "id" in lc:
+            return c
+    return None
+
+def detect_mrn_col(columns):
+    preferred = set(["MRN", "PAT_MRN", "PATIENT_MRN", "MEDICAL_RECORD_NUMBER"])
+    for c in columns:
+        if _norm_col(c) in preferred:
+            return c
+    for c in columns:
+        if "mrn" in _safe_str(c).lower():
             return c
     return None
 
@@ -81,7 +93,6 @@ def detect_note_type_col(columns):
     return None
 
 def detect_deid_text_col(columns):
-    # Must be DEID text, not raw
     candidates = []
     for c in columns:
         uc = _safe_str(c).strip().upper()
@@ -89,7 +100,6 @@ def detect_deid_text_col(columns):
             return c
         if "DEID" in uc or "DE-ID" in uc or "DE_IDENT" in uc:
             candidates.append(c)
-    # If multiple, prefer ones containing NOTE and TEXT
     for c in candidates:
         uc = _safe_str(c).upper()
         if "NOTE" in uc and "TEXT" in uc:
@@ -97,9 +107,6 @@ def detect_deid_text_col(columns):
     return candidates[0] if candidates else None
 
 def detect_datetime_col(columns):
-    """
-    Best-effort date/time col detection for NOTE tables.
-    """
     date_like = []
     for c in columns:
         lc = _safe_str(c).lower()
@@ -114,14 +121,9 @@ def detect_datetime_col(columns):
         for c in date_like:
             if key in _safe_str(c).lower():
                 return c
-
     return date_like[0] if date_like else None
 
 def detect_encounter_date_cols(columns):
-    """
-    Encounter tables often have multiple relevant date fields.
-    We return a prioritized list; the script will take the first parseable per row.
-    """
     norm_map = {}
     for c in columns:
         norm_map[_norm_col(c)] = c
@@ -167,10 +169,6 @@ def ensure_out_dir(p):
         os.makedirs(p)
 
 def read_csv_robust(path):
-    """
-    Avoid read_csv(errors=...) because your env threw:
-      TypeError: read_csv() got an unexpected keyword argument 'errors'
-    """
     try:
         return pd.read_csv(path, dtype=object, engine="python", encoding="utf-8")
     except Exception:
@@ -191,22 +189,23 @@ def try_parse_datetime(series):
     except Exception:
         return None
 
+def to01(v):
+    if v is None:
+        return 0
+    s = _safe_str(v).strip().lower()
+    if s in ["1", "y", "yes", "true", "t"]:
+        return 1
+    if s in ["0", "n", "no", "false", "f", ""]:
+        return 0
+    try:
+        return 1 if float(s) != 0.0 else 0
+    except Exception:
+        return 0
+
 
 # ----------------------------
 # MRN -> ENCRYPTED_PAT_ID resolution
 # ----------------------------
-def detect_mrn_col(columns):
-    # Preferred exact-ish names
-    preferred = set(["MRN", "PAT_MRN", "PATIENT_MRN", "MEDICAL_RECORD_NUMBER"])
-    for c in columns:
-        if _norm_col(c) in preferred:
-            return c
-    # Fallback heuristic
-    for c in columns:
-        if "mrn" in _safe_str(c).lower():
-            return c
-    return None
-
 def resolve_patient_id_from_mrn(mrn, crosswalk_path, mrn_col_override=None, pid_col_override=None):
     if not os.path.exists(crosswalk_path):
         raise RuntimeError("MRN crosswalk file not found: {}".format(crosswalk_path))
@@ -236,6 +235,153 @@ def resolve_patient_id_from_mrn(mrn, crosswalk_path, mrn_col_override=None, pid_
         raise RuntimeError("Matched row had empty ENCRYPTED_PAT_ID for MRN={}".format(mrn))
 
     return pid, mrn_col, pid_col, len(match)
+
+
+# ----------------------------
+# Stage2 anchor loading (frozen preferred)
+# ----------------------------
+def find_latest_frozen_stage2_patient_clean(root):
+    base = os.path.join(root, "_frozen_stage2")
+    if not os.path.isdir(base):
+        return None
+    cands = sorted(glob.glob(os.path.join(base, "*", "stage2_patient_clean.csv")))
+    if not cands:
+        return None
+    return os.path.abspath(cands[-1])
+
+def find_patient_stage_summary(root):
+    p = os.path.join(root, "_outputs", "patient_stage_summary.csv")
+    return os.path.abspath(p) if os.path.isfile(p) else None
+
+def parse_date_any(x):
+    s = _safe_str(x).strip()
+    if not s:
+        return None
+    try:
+        # pandas handles most formats
+        dt = pd.to_datetime(s, errors="coerce", infer_datetime_format=True)
+        if pd.isnull(dt):
+            return None
+        return dt.to_pydatetime()
+    except Exception:
+        return None
+
+def load_stage2_anchor_dt(root, patient_id):
+    # frozen preferred
+    frozen = find_latest_frozen_stage2_patient_clean(root)
+    if frozen and os.path.exists(frozen):
+        df = read_csv_robust(frozen)
+        pid_col = detect_pid_col(df.columns)
+        if pid_col and "STAGE2_DATE" in df.columns:
+            sub = df[df[pid_col].astype(str).str.strip() == _safe_str(patient_id).strip()]
+            if not sub.empty:
+                dt = parse_date_any(sub.iloc[0]["STAGE2_DATE"])
+                if dt:
+                    return dt, "frozen_stage2_patient_clean", frozen
+    # fallback outputs
+    summ = find_patient_stage_summary(root)
+    if summ and os.path.exists(summ):
+        df = read_csv_robust(summ)
+        pid_col = detect_pid_col(df.columns)
+        if pid_col and "STAGE2_DATE" in df.columns:
+            sub = df[df[pid_col].astype(str).str.strip() == _safe_str(patient_id).strip()]
+            if not sub.empty:
+                dt = parse_date_any(sub.iloc[0]["STAGE2_DATE"])
+                if dt:
+                    return dt, "patient_stage_summary", summ
+    return None, "NONE", ""
+
+
+# ----------------------------
+# Validation exemplar picker
+# ----------------------------
+def pick_case_from_validation(validation_path, outcome, case_type):
+    """
+    Returns dict with MRN, ENCRYPTED_PAT_ID (if present), and context cols.
+    """
+    if not os.path.exists(validation_path):
+        raise RuntimeError("Validation file not found: {}".format(validation_path))
+
+    df = read_csv_robust(validation_path)
+
+    # Determine columns
+    mrn_col = detect_mrn_col(df.columns) or "MRN" if "MRN" in df.columns else None
+    pid_col = detect_pid_col(df.columns)
+
+    # Map outcome -> gold/pred cols (your merged file uses these names)
+    gold_map = {
+        "MinorComp": "GOLD_Stage2_MinorComp",
+        "Reoperation": "GOLD_Stage2_Reoperation",
+        "Rehospitalization": "GOLD_Stage2_Rehospitalization",
+        "MajorComp": "GOLD_Stage2_MajorComp",
+        "Failure": "GOLD_Stage2_Failure",
+        "Revision": "GOLD_Stage2_Revision",
+    }
+    pred_map = {
+        "MinorComp": "Stage2_MinorComp_pred",
+        "Reoperation": "Stage2_Reoperation_pred",
+        "Rehospitalization": "Stage2_Rehospitalization_pred",
+        "MajorComp": "Stage2_MajorComp_pred",
+        "Failure": "Stage2_Failure_pred",
+        "Revision": "Stage2_Revision_pred",
+    }
+
+    if outcome not in gold_map or outcome not in pred_map:
+        raise RuntimeError("Unknown outcome: {}. Use one of: {}".format(outcome, sorted(gold_map.keys())))
+
+    gold_col = gold_map[outcome]
+    pred_col = pred_map[outcome]
+
+    if gold_col not in df.columns or pred_col not in df.columns:
+        raise RuntimeError("Missing columns in validation file for {}: {} / {}".format(outcome, gold_col, pred_col))
+
+    tmp = df.copy()
+    tmp["_g"] = tmp[gold_col].map(to01)
+    tmp["_p"] = tmp[pred_col].map(to01)
+
+    ct = case_type.upper().strip()
+    if ct == "FP":
+        sub = tmp[(tmp["_g"] == 0) & (tmp["_p"] == 1)]
+    elif ct == "FN":
+        sub = tmp[(tmp["_g"] == 1) & (tmp["_p"] == 0)]
+    elif ct == "TP":
+        sub = tmp[(tmp["_g"] == 1) & (tmp["_p"] == 1)]
+    elif ct == "TN":
+        sub = tmp[(tmp["_g"] == 0) & (tmp["_p"] == 0)]
+    else:
+        raise RuntimeError("case_type must be one of FP/FN/TP/TN")
+
+    if sub.empty:
+        raise RuntimeError("No rows found for outcome={} case_type={} in {}".format(outcome, ct, validation_path))
+
+    # Prefer rows that have an MRN (so you can de-id via MRN)
+    if mrn_col:
+        ok = sub[mrn_col].astype(str).str.strip()
+        sub["_mrn_ok"] = (ok != "") & (ok.str.lower() != "nan")
+        sub = sub.sort_values(["_mrn_ok"], ascending=False)
+
+    r = sub.iloc[0].to_dict()
+
+    ctx = {
+        "outcome": outcome,
+        "case_type": ct,
+        "gold_col": gold_col,
+        "pred_col": pred_col,
+        "gold": _safe_str(r.get(gold_col, "")),
+        "pred": _safe_str(r.get(pred_col, "")),
+        "MRN": _safe_str(r.get(mrn_col, "")) if mrn_col else "",
+        "ENCRYPTED_PAT_ID": _safe_str(r.get(pid_col, "")) if pid_col else "",
+        "STAGE2_DATE": _safe_str(r.get("STAGE2_DATE", "")),
+        "WINDOW_START": _safe_str(r.get("WINDOW_START", "")),
+        "WINDOW_END": _safe_str(r.get("WINDOW_END", "")),
+    }
+
+    # Include any evidence columns that exist for convenience
+    for c in df.columns:
+        if "evidence" in _safe_str(c).lower() or "snippet" in _safe_str(c).lower() or "pattern" in _safe_str(c).lower():
+            ctx[c] = _safe_str(r.get(c, ""))
+
+    return ctx
 
 
 # ----------------------------
@@ -308,16 +454,25 @@ def write_notes_bundle(patient_id, rows, out_dir):
 
     return patient_dir, timeline_path, combined_path
 
-def write_encounters_timeline(patient_id, encounter_rows, patient_dir):
+def write_encounters_timeline(encounter_rows, patient_dir):
     out_path = os.path.join(patient_dir, "encounters_timeline.csv")
     df = pd.DataFrame(encounter_rows)
+
+    if len(df) > 0 and "BEST_EVENT_DT_PARSED" in df.columns:
+        # Sort by parsed datetime
+        try:
+            df["_sort"] = df["BEST_EVENT_DT_PARSED"].apply(lambda x: x if x is not None else pd.NaT)
+            df = df.sort_values(["_sort", "SOURCE_FILE", "ROW_IDX"], ascending=True)
+            df = df.drop(columns=["_sort"])
+        except Exception:
+            pass
 
     preferred = [
         "ENCRYPTED_PAT_ID", "BEST_EVENT_DT_RAW", "BEST_EVENT_DT_PARSED",
         "ANCHOR_SOURCE_COL", "SOURCE_FILE",
         "PAT_ENC_CSN_ID", "ENCRYPTED_CSN", "ENCOUNTER_TYPE",
         "DEPARTMENT", "OP_DEPARTMENT",
-        "RECONSTRUCTION_DATE", "OPERATION_DATE", "ADMIT_DATE",
+        "RECONSTRUCTION_DATE", "OPERATION_DATE", "ADMIT_DATE", "DISCHARGE_DATE_DT",
         "CPT_CODE", "PROCEDURE", "REASON_FOR_VISIT",
         "ROW_IDX"
     ]
@@ -328,61 +483,53 @@ def write_encounters_timeline(patient_id, encounter_rows, patient_dir):
     for c in df.columns:
         if c not in cols:
             cols.append(c)
-    df = df[cols]
+    df = df[cols] if len(cols) else df
 
     df.to_csv(out_path, index=False, encoding="utf-8")
     return out_path
 
-def compute_anchor_from_encounters(encounter_rows):
-    """
-    Anchor = earliest parsed BEST_EVENT_DT_PARSED across encounter rows.
-    Returns (anchor_dt, source_col, n_rows)
-    """
-    best = None
-    best_source = None
-    for r in encounter_rows:
-        dtp = r.get("BEST_EVENT_DT_PARSED", None)
-        if dtp is None:
-            continue
-        if best is None or dtp < best:
-            best = dtp
-            best_source = r.get("ANCHOR_SOURCE_COL", None)
-    return best, best_source, len(encounter_rows)
-
-def write_anchor_summary(patient_id, anchor_dt, anchor_source, n_rows, patient_dir):
+def write_anchor_summary_stage2(patient_id, stage2_dt, source_label, source_path, patient_dir):
     out_path = os.path.join(patient_dir, "stage2_anchor_summary.txt")
     with open(out_path, "w") as f:
-        f.write("STAGE 2 ANCHOR SUMMARY (ENCOUNTER-BASED)\n")
-        f.write("======================================\n\n")
+        f.write("STAGE 2 ANCHOR SUMMARY (STAGE2_DATE-BASED)\n")
+        f.write("=========================================\n\n")
         f.write("ENCRYPTED_PAT_ID: {}\n".format(patient_id))
-        f.write("TOTAL_ENCOUNTER_ROWS: {}\n\n".format(n_rows))
+        f.write("SOURCE_LABEL: {}\n".format(source_label))
+        f.write("SOURCE_PATH: {}\n\n".format(source_path))
 
-        if anchor_dt is None:
-            f.write("ANCHOR_DATE (parsed): NONE FOUND\n")
-            f.write("ANCHOR_SOURCE: NONE\n\n")
-            f.write("WARNING: No parseable encounter dates were found.\n")
+        if stage2_dt is None:
+            f.write("STAGE2_DATE (parsed): NONE FOUND\n\n")
+            f.write("WARNING: Could not find Stage2 date for this patient in frozen pack or patient_stage_summary.\n")
             return out_path, None
 
-        anchor_30 = anchor_dt + pd.Timedelta(days=30)
-        anchor_90 = anchor_dt + pd.Timedelta(days=90)
-        anchor_365 = anchor_dt + pd.Timedelta(days=365)
+        anchor_30 = stage2_dt + pd.Timedelta(days=30)
+        anchor_90 = stage2_dt + pd.Timedelta(days=90)
+        anchor_365 = stage2_dt + pd.Timedelta(days=365)
 
-        f.write("ANCHOR_DATE (parsed): {}\n".format(anchor_dt.isoformat()))
-        f.write("ANCHOR_SOURCE: {}\n\n".format(anchor_source if anchor_source else "UNKNOWN"))
-
-        f.write("WINDOWS (relative to ANCHOR_DATE)\n")
+        f.write("STAGE2_DATE (parsed): {}\n\n".format(stage2_dt.isoformat()))
+        f.write("WINDOWS (relative to STAGE2_DATE)\n")
         f.write("---------------------------------\n")
-        f.write("ANCHOR + 30 days : {}\n".format(anchor_30.date().isoformat()))
-        f.write("ANCHOR + 90 days : {}\n".format(anchor_90.date().isoformat()))
-        f.write("ANCHOR + 365 days: {}\n\n".format(anchor_365.date().isoformat()))
-
+        f.write("STAGE2 + 30 days : {}\n".format(anchor_30.date().isoformat()))
+        f.write("STAGE2 + 90 days : {}\n".format(anchor_90.date().isoformat()))
+        f.write("STAGE2 + 365 days: {}\n\n".format(anchor_365.date().isoformat()))
         f.write("Interpretation:\n")
         f.write("  0–30d   = early\n")
         f.write("  31–90d  = intermediate\n")
         f.write("  91–365d = late\n")
         f.write("  >365d   = very late\n")
 
-    return out_path, anchor_dt
+    return out_path, stage2_dt
+
+def write_case_context(case_ctx, patient_dir):
+    if not case_ctx:
+        return ""
+    out_path = os.path.join(patient_dir, "case_context.txt")
+    with open(out_path, "w") as f:
+        f.write("VALIDATION EXEMPLAR CONTEXT\n")
+        f.write("===========================\n\n")
+        for k in sorted(case_ctx.keys()):
+            f.write("{}: {}\n".format(k, _safe_str(case_ctx.get(k, ""))))
+    return out_path
 
 
 # ----------------------------
@@ -394,26 +541,59 @@ def main():
     ap.add_argument("--encounters", nargs="+", default=None, help="Encounter CSV files (optional; uses defaults if omitted).")
     ap.add_argument("--out_dir", default=DEFAULT_OUT_DIR, help="Output directory for patient bundles.")
 
-    # Either provide patient_id OR mrn
+    # Either provide patient_id OR mrn OR exemplar selection
     ap.add_argument("--patient_id", default=None, help="ENCRYPTED_PAT_ID to export.")
     ap.add_argument("--mrn", default=None, help="MRN to resolve to ENCRYPTED_PAT_ID via crosswalk, then export.")
     ap.add_argument("--mrn_crosswalk", default=DEFAULT_MRN_CROSSWALK, help="CSV mapping MRN -> ENCRYPTED_PAT_ID.")
     ap.add_argument("--mrn_col", default=None, help="Optional: MRN column name in crosswalk (override auto-detect).")
     ap.add_argument("--pid_col", default=None, help="Optional: ENCRYPTED_PAT_ID column name in crosswalk (override auto-detect).")
 
+    # Exemplar mode from validation_merged.csv
+    ap.add_argument("--validation", default=DEFAULT_VALIDATION_MERGED, help="Path to validation_merged.csv")
+    ap.add_argument("--outcome", default=None, help="Outcome name for exemplar mode: MinorComp, Reoperation, Rehospitalization, MajorComp, Failure, Revision")
+    ap.add_argument("--case_type", default=None, help="Case type for exemplar mode: FP, FN, TP, TN")
+
     ap.add_argument("--pick_random", action="store_true", help="Pick a random patient with >= --min_notes (from notes only).")
     ap.add_argument("--min_notes", type=int, default=10, help="Used with --pick_random.")
     ap.add_argument("--max_rows_per_file", type=int, default=None, help="Optional: cap rows per file for fast tests.")
     args = ap.parse_args()
 
+    root = os.path.abspath(".")
     deid_inputs = args.inputs if args.inputs else list(DEFAULT_DEID_INPUTS)
     enc_inputs = args.encounters if args.encounters else list(DEFAULT_ENCOUNTER_INPUTS)
 
     ensure_out_dir(args.out_dir)
 
-    # Resolve patient_id (priority: mrn -> patient_id; else explicit patient_id; else default; unless pick_random)
+    # -------------
+    # Resolve patient selection
+    # -------------
     patient_id = None
-    if args.mrn:
+    selected_mrn = None
+    case_ctx = None
+
+    # Exemplar mode: needs both outcome and case_type
+    if args.outcome and args.case_type:
+        case_ctx = pick_case_from_validation(args.validation, args.outcome, args.case_type)
+        selected_mrn = _safe_str(case_ctx.get("MRN", "")).strip()
+        selected_pid = _safe_str(case_ctx.get("ENCRYPTED_PAT_ID", "")).strip()
+
+        if selected_mrn:
+            resolved_pid, used_mrn_col, used_pid_col, n_matches = resolve_patient_id_from_mrn(
+                mrn=selected_mrn,
+                crosswalk_path=args.mrn_crosswalk,
+                mrn_col_override=args.mrn_col,
+                pid_col_override=args.pid_col
+            )
+            patient_id = resolved_pid
+            print("Exemplar pick: outcome={} case_type={} MRN={} -> ENCRYPTED_PAT_ID={} (matches={})".format(
+                args.outcome, args.case_type, selected_mrn, patient_id, n_matches
+            ))
+        elif selected_pid:
+            patient_id = selected_pid
+            print("Exemplar pick: outcome={} case_type={} ENCRYPTED_PAT_ID={}".format(args.outcome, args.case_type, patient_id))
+        else:
+            raise RuntimeError("Exemplar row had neither MRN nor ENCRYPTED_PAT_ID. Try another case_type or outcome.")
+    elif args.mrn:
         resolved_pid, used_mrn_col, used_pid_col, n_matches = resolve_patient_id_from_mrn(
             mrn=args.mrn,
             crosswalk_path=args.mrn_crosswalk,
@@ -421,6 +601,7 @@ def main():
             pid_col_override=args.pid_col
         )
         patient_id = resolved_pid
+        selected_mrn = args.mrn
         print("Resolved MRN {} -> ENCRYPTED_PAT_ID {} (matches={})".format(args.mrn, patient_id, n_matches))
         print("Crosswalk cols: MRN={}, ENCRYPTED_PAT_ID={}".format(used_mrn_col, used_pid_col))
     elif args.patient_id:
@@ -512,8 +693,19 @@ def main():
     # Write note bundle
     patient_dir, notes_timeline_path, combined_path = write_notes_bundle(patient_id, patient_note_rows, args.out_dir)
 
+    # If exemplar mode, write case context into the bundle
+    case_context_path = ""
+    if case_ctx:
+        case_context_path = write_case_context(case_ctx, patient_dir)
+
     # ---------
-    # ENCOUNTERS: Build structured date timeline + anchor
+    # STAGE2 anchor summary (from frozen pack preferred)
+    # ---------
+    stage2_dt, stage2_source_label, stage2_source_path = load_stage2_anchor_dt(root, patient_id)
+    anchor_summary_path, stage2_dt = write_anchor_summary_stage2(patient_id, stage2_dt, stage2_source_label, stage2_source_path, patient_dir)
+
+    # ---------
+    # ENCOUNTERS: Build structured date timeline
     # ---------
     encounter_rows = []
 
@@ -576,33 +768,27 @@ def main():
 
             encounter_rows.append(row)
 
-    encounters_path = ""
-    anchor_summary_path = ""
-    anchor_dt = None
-
     if encounter_rows:
-        encounters_path = write_encounters_timeline(patient_id, encounter_rows, patient_dir)
-        anchor_dt, anchor_source, n_enc = compute_anchor_from_encounters(encounter_rows)
-        anchor_summary_path, anchor_dt = write_anchor_summary(patient_id, anchor_dt, anchor_source, n_enc, patient_dir)
+        encounters_path = write_encounters_timeline(encounter_rows, patient_dir)
     else:
         encounters_path = os.path.join(patient_dir, "encounters_timeline.csv")
         pd.DataFrame([]).to_csv(encounters_path, index=False, encoding="utf-8")
-        anchor_summary_path = os.path.join(patient_dir, "stage2_anchor_summary.txt")
-        with open(anchor_summary_path, "w") as f:
-            f.write("No encounter rows found for this patient_id across provided encounter files.\n")
 
     # ---------
     # Print summary
     # ---------
     print("\nEXPORTED PATIENT:")
     print("  ENCRYPTED_PAT_ID:", patient_id)
+    print("  MRN (if used)    :", selected_mrn if selected_mrn else "")
     print("  Notes exported   :", len(patient_note_rows))
     print("  Patient dir      :", patient_dir)
     print("  Notes timeline   :", notes_timeline_path)
     print("  Combined notes   :", combined_path)
     print("  Encounters file  :", encounters_path)
+    print("  Stage2 anchor    :", stage2_dt.isoformat() if stage2_dt else "NONE")
     print("  Anchor summary   :", anchor_summary_path)
-    print("  Anchor (parsed)  :", anchor_dt.isoformat() if anchor_dt else "NONE")
+    if case_context_path:
+        print("  Case context     :", case_context_path)
     print("Done.")
 
 if __name__ == "__main__":
