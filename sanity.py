@@ -1,5 +1,1 @@
-import pandas as pd
-g=pd.read_csv('gold_cleaned_for_cedar.csv',dtype=str,low_memory=False)
-num=lambda s: pd.to_numeric(s,errors='coerce').fillna(0).astype(int)
-cols=['Stage2_MajorComp','Stage2_Reoperation','Stage2_Rehospitalization','Stage2_Failure','Stage2_Revision']; df=g[num(g.get('Stage2_MajorComp',0))==1]
-print(df[cols].apply(num).value_counts(dropna=False))
+import pandas as pd; g=pd.read_csv('gold_cleaned_for_cedar.csv',dtype=str,low_memory=False); num=lambda s: pd.to_numeric(s,errors='coerce').fillna(0).astype(int); key=['MRN','PatientID','Recon_Type','Recon_Timing','Stage2_Applicable','Stage2_MinorComp','Stage2_Reoperation','Stage2_Rehospitalization','Stage2_MajorComp','Stage2_Failure','Stage2_Revision']; df=g[num(g.get('Stage2_MajorComp',0))==1]; print('MajorComp rows:',len(df)); print(df[[c for c in key if c in df.columns]].head(10).to_string(index=False))
