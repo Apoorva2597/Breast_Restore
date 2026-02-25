@@ -1,45 +1,47 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-build_stage2_outcomes_FINAL.py  (Python 3.6.8 compatible)
+stage2_complications_from_notes.py  (Python 3.6.8 compatible)
 
-Run from: ~/Breast_Restore
+Run from:  ~/Breast_Restore
+Inputs:
+  - Stage2 anchor (prefers frozen pack if present):
+      ./_frozen_stage2/*/stage2_patient_clean.csv
+    else:
+      ./_outputs/patient_stage_summary.csv
+  - Notes (auto-found under ~/my_data_Breast/**/):
+      HPI11526 Clinic Notes.csv
+      HPI11526 Inpatient Notes.csv
+      HPI11526 Operation Notes.csv
 
-Inputs (auto-detected):
-  1) Stage2 anchor (required):
-       ./_outputs/patient_stage_summary.csv
-     Uses:
-       ENCRYPTED_PAT_ID, STAGE2_DATE, HAS_STAGE2
-
-  2) Encounter sources (auto-detected; at least 1 recommended):
-       HPI11526 Clinic Encounters.csv
-       HPI11526 Inpatient Encounters.csv
-       HPI11526 Operation Encounters.csv
-
-Outputs:
+Output:
   ./_outputs/stage2_outcomes_pred.csv
 
-What it does (proper, definition-aligned):
-  - Anchors 1-year window AFTER Stage2 date per patient (window_start = stage2_date, window_end = stage2_date + 365d)
-  - Detects *complication-driven* reoperation / rehospitalization (NOT just any reconstructive CPT)
-  - Detects failure (implant/flap removal due to complication)
-  - Detects revision (elective contour/asymmetry/scar correction; can be CPT/keyword-based)
-  - Detects minor complication (complication evidence within window WITHOUT reop/rehosp)
-  - Derives major complication = reop OR rehosp
+What it does (high level):
+- Takes your Stage 2 date per patient as the anchor
+- Defines a 1-year window post Stage 2 (inclusive start; exclusive end)
+- Scans NOTE_TEXT in Clinic/Inpatient/Operation NOTES for complication/treatment signals
+- Produces patient-level outcome flags + “best evidence” (date/source/note_id/snippet/pattern)
+
+Notes:
+- This is intentionally conservative: it does NOT infer complications from generic encounter reasons.
+- It only fires when it sees explicit complication terms in note text, plus reop/failure/revision cues.
 """
 
 from __future__ import print_function
+
 import os
 import glob
 import re
+import csv
 from datetime import datetime, timedelta
 
 import pandas as pd
 
 
-# -----------------------------
+# -------------------------
 # Robust IO / normalization
-# -----------------------------
+# -------------------------
 
 def read_csv_robust(path, **kwargs):
     for enc in ["utf-8", "utf-8-sig", "cp1252", "latin1"]:
@@ -69,26 +71,23 @@ def to01(v):
         return 0
     try:
         return 1 if float(s) != 0.0 else 0
-    except:
+    except Exception:
         return 0
 
 
-def pick_first_existing(df, options):
-    for c in options:
-        if c in df.columns:
-            return c
-    return None
+def normalize_text(s):
+    if s is None:
+        return ""
+    s = str(s).replace("\r", "\n").lower()
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
 
 def parse_date_any(s):
-    """
-    Returns a python date (datetime.date) or None.
-    Handles common formats and timestamp-like strings.
-    """
     if s is None:
         return None
     s = str(s).strip()
-    if not s or s.lower() == "nan":
+    if not s:
         return None
 
     fmts = [
@@ -102,8 +101,6 @@ def parse_date_any(s):
         "%m/%d/%Y %H:%M",
         "%m/%d/%y %H:%M:%S",
         "%m/%d/%y %H:%M",
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%dT%H:%M:%S.%f",
     ]
     for fmt in fmts:
         try:
@@ -111,13 +108,6 @@ def parse_date_any(s):
         except Exception:
             pass
 
-    # fallback: extract date token
-    m = re.search(r"(\d{4}-\d{1,2}-\d{1,2})", s)
-    if m:
-        try:
-            return datetime.strptime(m.group(1), "%Y-%m-%d").date()
-        except Exception:
-            pass
     m = re.search(r"(\d{1,2}/\d{1,2}/\d{2,4})", s)
     if m:
         token = m.group(1)
@@ -127,481 +117,313 @@ def parse_date_any(s):
             except Exception:
                 pass
 
+    m = re.search(r"(\d{4}-\d{1,2}-\d{1,2})", s)
+    if m:
+        token = m.group(1)
+        try:
+            return datetime.strptime(token, "%Y-%m-%d").date()
+        except Exception:
+            pass
+
     return None
 
 
-def norm_text(*parts):
-    s = " ".join([("" if p is None else str(p)) for p in parts])
-    s = s.replace("\r", "\n").lower()
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+def pick_first_existing(df, options):
+    for c in options:
+        if c in df.columns:
+            return c
+    return None
 
 
-# -----------------------------
-# Auto-detect input files
-# -----------------------------
+# -------------------------
+# File discovery
+# -------------------------
 
-def find_stage_summary(root):
-    preferred = os.path.join(root, "_outputs", "patient_stage_summary.csv")
-    if os.path.isfile(preferred):
-        return os.path.abspath(preferred)
-
-    cands = []
-    cands += glob.glob(os.path.join(root, "_outputs", "*patient*stage*summary*.csv"))
-    cands += glob.glob(os.path.join(root, "**", "*patient*stage*summary*.csv"), recursive=True)
-    cands = [os.path.abspath(p) for p in cands if os.path.isfile(p)]
-    if not cands:
+def find_latest_frozen_stage2_patient_clean(root):
+    base = os.path.join(root, "_frozen_stage2")
+    if not os.path.isdir(base):
         return None
-    cands.sort(key=lambda x: len(x))
-    return cands[0]
+    candidates = sorted(glob.glob(os.path.join(base, "*", "stage2_patient_clean.csv")))
+    if not candidates:
+        return None
+    # folders are timestamped; last is newest
+    return os.path.abspath(candidates[-1])
 
 
-def _search_data_roots(root):
+def find_patient_stage_summary(root):
+    p = os.path.join(root, "_outputs", "patient_stage_summary.csv")
+    return os.path.abspath(p) if os.path.isfile(p) else None
+
+
+def find_notes_files():
     """
-    Common places you keep the HPI files.
-    We search:
-      - current repo
-      - ~/my_data_Breast/
-      - ../my_data_Breast/
+    Auto-find your HPI11526 notes under ~/my_data_Breast/**.
     """
-    homes = []
-    try:
-        homes.append(os.path.expanduser("~"))
-    except Exception:
-        pass
-
-    roots = [root]
-    for h in homes:
-        roots.append(os.path.join(h, "my_data_Breast"))
-    roots.append(os.path.abspath(os.path.join(root, "..", "my_data_Breast")))
-    # de-dup, keep existing
-    out = []
+    home = os.path.expanduser("~")
+    base = os.path.join(home, "my_data_Breast")
+    patterns = [
+        "**/HPI11526 Clinic Notes.csv",
+        "**/HPI11526 Inpatient Notes.csv",
+        "**/HPI11526 Operation Notes.csv",
+    ]
+    found = []
+    for pat in patterns:
+        found += glob.glob(os.path.join(base, pat), recursive=True)
+    # keep only existing files
+    found = [os.path.abspath(p) for p in found if os.path.isfile(p)]
+    # de-dupe preserving order
     seen = set()
-    for r in roots:
-        ar = os.path.abspath(r)
-        if ar not in seen and os.path.exists(ar):
-            out.append(ar)
-            seen.add(ar)
+    out = []
+    for p in found:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
     return out
 
 
-def find_encounter_file(root, kind):
-    """
-    kind in {"Clinic", "Inpatient", "Operation"}
-    """
-    targets = []
-    for base in _search_data_roots(root):
-        # allow either exact file or anywhere under base
-        targets += glob.glob(os.path.join(base, "**", "*{} Encounters.csv".format(kind)), recursive=True)
-        targets += glob.glob(os.path.join(base, "**", "*{} Encounter*.csv".format(kind)), recursive=True)
+# -------------------------
+# Signal dictionaries (regex)
+# -------------------------
 
-    targets = [os.path.abspath(p) for p in targets if os.path.isfile(p)]
-    if not targets:
-        return None
-    # prefer shortest path (usually the intended dataset location)
-    targets.sort(key=lambda x: len(x))
-    return targets[0]
-
-
-# -----------------------------
-# Patterns (definition-aligned)
-# -----------------------------
-# Complications list is from your spec:
-# Hematoma, Wound dehiscence, Wound infection, Mastectomy skin flap necrosis,
-# Seroma, Capsular contracture, Implant malposition, Implant rupture/leak/deflation,
-# Implant/expander extrusion, Other (systemic etc.)
-COMP_PATTERNS = [
-    ("hematoma", r"\bhematoma\b|\bevacuati(on|e)\b.*\bhematoma\b"),
-    ("seroma", r"\bseroma\b|\baspirat(e|ion)\b.*\bseroma\b"),
-    ("infection", r"\binfect(ion|ed|ious)\b|\bcellulit(is|ic)\b|\babscess\b|\bpus\b|\bpurulen(t|ce)\b"),
-    ("dehiscence", r"\bdehiscen(ce|t)\b|\bwound\b.*\b(open|breakdown|separat)\w*\b"),
-    ("skin_flap_necrosis", r"\b(necros(is|e)|eschar)\b|\bskin\s*flap\b.*\b(necros|ischemi)\w*\b"),
-    ("capsular_contracture", r"\bcapsular contracture\b|\bbaker\b.*\b(i|ii|iii|iv|1|2|3|4)\b"),
-    ("malposition", r"\bmalposition\b|\bbottom(ing)?\s*out\b|\bsymmastia\b|\blateral(iz|is)ation\b"),
-    ("rupture_leak_deflation", r"\bruptur(e|ed)\b|\bleak(age)?\b|\bdeflat(e|ion)\b"),
-    ("extrusion", r"\bextrusion\b|\bexpos(ed|ure)\b.*\b(implant|expander)\b"),
-    ("thromboembolism", r"\b(pulmonary embol(ism)?|pe\b|dvt\b|deep venous thromb)\b"),
-    ("systemic", r"\b(sepsis|bacteremi(a|c)|pneumonia|aki\b|acute kidney)\b"),
+# Specific complication categories (for future expansion; currently used as evidence for Minor/Major etc.)
+COMPLICATION_PATTERNS = [
+    ("hematoma", r"\bhematoma\b"),
+    ("seroma", r"\bseroma\b"),
+    ("infection", r"\b(infect(ion|ed)?|cellulit(is)?|abscess|purulen(t|ce)|sepsis)\b"),
+    ("dehiscence", r"\b(dehisc(ence|ed)?|wound (open|opened)|incision (open|opened))\b"),
+    ("necrosis", r"\b(necros(is|ed)?|eschar|skin flap necros)\b"),
+    ("capsular_contracture", r"\b(capsular contracture|baker (i|ii|iii|iv)|capsule contracture)\b"),
+    ("malposition", r"\b(implant malposition|malposition|bottom(ing)? out|symmastia)\b"),
+    ("rupture_deflation", r"\b(rupture|leak(age)?|deflat(ion|ed)?|collapse)\b"),
+    ("extrusion", r"\b(extrusion|exposed implant|implant exposure)\b"),
+    ("thromboembolism", r"\b(pulmonary embol(ism)?|\bpe\b|dvt|thromboembol(ism)?)\b"),
 ]
 
-# Surgical intervention / “return to OR” language (complication-driven)
-INTERVENTION_PATTERNS = [
-    ("washout", r"\bwashout\b|\birrigat(e|ion)\b.*\bdebrid\w*\b"),
-    ("debridement", r"\bdebrid(e|ement|ed)\b"),
-    ("drainage", r"\bdrain(age|ed)\b|\bevacuati(on|e)\b|\bincision and drainage\b|\bi\s*&\s*d\b"),
-    ("reoperation_generic", r"\breturn(ed)?\s+to\s+or\b|\btake\s*back\b|\bre-?operat(e|ion)\b"),
-    ("implant_exchange", r"\bimplant\b.*\bexchange|exchang(e|ed)\b.*\bimplant\b"),
-    ("implant_removal", r"\b(explant|remove(d)?|removal)\b.*\b(implant|expander)\b"),
+# Treatment signals
+REOP_PATTERNS = [
+    ("return_to_or", r"\b(return(ed)? to (the )?or|take\s*back|takeback)\b"),
+    ("washout", r"\b(wash\s*out|irrigat(e|ion))\b"),
+    ("debridement", r"\bdebrid(e|ement)\b"),
+    ("i_and_d", r"\b(i\s*&\s*d|incision and drainage)\b"),
+    ("explants", r"\b(explant|remove(d)? implant|implant removal|expander removal)\b"),
+    ("capsulectomy", r"\b(capsulectomy|capsulotomy)\b"),
 ]
 
-# Failure (implant/flap removal due to complication) – must be complication-driven OR explicit failure wording
+NONOP_PATTERNS = [
+    ("antibiotics", r"\b(antibiotic(s)?|keflex|cephalexin|clinda(mycin)?|doxy(cycline)?|augmentin|bactrim|vancomycin|zosyn|cefazolin)\b"),
+    ("drainage", r"\b(aspirat(e|ion)|percutaneous drainage|needle drainage|ir drain|drain placement)\b"),
+    ("wound_care", r"\b(dressing changes?|wound care|packing|wet to dry|local wound care)\b"),
+]
+
 FAILURE_PATTERNS = [
-    ("implant_removed", r"\b(explant|remove(d)?|removal)\b.*\b(implant|expander)\b"),
-    ("flap_loss", r"\bflap\b.*\b(loss|fail(ure|ed)|necros)\w*\b"),
-    ("device_extrusion", r"\bextrusion\b|\bexpos(ed|ure)\b.*\b(implant|expander)\b"),
+    ("implant_removed", r"\b(explant|implant removal|remove(d)? implant)\b"),
+    ("flap_loss", r"\b(flap loss|failed flap|takeback.*flap)\b"),
+    ("extrusion_failure", r"\b(extrusion|implant exposure)\b.*\b(explant|remov)\b"),
 ]
 
-# Revision (elective correction) – gold defines revision surgery after stage2 for contour/asymmetry/scar
 REVISION_PATTERNS = [
-    ("revision_word", r"\brevision\b|\brevise\b"),
-    ("scar_revision", r"\bscar\b.*\brevision\b|\bscar revision\b"),
-    ("fat_grafting", r"\bfat graft\w*\b|\blipofill(ing)?\b|\blipo-?injection\b|\bautologous fat\b"),
-    ("contour_asymmetry", r"\bcontour\b|\basymmetr(y|ies)\b|\bdeformit(y|ies)\b"),
-    ("capsulorrhaphy", r"\bcapsulorrhaphy\b|\bpocket\b.*\b(revision|repair)\b"),
-    ("implant_reposition", r"\breposition\b.*\bimplant\b|\bimplant\b.*\breposition\b"),
+    ("revision", r"\b(revision|scar revision|dog[- ]?ear|contour deformit(y|ies)|asymmetr(y|ies)|fat graft(ing)?|lipofill(ing)?|capsulorrhaphy)\b"),
+    ("cpt_19380_hint", r"\b19380\b"),  # if CPT appears in note text
 ]
 
-# CPT “hints”
-# IMPORTANT: we DO NOT mark reoperation solely on reconstruction CPTs (19340/19357/etc).
-# We only use these CPTs for revision/failure support or as additional evidence when comp keywords exist.
-CPT_FAILURE = set(["19328"])   # removal of implant material (common)
-CPT_REVISION = set(["19380"])  # revision of reconstructed breast
+# fast combined regexes
+COMP_RX = re.compile("|".join(["({})".format(p[1]) for p in COMPLICATION_PATTERNS]))
+REOP_RX = re.compile("|".join(["({})".format(p[1]) for p in REOP_PATTERNS]))
+NONOP_RX = re.compile("|".join(["({})".format(p[1]) for p in NONOP_PATTERNS]))
+FAIL_RX = re.compile("|".join(["({})".format(p[1]) for p in FAILURE_PATTERNS]))
+REV_RX = re.compile("|".join(["({})".format(p[1]) for p in REVISION_PATTERNS]))
 
 
-def match_first(patterns, text):
-    """
-    patterns: list of (name, regex)
-    returns (name, regex) of first match else ("","")
-    """
-    for name, rx in patterns:
-        if re.search(rx, text):
-            return name, rx
+def best_match(pattern_list, text):
+    for label, pat in pattern_list:
+        if re.search(pat, text):
+            return label, pat
     return "", ""
 
 
-def has_any(patterns, text):
-    for _, rx in patterns:
-        if re.search(rx, text):
-            return True
-    return False
+def make_snippet(text, width=220):
+    t = normalize_text(text)
+    if len(t) <= width:
+        return t
+    return t[:width] + "..."
 
 
-# -----------------------------
-# Evidence selection helpers
-# -----------------------------
+# -------------------------
+# Notes ingestion / aggregation
+# -------------------------
 
-def within_window(d, start, end):
-    if d is None or start is None or end is None:
-        return False
-    return (d >= start) and (d <= end)
-
-
-def take_earliest(e1, e2):
+def load_notes_aggregated(path):
     """
-    Each evidence is dict or None. Choose one with earlier date (or keep existing if one missing date).
+    Aggregates multi-line notes into one row per NOTE_ID (when NOTE_ID exists).
+    If NOTE_ID is missing, falls back to row-level scanning.
+    Returns a DataFrame with:
+      ENCRYPTED_PAT_ID, NOTE_DATE, NOTE_ID, NOTE_TYPE, NOTE_TEXT, SOURCE_FILE
     """
-    if e1 is None:
-        return e2
-    if e2 is None:
-        return e1
-    d1 = e1.get("date")
-    d2 = e2.get("date")
-    if d1 and d2:
-        return e1 if d1 <= d2 else e2
-    if d1 and not d2:
-        return e1
-    if d2 and not d1:
-        return e2
-    return e1
-
-
-def ev(date_obj, source, detail):
-    # detail = dict with keys: kind, pattern_name, pattern_rx, snippet(optional)
-    return {
-        "date": date_obj,
-        "source": source,
-        "pattern": detail.get("pattern_name", ""),
-        "pattern_rx": detail.get("pattern_rx", ""),
-        "kind": detail.get("kind", ""),
-    }
-
-
-# -----------------------------
-# Core extraction
-# -----------------------------
-
-def load_stage2_anchor(stage_path):
-    df = normalize_cols(read_csv_robust(stage_path, dtype=str, low_memory=False))
-    enc_col = pick_first_existing(df, ["ENCRYPTED_PAT_ID", "ENCRYPTED_PATID", "ENCRYPTED_PATIENT_ID"])
-    s2date_col = pick_first_existing(df, ["STAGE2_DATE", "Stage2_Date", "stage2_date"])
-    has_s2_col = pick_first_existing(df, ["HAS_STAGE2", "has_stage2", "PRED_HAS_STAGE2"])
-
-    if not enc_col or not s2date_col:
-        raise ValueError("Stage summary must have ENCRYPTED_PAT_ID and STAGE2_DATE. Found: {}".format(list(df.columns)))
-
-    df = df.rename(columns={enc_col: "ENCRYPTED_PAT_ID"})
-    df["ENCRYPTED_PAT_ID"] = df["ENCRYPTED_PAT_ID"].map(normalize_id)
-    df["STAGE2_DATE"] = df[s2date_col].map(lambda x: parse_date_any(x))
-    if has_s2_col:
-        df["HAS_STAGE2"] = df[has_s2_col].map(to01).astype(int)
-    else:
-        df["HAS_STAGE2"] = df["STAGE2_DATE"].notna().astype(int)
-
-    # keep only stage2 patients with a usable date
-    df = df[(df["HAS_STAGE2"] == 1) & (df["STAGE2_DATE"].notna())].copy()
-    # window
-    df["WINDOW_START"] = df["STAGE2_DATE"]
-    df["WINDOW_END"] = df["STAGE2_DATE"].map(lambda d: d + timedelta(days=365))
-    return df[["ENCRYPTED_PAT_ID", "STAGE2_DATE", "WINDOW_START", "WINDOW_END"]]
-
-
-def load_encounters(path, kind):
-    """
-    Standardize a minimal schema:
-      ENCRYPTED_PAT_ID, EVENT_DATE, REASON_FOR_VISIT, CPT_CODE, PROCEDURE
-    """
-    if not path or not os.path.isfile(path):
-        return None
-
     df = normalize_cols(read_csv_robust(path, dtype=str, low_memory=False))
+    src = os.path.basename(path)
+
     enc_col = pick_first_existing(df, ["ENCRYPTED_PAT_ID", "ENCRYPTED_PATID", "ENCRYPTED_PATIENT_ID"])
     if not enc_col:
-        # if missing, we cannot join reliably
-        return None
-    df = df.rename(columns={enc_col: "ENCRYPTED_PAT_ID"})
-    df["ENCRYPTED_PAT_ID"] = df["ENCRYPTED_PAT_ID"].map(normalize_id)
+        raise ValueError("Notes file missing ENCRYPTED_PAT_ID: {}".format(path))
 
-    # date column differs by file
-    date_col = None
-    if kind == "Clinic":
-        date_col = pick_first_existing(df, ["ADMIT_DATE", "VISIT_DATE", "ENCOUNTER_DATE", "DATE"])
-    elif kind == "Inpatient":
-        date_col = pick_first_existing(df, ["HOSP_ADMSN_TM", "ADMIT_DATE", "ADMISSION_DATE", "DATE"])
-    elif kind == "Operation":
-        date_col = pick_first_existing(df, ["OPERATION_DATE", "SURGERY_DATE", "DATE"])
+    note_id_col = pick_first_existing(df, ["NOTE_ID", "Note_ID", "note_id"])
+    note_type_col = pick_first_existing(df, ["NOTE_TYPE", "Note_Type", "note_type"])
+    text_col = pick_first_existing(df, ["NOTE_TEXT", "Note_Text", "note_text", "NOTE_TEXT_DEID"])
+    dos_col = pick_first_existing(df, ["NOTE_DATE_OF_SERVICE", "NOTE_DATE", "DATE_OF_SERVICE", "SERVICE_DATE"])
+    op_date_col = pick_first_existing(df, ["OPERATION_DATE", "OPER_DATE"])
 
-    if not date_col:
-        # last resort: any column with "DATE" in name
-        for c in df.columns:
-            if "DATE" in c.upper():
-                date_col = c
-                break
+    # Normalize minimal columns
+    df[enc_col] = df[enc_col].map(normalize_id)
+    if note_id_col:
+        df[note_id_col] = df[note_id_col].map(normalize_id)
+    if note_type_col:
+        df[note_type_col] = df[note_type_col].fillna("").map(str)
+    if text_col:
+        df[text_col] = df[text_col].fillna("").map(str)
 
-    df["EVENT_DATE"] = df[date_col].map(parse_date_any) if date_col else None
+    # Build NOTE_DATE
+    def row_note_date(r):
+        d = None
+        if op_date_col and r.get(op_date_col):
+            d = parse_date_any(r.get(op_date_col))
+        if not d and dos_col and r.get(dos_col):
+            d = parse_date_any(r.get(dos_col))
+        return d
 
-    # optional text cols
-    rfv = pick_first_existing(df, ["REASON_FOR_VISIT", "REASON", "VISIT_REASON"])
-    cpt = pick_first_existing(df, ["CPT_CODE", "CPT", "CPT_CD"])
-    proc = pick_first_existing(df, ["PROCEDURE", "PROC", "PROCEDURE_NAME"])
+    if note_id_col and text_col:
+        # aggregate by NOTE_ID
+        grp_cols = [enc_col, note_id_col]
+        keep_cols = [enc_col, note_id_col]
+        if note_type_col:
+            keep_cols.append(note_type_col)
 
-    df["REASON_FOR_VISIT"] = df[rfv] if rfv else ""
-    df["CPT_CODE"] = df[cpt] if cpt else ""
-    df["PROCEDURE"] = df[proc] if proc else ""
+        # sort by LINE if present for better concatenation
+        line_col = pick_first_existing(df, ["LINE", "Line", "line"])
+        if line_col:
+            try:
+                df[line_col] = pd.to_numeric(df[line_col], errors="coerce")
+                df = df.sort_values([enc_col, note_id_col, line_col])
+            except Exception:
+                pass
 
-    df["SOURCE_FILE"] = os.path.basename(path)
-    return df[["ENCRYPTED_PAT_ID", "EVENT_DATE", "REASON_FOR_VISIT", "CPT_CODE", "PROCEDURE", "SOURCE_FILE"]]
-
-
-def classify_row(text_blob, cpt_code):
-    """
-    Returns flags + matched patterns.
-    """
-    comp_name, comp_rx = match_first(COMP_PATTERNS, text_blob)
-    int_name, int_rx = match_first(INTERVENTION_PATTERNS, text_blob)
-    fail_name, fail_rx = match_first(FAILURE_PATTERNS, text_blob)
-    rev_name, rev_rx = match_first(REVISION_PATTERNS, text_blob)
-
-    cpt = ("" if cpt_code is None else str(cpt_code)).strip()
-    cpt_short = re.sub(r"\D", "", cpt)  # keep digits
-
-    flags = {
-        "has_comp": bool(comp_name),
-        "has_intervention": bool(int_name),
-        "has_failure_kw": bool(fail_name),
-        "has_revision_kw": bool(rev_name),
-        "cpt_is_failure": (cpt_short in CPT_FAILURE) if cpt_short else False,
-        "cpt_is_revision": (cpt_short in CPT_REVISION) if cpt_short else False,
-        "comp_name": comp_name,
-        "comp_rx": comp_rx,
-        "int_name": int_name,
-        "int_rx": int_rx,
-        "fail_name": fail_name,
-        "fail_rx": fail_rx,
-        "rev_name": rev_name,
-        "rev_rx": rev_rx,
-        "cpt_short": cpt_short,
-    }
-    return flags
-
-
-def build_outcomes(stage2_anchor, clinic_df, inpatient_df, op_df):
-    """
-    Produces patient-level outcomes with evidence.
-    """
-    # index encounters by patient for speed
-    by_pid = {}
-
-    def add_df(df):
-        if df is None or df.empty:
-            return
-        for _, r in df.iterrows():
-            pid = normalize_id(r.get("ENCRYPTED_PAT_ID"))
-            if not pid:
-                continue
-            by_pid.setdefault(pid, []).append(r)
-
-    add_df(clinic_df)
-    add_df(inpatient_df)
-    add_df(op_df)
-
-    rows_out = []
-    for _, a in stage2_anchor.iterrows():
-        pid = a["ENCRYPTED_PAT_ID"]
-        s2 = a["STAGE2_DATE"]
-        ws = a["WINDOW_START"]
-        we = a["WINDOW_END"]
-
-        # evidence containers
-        reop_ev = None
-        rehosp_ev = None
-        failure_ev = None
-        revision_ev = None
-        minor_comp_ev = None
-
-        events = by_pid.get(pid, [])
-        for r in events:
-            d = r.get("EVENT_DATE")
-            if not within_window(d, ws, we):
-                continue
-
-            src = r.get("SOURCE_FILE", "")
-            kind = "UNKNOWN"
-            if src.lower().find("clinic") >= 0:
-                kind = "CLINIC"
-            elif src.lower().find("inpatient") >= 0:
-                kind = "INPATIENT"
-            elif src.lower().find("operation") >= 0:
-                kind = "OPERATION"
-
-            text_blob = norm_text(r.get("REASON_FOR_VISIT", ""), r.get("PROCEDURE", ""), r.get("CPT_CODE", ""))
-            flags = classify_row(text_blob, r.get("CPT_CODE", ""))
-
-            # ---- Rehospitalization (must be inpatient + complication evidence)
-            if kind == "INPATIENT" and flags["has_comp"]:
-                rehosp_ev = take_earliest(
-                    rehosp_ev,
-                    ev(d, src, {"kind": "rehosp", "pattern_name": flags["comp_name"], "pattern_rx": flags["comp_rx"]})
-                )
-
-            # ---- Reoperation (must be complication-driven + intervention OR explicit OR takeback language)
-            # Accept OPERATION encounters directly; inpatient can also represent OR return if intervention language exists.
-            if flags["has_comp"] and flags["has_intervention"] and (kind in ["OPERATION", "INPATIENT"]):
-                reop_ev = take_earliest(
-                    reop_ev,
-                    ev(d, src, {"kind": "reop", "pattern_name": flags["int_name"] + "|" + flags["comp_name"],
-                               "pattern_rx": flags["int_rx"] + " || " + flags["comp_rx"]})
-                )
-
-            # ---- Failure (implant/flap removal) – require:
-            #  (A) explicit removal/extrusion/flap loss wording, OR CPT 19328
-            #  AND preferably complication evidence; however explicit failure phrases can stand alone.
-            failure_signal = False
-            fail_pat = ""
-            fail_rx = ""
-            if flags["has_failure_kw"]:
-                failure_signal = True
-                fail_pat = flags["fail_name"]
-                fail_rx = flags["fail_rx"]
-            elif flags["cpt_is_failure"]:
-                # CPT 19328 alone is strong device removal; but could be elective exchange context.
-                # Require either complication keyword OR removal wording.
-                if flags["has_comp"] or re.search(r"\b(remove(d)?|removal|explant|take out)\b", text_blob):
-                    failure_signal = True
-                    fail_pat = "CPT_19328"
-                    fail_rx = "CPT_19328"
-
-            if failure_signal:
-                # If comp exists, embed it into the evidence pattern for traceability.
-                pat_name = fail_pat if not flags["has_comp"] else (fail_pat + "|" + flags["comp_name"])
-                pat_rx = fail_rx if not flags["has_comp"] else (fail_rx + " || " + flags["comp_rx"])
-                failure_ev = take_earliest(
-                    failure_ev,
-                    ev(d, src, {"kind": "failure", "pattern_name": pat_name, "pattern_rx": pat_rx})
-                )
-
-            # ---- Revision (elective) – allow keyword OR CPT 19380, within window (no comp required)
-            rev_signal = False
-            rev_pat = ""
-            rev_rx = ""
-            if flags["has_revision_kw"]:
-                rev_signal = True
-                rev_pat = flags["rev_name"]
-                rev_rx = flags["rev_rx"]
-            elif flags["cpt_is_revision"]:
-                rev_signal = True
-                rev_pat = "CPT_19380"
-                rev_rx = "CPT_19380"
-
-            if rev_signal:
-                revision_ev = take_earliest(
-                    revision_ev,
-                    ev(d, src, {"kind": "revision", "pattern_name": rev_pat, "pattern_rx": rev_rx})
-                )
-
-            # ---- Minor complication evidence (clinic-focused; comp keyword + non-OR management hints)
-            # Minor comp = comp evidence in window but no reop/rehosp ultimately.
-            # Here we store candidate evidence; final minor flag applied after we know reop/rehosp.
-            if flags["has_comp"]:
-                # Non-operative hints (antibiotics, wound care, dressing changes, aspiration etc.)
-                nonop_hint = bool(re.search(r"\b(antibiotic|abx|augmentin|keflex|clinda|doxy|iv antibiotics|oral antibiotics)\b", text_blob)) \
-                             or bool(re.search(r"\b(dressing|wound care|packing|clinic visit|local care|aspirat(e|ion)|office)\b", text_blob)) \
-                             or bool(re.search(r"\b(draina(ge|ged)|aspirat(e|ion))\b", text_blob))
-                # prefer clinic sources for minor evidence
-                if kind == "CLINIC" or nonop_hint:
-                    minor_comp_ev = take_earliest(
-                        minor_comp_ev,
-                        ev(d, src, {"kind": "minor_comp", "pattern_name": flags["comp_name"], "pattern_rx": flags["comp_rx"]})
-                    )
-
-        # Final binary outputs
-        reop = 1 if reop_ev is not None else 0
-        rehosp = 1 if rehosp_ev is not None else 0
-        major = 1 if (reop or rehosp) else 0
-        failure = 1 if failure_ev is not None else 0
-        revision = 1 if revision_ev is not None else 0
-
-        # Minor comp: must have comp evidence, but NOT major
-        minor = 0
-        if (minor_comp_ev is not None) and (major == 0):
-            minor = 1
-
-        rows_out.append({
-            "ENCRYPTED_PAT_ID": pid,
-            "STAGE2_DATE": s2.strftime("%Y-%m-%d") if s2 else "",
-            "WINDOW_START": ws.strftime("%Y-%m-%d") if ws else "",
-            "WINDOW_END": we.strftime("%Y-%m-%d") if we else "",
-
-            "Stage2_MinorComp_pred": minor,
-            "Stage2_Reoperation_pred": reop,
-            "Stage2_Rehospitalization_pred": rehosp,
-            "Stage2_MajorComp_pred": major,
-            "Stage2_Failure_pred": failure,
-            "Stage2_Revision_pred": revision,
-
-            # Evidence columns (dates/sources/patterns)
-            "reop_evidence_date": reop_ev["date"].strftime("%Y-%m-%d") if reop_ev and reop_ev.get("date") else "",
-            "reop_evidence_source": reop_ev.get("source", "") if reop_ev else "",
-            "reop_evidence_pattern": reop_ev.get("pattern", "") if reop_ev else "",
-
-            "rehosp_evidence_date": rehosp_ev["date"].strftime("%Y-%m-%d") if rehosp_ev and rehosp_ev.get("date") else "",
-            "rehosp_evidence_source": rehosp_ev.get("source", "") if rehosp_ev else "",
-            "rehosp_evidence_pattern": rehosp_ev.get("pattern", "") if rehosp_ev else "",
-
-            "failure_evidence_date": failure_ev["date"].strftime("%Y-%m-%d") if failure_ev and failure_ev.get("date") else "",
-            "failure_evidence_source": failure_ev.get("source", "") if failure_ev else "",
-            "failure_evidence_pattern": failure_ev.get("pattern", "") if failure_ev else "",
-
-            "revision_evidence_date": revision_ev["date"].strftime("%Y-%m-%d") if revision_ev and revision_ev.get("date") else "",
-            "revision_evidence_source": revision_ev.get("source", "") if revision_ev else "",
-            "revision_evidence_pattern": revision_ev.get("pattern", "") if revision_ev else "",
-
-            "minorcomp_evidence_date": minor_comp_ev["date"].strftime("%Y-%m-%d") if minor_comp_ev and minor_comp_ev.get("date") else "",
-            "minorcomp_evidence_source": minor_comp_ev.get("source", "") if minor_comp_ev else "",
-            "minorcomp_evidence_pattern": minor_comp_ev.get("pattern", "") if minor_comp_ev else "",
+        agg = df.groupby(grp_cols, as_index=False).agg({
+            (note_type_col if note_type_col else enc_col): "first",
+            text_col: lambda x: "\n".join([str(v) for v in x if str(v).strip() != ""])
         })
 
-    return pd.DataFrame(rows_out)
+        # rebuild columns cleanly
+        out = pd.DataFrame()
+        out["ENCRYPTED_PAT_ID"] = agg[enc_col].map(normalize_id)
+        out["NOTE_ID"] = agg[note_id_col].map(normalize_id)
+        out["NOTE_TYPE"] = agg[note_type_col] if note_type_col else ""
+        out["NOTE_TEXT"] = agg[text_col].fillna("").map(str)
 
+        # compute NOTE_DATE using earliest date among component rows
+        # (do a lightweight join for date computation)
+        tmp = df[[enc_col, note_id_col]].copy()
+        tmp["NOTE_DATE"] = df.apply(row_note_date, axis=1)
+        tmp = tmp.dropna(subset=["NOTE_DATE"])
+        if len(tmp) > 0:
+            tmp2 = tmp.groupby([enc_col, note_id_col], as_index=False)["NOTE_DATE"].min()
+            tmp2.columns = [enc_col, note_id_col, "NOTE_DATE"]
+            out = out.merge(tmp2, left_on=["ENCRYPTED_PAT_ID", "NOTE_ID"], right_on=[enc_col, note_id_col], how="left")
+            out = out.drop([enc_col, note_id_col], axis=1)
+        else:
+            out["NOTE_DATE"] = None
+
+        out["SOURCE_FILE"] = src
+        return out
+
+    # fallback: row-level
+    out = pd.DataFrame()
+    out["ENCRYPTED_PAT_ID"] = df[enc_col].map(normalize_id)
+    out["NOTE_ID"] = df[note_id_col].map(normalize_id) if note_id_col else ""
+    out["NOTE_TYPE"] = df[note_type_col] if note_type_col else ""
+    out["NOTE_TEXT"] = df[text_col].fillna("").map(str) if text_col else ""
+    out["NOTE_DATE"] = df.apply(row_note_date, axis=1)
+    out["SOURCE_FILE"] = src
+    return out
+
+
+# -------------------------
+# Stage2 anchor loading
+# -------------------------
+
+def load_stage2_anchors(root):
+    frozen = find_latest_frozen_stage2_patient_clean(root)
+    if frozen:
+        df = normalize_cols(read_csv_robust(frozen, dtype=str, low_memory=False))
+        # expect ENCRYPTED_PAT_ID + STAGE2_DATE
+        if "ENCRYPTED_PAT_ID" not in df.columns:
+            raise ValueError("Frozen stage2_patient_clean.csv missing ENCRYPTED_PAT_ID: {}".format(frozen))
+        if "STAGE2_DATE" not in df.columns:
+            raise ValueError("Frozen stage2_patient_clean.csv missing STAGE2_DATE: {}".format(frozen))
+        df["ENCRYPTED_PAT_ID"] = df["ENCRYPTED_PAT_ID"].map(normalize_id)
+        df["STAGE2_DATE"] = df["STAGE2_DATE"].map(lambda x: parse_date_any(x))
+        df = df.dropna(subset=["STAGE2_DATE"])
+        print("Using Stage2 anchors (frozen):", frozen)
+        return df[["ENCRYPTED_PAT_ID", "STAGE2_DATE"]].drop_duplicates()
+
+    summ = find_patient_stage_summary(root)
+    if not summ:
+        raise IOError("Could not find Stage2 anchor: frozen stage2_patient_clean.csv OR _outputs/patient_stage_summary.csv")
+
+    df = normalize_cols(read_csv_robust(summ, dtype=str, low_memory=False))
+    enc_col = pick_first_existing(df, ["ENCRYPTED_PAT_ID", "ENCRYPTED_PATID", "ENCRYPTED_PATIENT_ID"])
+    if not enc_col:
+        raise ValueError("patient_stage_summary missing ENCRYPTED_PAT_ID: {}".format(summ))
+    if "STAGE2_DATE" not in df.columns:
+        raise ValueError("patient_stage_summary missing STAGE2_DATE: {}".format(summ))
+
+    df = df.rename(columns={enc_col: "ENCRYPTED_PAT_ID"})
+    df["ENCRYPTED_PAT_ID"] = df["ENCRYPTED_PAT_ID"].map(normalize_id)
+    df["STAGE2_DATE"] = df["STAGE2_DATE"].map(lambda x: parse_date_any(x))
+    # filter to stage2 patients (HAS_STAGE2==1 if present, else STAGE2_DATE not null)
+    if "HAS_STAGE2" in df.columns:
+        df = df[df["HAS_STAGE2"].map(to01) == 1]
+    df = df.dropna(subset=["STAGE2_DATE"])
+    print("Using Stage2 anchors (outputs):", summ)
+    return df[["ENCRYPTED_PAT_ID", "STAGE2_DATE"]].drop_duplicates()
+
+
+# -------------------------
+# Evidence selection
+# -------------------------
+
+def update_best(best, candidate):
+    """
+    best: dict or None
+    candidate: dict with evidence_date (date or None), priority (int), etc.
+    Preference:
+      1) earlier evidence_date (if exists)
+      2) higher priority (lower int)
+      3) keep first otherwise
+    """
+    if best is None:
+        return candidate
+    bd = best.get("evidence_date")
+    cd = candidate.get("evidence_date")
+    if cd and bd:
+        if cd < bd:
+            return candidate
+        if cd > bd:
+            return best
+    elif cd and not bd:
+        return candidate
+    elif bd and not cd:
+        return best
+
+    # same date/none: compare priority
+    bp = best.get("priority", 999)
+    cp = candidate.get("priority", 999)
+    if cp < bp:
+        return candidate
+    return best
+
+
+# -------------------------
+# Main scanning logic
+# -------------------------
 
 def main():
     root = os.path.abspath(".")
@@ -609,43 +431,316 @@ def main():
     if not os.path.isdir(out_dir):
         os.makedirs(out_dir)
 
-    stage_path = find_stage_summary(root)
-    if not stage_path:
-        raise IOError("Could not find _outputs/patient_stage_summary.csv (Stage2 anchor required).")
+    anchors = load_stage2_anchors(root)
+    anchors = anchors.dropna(subset=["ENCRYPTED_PAT_ID", "STAGE2_DATE"])
+    anchors["ENCRYPTED_PAT_ID"] = anchors["ENCRYPTED_PAT_ID"].map(normalize_id)
 
-    clinic_path = find_encounter_file(root, "Clinic")
-    inpatient_path = find_encounter_file(root, "Inpatient")
-    openc_path = find_encounter_file(root, "Operation")
+    stage2_pids = set(anchors["ENCRYPTED_PAT_ID"].tolist())
+    print("Stage2 patients (anchors):", len(stage2_pids))
 
-    print("Using:")
-    print("  Stage summary:", stage_path)
-    print("  Clinic enc   :", clinic_path if clinic_path else "(not found)")
-    print("  Inpatient enc:", inpatient_path if inpatient_path else "(not found)")
-    print("  Operation enc:", openc_path if openc_path else "(not found)")
-    print("")
+    # Map pid -> stage2_date
+    stage2_date_map = {}
+    for _, r in anchors.iterrows():
+        pid = r["ENCRYPTED_PAT_ID"]
+        d = r["STAGE2_DATE"]
+        if pid and d:
+            # keep earliest stage2 date if duplicates
+            if (pid not in stage2_date_map) or (d < stage2_date_map[pid]):
+                stage2_date_map[pid] = d
 
-    stage2_anchor = load_stage2_anchor(stage_path)
+    note_files = find_notes_files()
+    if not note_files:
+        raise IOError("Could not find HPI11526 *Notes.csv under ~/my_data_Breast/**")
 
-    clinic_df = load_encounters(clinic_path, "Clinic") if clinic_path else None
-    inpatient_df = load_encounters(inpatient_path, "Inpatient") if inpatient_path else None
-    op_df = load_encounters(openc_path, "Operation") if openc_path else None
+    print("Notes files found:")
+    for p in note_files:
+        print("  -", p)
 
-    if (clinic_df is None) and (inpatient_df is None) and (op_df is None):
-        raise IOError("No encounter files found. Put the HPI11526 *Encounters.csv files under ~/my_data_Breast or within the repo tree.")
+    # Load + concatenate aggregated notes
+    all_notes = []
+    for nf in note_files:
+        df = load_notes_aggregated(nf)
+        # keep only stage2 patients early to reduce memory
+        df = df[df["ENCRYPTED_PAT_ID"].isin(stage2_pids)]
+        all_notes.append(df)
 
-    pred = build_outcomes(stage2_anchor, clinic_df, inpatient_df, op_df)
+    notes = pd.concat(all_notes, ignore_index=True) if all_notes else pd.DataFrame()
+    if len(notes) == 0:
+        raise IOError("No notes matched Stage2 patients after filtering.")
 
+    # Normalize and compute window membership
+    notes["NOTE_TEXT_NORM"] = notes["NOTE_TEXT"].map(normalize_text)
+    # Some NOTE_DATE may be NaN/None
+    notes["NOTE_DATE"] = notes["NOTE_DATE"]
+
+    # Prepare per-patient outputs
+    results = {}
+    for pid in stage2_pids:
+        results[pid] = {
+            "ENCRYPTED_PAT_ID": pid,
+            "STAGE2_DATE": stage2_date_map.get(pid),
+            "WINDOW_START": stage2_date_map.get(pid),
+            "WINDOW_END": (stage2_date_map.get(pid) + timedelta(days=365)) if stage2_date_map.get(pid) else None,
+
+            "Stage2_MinorComp_pred": 0,
+            "Stage2_Reoperation_pred": 0,
+            "Stage2_Rehospitalization_pred": 0,
+            "Stage2_MajorComp_pred": 0,
+            "Stage2_Failure_pred": 0,
+            "Stage2_Revision_pred": 0,
+
+            # evidence blocks
+            "minor_evidence_date": "",
+            "minor_evidence_source": "",
+            "minor_evidence_note_id": "",
+            "minor_evidence_pattern": "",
+            "minor_evidence_snippet": "",
+
+            "reop_evidence_date": "",
+            "reop_evidence_source": "",
+            "reop_evidence_note_id": "",
+            "reop_evidence_pattern": "",
+            "reop_evidence_snippet": "",
+
+            "rehosp_evidence_date": "",
+            "rehosp_evidence_source": "",
+            "rehosp_evidence_note_id": "",
+            "rehosp_evidence_pattern": "",
+            "rehosp_evidence_snippet": "",
+
+            "failure_evidence_date": "",
+            "failure_evidence_source": "",
+            "failure_evidence_note_id": "",
+            "failure_evidence_pattern": "",
+            "failure_evidence_snippet": "",
+
+            "revision_evidence_date": "",
+            "revision_evidence_source": "",
+            "revision_evidence_note_id": "",
+            "revision_evidence_pattern": "",
+            "revision_evidence_snippet": "",
+        }
+
+    # Best evidence trackers
+    best_minor = {}
+    best_reop = {}
+    best_rehosp = {}
+    best_failure = {}
+    best_revision = {}
+
+    # Scan row-by-row (already aggregated per NOTE_ID where possible)
+    for idx, r in notes.iterrows():
+        pid = normalize_id(r.get("ENCRYPTED_PAT_ID"))
+        if not pid or pid not in stage2_date_map:
+            continue
+
+        s2 = stage2_date_map[pid]
+        win_start = s2
+        win_end = s2 + timedelta(days=365)
+
+        nd = r.get("NOTE_DATE")
+        # nd may be float NaN; handle safely
+        if isinstance(nd, float):
+            nd = None
+
+        # If date exists, enforce window. If date missing, still allow *only* for strong signals (reop/failure/revision)
+        in_window = False
+        if nd:
+            try:
+                in_window = (nd >= win_start) and (nd < win_end)
+            except Exception:
+                in_window = False
+
+        t = r.get("NOTE_TEXT_NORM", "")
+        if not t:
+            continue
+
+        src = str(r.get("SOURCE_FILE", "") or "")
+        note_id = normalize_id(r.get("NOTE_ID", ""))
+        note_type = str(r.get("NOTE_TYPE", "") or "")
+
+        # Complication present?
+        has_comp = bool(COMP_RX.search(t))
+
+        # -------- Minor complication (complication + nonop/no-op; no reop/rehosp implied)
+        # We flag minor if: in-window AND complication AND (nonop OR explicit "managed conservatively") AND NOT failure terms
+        if in_window and has_comp:
+            nonop = bool(NONOP_RX.search(t)) or ("conservative" in t) or ("managed with" in t and "antibi" in t)
+            fail = bool(FAIL_RX.search(t))
+            reop = bool(REOP_RX.search(t))
+            if nonop and (not reop) and (not fail):
+                lbl, pat = best_match(COMPLICATION_PATTERNS, t)
+                cand = {
+                    "evidence_date": nd,
+                    "priority": 10,
+                    "source": src,
+                    "note_id": note_id,
+                    "pattern": pat if pat else lbl,
+                    "snippet": make_snippet(r.get("NOTE_TEXT", "")),
+                }
+                best_minor[pid] = update_best(best_minor.get(pid), cand)
+
+        # -------- Reoperation (complication + reop terms) OR explicit implant/expander removal in OR context
+        # For date-missing notes, we require BOTH comp + reop/failure keyword to avoid false positives.
+        if (in_window and has_comp and REOP_RX.search(t)) or ((not nd) and has_comp and (REOP_RX.search(t) or FAIL_RX.search(t))):
+            lbl, pat = best_match(REOP_PATTERNS, t)
+            if not pat:
+                # fallback to complication label if reop label missing
+                lbl2, pat2 = best_match(COMPLICATION_PATTERNS, t)
+                pat = pat2 or lbl2
+            cand = {
+                "evidence_date": nd,
+                "priority": 1,  # strong
+                "source": src,
+                "note_id": note_id,
+                "pattern": pat if pat else lbl,
+                "snippet": make_snippet(r.get("NOTE_TEXT", "")),
+            }
+            best_reop[pid] = update_best(best_reop.get(pid), cand)
+
+        # -------- Failure (implant/flap removal due to complication)
+        if (in_window and FAIL_RX.search(t)) or ((not nd) and FAIL_RX.search(t) and has_comp):
+            lbl, pat = best_match(FAILURE_PATTERNS, t)
+            cand = {
+                "evidence_date": nd,
+                "priority": 0,  # strongest
+                "source": src,
+                "note_id": note_id,
+                "pattern": pat if pat else lbl,
+                "snippet": make_snippet(r.get("NOTE_TEXT", "")),
+            }
+            best_failure[pid] = update_best(best_failure.get(pid), cand)
+
+        # -------- Revision (revision terms; separate from reop-for-complication)
+        if in_window and REV_RX.search(t):
+            lbl, pat = best_match(REVISION_PATTERNS, t)
+            cand = {
+                "evidence_date": nd,
+                "priority": 5,
+                "source": src,
+                "note_id": note_id,
+                "pattern": pat if pat else lbl,
+                "snippet": make_snippet(r.get("NOTE_TEXT", "")),
+            }
+            best_revision[pid] = update_best(best_revision.get(pid), cand)
+
+        # -------- Rehospitalization (use inpatient note source + complication)
+        # Conservative: requires in-window + complication + inpatient source file
+        if in_window and has_comp:
+            if ("Inpatient Notes".lower() in src.lower()) or ("discharge" in note_type.lower()) or ("h&p" in note_type.lower()):
+                lbl, pat = best_match(COMPLICATION_PATTERNS, t)
+                cand = {
+                    "evidence_date": nd,
+                    "priority": 2,
+                    "source": src,
+                    "note_id": note_id,
+                    "pattern": pat if pat else lbl,
+                    "snippet": make_snippet(r.get("NOTE_TEXT", "")),
+                }
+                best_rehosp[pid] = update_best(best_rehosp.get(pid), cand)
+
+    # Finalize per-patient flags + evidence
+    def fmt_date(d):
+        if not d:
+            return ""
+        try:
+            return d.strftime("%Y-%m-%d")
+        except Exception:
+            return ""
+
+    for pid in results.keys():
+        if pid in best_minor:
+            results[pid]["Stage2_MinorComp_pred"] = 1
+            results[pid]["minor_evidence_date"] = fmt_date(best_minor[pid].get("evidence_date"))
+            results[pid]["minor_evidence_source"] = best_minor[pid].get("source", "")
+            results[pid]["minor_evidence_note_id"] = best_minor[pid].get("note_id", "")
+            results[pid]["minor_evidence_pattern"] = best_minor[pid].get("pattern", "")
+            results[pid]["minor_evidence_snippet"] = best_minor[pid].get("snippet", "")
+
+        if pid in best_reop:
+            results[pid]["Stage2_Reoperation_pred"] = 1
+            results[pid]["reop_evidence_date"] = fmt_date(best_reop[pid].get("evidence_date"))
+            results[pid]["reop_evidence_source"] = best_reop[pid].get("source", "")
+            results[pid]["reop_evidence_note_id"] = best_reop[pid].get("note_id", "")
+            results[pid]["reop_evidence_pattern"] = best_reop[pid].get("pattern", "")
+            results[pid]["reop_evidence_snippet"] = best_reop[pid].get("snippet", "")
+
+        if pid in best_rehosp:
+            results[pid]["Stage2_Rehospitalization_pred"] = 1
+            results[pid]["rehosp_evidence_date"] = fmt_date(best_rehosp[pid].get("evidence_date"))
+            results[pid]["rehosp_evidence_source"] = best_rehosp[pid].get("source", "")
+            results[pid]["rehosp_evidence_note_id"] = best_rehosp[pid].get("note_id", "")
+            results[pid]["rehosp_evidence_pattern"] = best_rehosp[pid].get("pattern", "")
+            results[pid]["rehosp_evidence_snippet"] = best_rehosp[pid].get("snippet", "")
+
+        if pid in best_failure:
+            results[pid]["Stage2_Failure_pred"] = 1
+            results[pid]["failure_evidence_date"] = fmt_date(best_failure[pid].get("evidence_date"))
+            results[pid]["failure_evidence_source"] = best_failure[pid].get("source", "")
+            results[pid]["failure_evidence_note_id"] = best_failure[pid].get("note_id", "")
+            results[pid]["failure_evidence_pattern"] = best_failure[pid].get("pattern", "")
+            results[pid]["failure_evidence_snippet"] = best_failure[pid].get("snippet", "")
+
+        if pid in best_revision:
+            results[pid]["Stage2_Revision_pred"] = 1
+            results[pid]["revision_evidence_date"] = fmt_date(best_revision[pid].get("evidence_date"))
+            results[pid]["revision_evidence_source"] = best_revision[pid].get("source", "")
+            results[pid]["revision_evidence_note_id"] = best_revision[pid].get("note_id", "")
+            results[pid]["revision_evidence_pattern"] = best_revision[pid].get("pattern", "")
+            results[pid]["revision_evidence_snippet"] = best_revision[pid].get("snippet", "")
+
+        # MajorComp is derived: reop OR rehosp
+        if results[pid]["Stage2_Reoperation_pred"] == 1 or results[pid]["Stage2_Rehospitalization_pred"] == 1:
+            results[pid]["Stage2_MajorComp_pred"] = 1
+
+        # Ensure dates present in output
+        results[pid]["STAGE2_DATE"] = fmt_date(results[pid]["STAGE2_DATE"])
+        results[pid]["WINDOW_START"] = fmt_date(results[pid]["WINDOW_START"])
+        results[pid]["WINDOW_END"] = fmt_date(results[pid]["WINDOW_END"])
+
+    # Write output
     out_path = os.path.join(out_dir, "stage2_outcomes_pred.csv")
-    pred.to_csv(out_path, index=False)
 
-    # quick console sanity
-    n = int(pred.shape[0])
+    # Stable column order
+    cols = [
+        "ENCRYPTED_PAT_ID",
+        "STAGE2_DATE", "WINDOW_START", "WINDOW_END",
+        "Stage2_MinorComp_pred",
+        "Stage2_Reoperation_pred",
+        "Stage2_Rehospitalization_pred",
+        "Stage2_MajorComp_pred",
+        "Stage2_Failure_pred",
+        "Stage2_Revision_pred",
+
+        "minor_evidence_date", "minor_evidence_source", "minor_evidence_note_id", "minor_evidence_pattern", "minor_evidence_snippet",
+        "reop_evidence_date", "reop_evidence_source", "reop_evidence_note_id", "reop_evidence_pattern", "reop_evidence_snippet",
+        "rehosp_evidence_date", "rehosp_evidence_source", "rehosp_evidence_note_id", "rehosp_evidence_pattern", "rehosp_evidence_snippet",
+        "failure_evidence_date", "failure_evidence_source", "failure_evidence_note_id", "failure_evidence_pattern", "failure_evidence_snippet",
+        "revision_evidence_date", "revision_evidence_source", "revision_evidence_note_id", "revision_evidence_pattern", "revision_evidence_snippet",
+    ]
+
+    out_df = pd.DataFrame(list(results.values()))
+    # Add any missing cols (safety)
+    for c in cols:
+        if c not in out_df.columns:
+            out_df[c] = ""
+    out_df = out_df[cols]
+
+    out_df.to_csv(out_path, index=False)
+
+    # Console summary
+    def cnt(c):
+        return int(pd.to_numeric(out_df[c], errors="coerce").fillna(0).astype(int).sum())
+
+    print("")
     print("OK: wrote", out_path)
-    print("Stage2 patients:", n)
-    for col in ["Stage2_MinorComp_pred", "Stage2_Reoperation_pred", "Stage2_Rehospitalization_pred",
-                "Stage2_MajorComp_pred", "Stage2_Failure_pred", "Stage2_Revision_pred"]:
-        if col in pred.columns:
-            print("  {} = {}".format(col, int(pred[col].sum())))
+    print("Stage2 patients:", len(out_df))
+    print("  Stage2_MinorComp_pred =", cnt("Stage2_MinorComp_pred"))
+    print("  Stage2_Reoperation_pred =", cnt("Stage2_Reoperation_pred"))
+    print("  Stage2_Rehospitalization_pred =", cnt("Stage2_Rehospitalization_pred"))
+    print("  Stage2_MajorComp_pred =", cnt("Stage2_MajorComp_pred"))
+    print("  Stage2_Failure_pred =", cnt("Stage2_Failure_pred"))
+    print("  Stage2_Revision_pred =", cnt("Stage2_Revision_pred"))
 
 
 if __name__ == "__main__":
