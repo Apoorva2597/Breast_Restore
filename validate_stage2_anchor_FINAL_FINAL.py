@@ -9,7 +9,7 @@ Run from: /home/apokol/Breast_Restore
 
 Inputs:
 - ./gold_cleaned_for_cedar.csv
-- ./_outputs/patient_stage_summary_FINAL_FINAL.csv   (preferred; falls back to patient_stage_summary.csv)
+- ./_outputs/patient_stage_summary.csv   (preferred; falls back to patient_stage_summary.csv)
 - ./_staging_inputs/HPI11526 Operation Notes.csv      (used only if stage summary lacks MRN)
 
 Outputs:
