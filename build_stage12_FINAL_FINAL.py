@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-build_stage12_FINAL_WITH_CLINIC_TIGHT_SCHEDULED.py (Python 3.6.8 compatible)
+build_stage12_FINAL_WITH_CLINIC_reduceFN.py (Python 3.6.8 compatible)
 
-OP + CLINIC INPUTS (logic unchanged):
-- Reads:
-    - ./_staging_inputs/HPI11526 Operation Notes.csv
-    - ./_staging_inputs/HPI11526 Clinic Notes.csv
-- Keeps EXACT SAME stage detection logic as the OP-only version you just ran
-- Writes:
-    - ./_outputs/patient_stage_summary.csv
+Goal: reduce FN modestly (keep FP controlled).
+Changes (logic edits):
+- Add performed Stage2 bucket for common wording that misses "remove":
+  A) TE/expander + (exchange/replace) + implant (no explicit removal/action needed)
+- Add performed Stage2 bucket for "permanent implant" placement in reconstruction context:
+  B) (permanent implant OR implant) + (breast reconstruction OR 2nd stage/stage 2) + action
+- Slightly relax scheduled proximity 50 -> 70 (still sentence-scoped + guards)
+Inputs:
+- ./_staging_inputs/HPI11526 Operation Notes.csv
+- ./_staging_inputs/HPI11526 Clinic Notes.csv
+Output:
+- ./_outputs/patient_stage_summary.csv
 """
 
 from __future__ import print_function
@@ -74,20 +79,28 @@ def _best_note_date(row):
     return _parse_date_any(row.get("NOTE_DATE_OF_SERVICE", ""))
 
 # -------------------------
-# Stage detection logic (UNCHANGED)
+# Stage detection logic
 # -------------------------
 
 RE_TE = re.compile(r"\b(expander|expanders|tissue expander|te)\b", re.I)
 RE_REMOVE = re.compile(r"\b(remove(d|al)?|explant(ed|ation)?|take\s*out|takedown|retrieve)\b", re.I)
 RE_IMPLANT = re.compile(r"\b(implant(s)?|prosthesis|silicone|saline|gel)\b", re.I)
-RE_ACTION = re.compile(r"\b(place(d|ment)?|insert(ed|ion)?|exchange(d)?|replace(d|ment)?)\b", re.I)
+RE_PERMANENT = re.compile(r"\b(permanent implant|permanent implants)\b", re.I)
 
+RE_ACTION = re.compile(r"\b(place(d|ment)?|insert(ed|ion)?|exchange(d)?|replace(d|ment)?)\b", re.I)
+RE_EXCH_WORD = re.compile(r"\b(exchange|replace|replacement|exchanged)\b", re.I)
+
+RE_RECON = re.compile(r"\b(breast reconstruction|reconstruction)\b", re.I)
+RE_STAGE2_HINT = re.compile(r"\b(second stage|stage\s*2)\b", re.I)
+
+# Performed exchange (tight)
 RE_EXCHANGE = re.compile(
-    r"\b(implant|expander)\b.{0,50}\b(exchange|replace|replacement)\b"
-    r"|\b(exchange|replace|replacement)\b.{0,50}\b(implant|expander)\b",
+    r"\b(implant|expander)\b.{0,50}\b(exchange|replace|replacement|exchanged)\b"
+    r"|\b(exchange|replace|replacement|exchanged)\b.{0,50}\b(implant|expander)\b",
     re.I
 )
 
+# Scheduled (tight + guards)
 RE_SCHEDULE = re.compile(r"\b(schedule(d)?|planned|plan)\b", re.I)
 RE_SCHEDULED_FOR = re.compile(r"\bscheduled\b.{0,12}\bfor\b", re.I)
 RE_PROC_CUE = re.compile(r"\b(surgery|procedure|operation|or|operative)\b", re.I)
@@ -107,6 +120,7 @@ RE_BAD_SCHED_CONTEXT = re.compile(
     re.I
 )
 
+# Stage2-specific phrases (NOT generic implant alone)
 RE_STAGE2_PROC_PHRASE = re.compile(
     r"\b(expander[- ]?to[- ]?implant)\b"
     r"|\b(exchange)\b.{0,30}\b(expander|implant)\b"
@@ -123,7 +137,7 @@ STAGE1_PATTERNS = [
     r"\b(stage\s*1)\b.*\b(reconstruction|tissue expander|expander|te)\b",
 ]
 
-def _scheduled_stage2_sentence_level(text_norm, proximity=50):
+def _scheduled_stage2_sentence_level(text_norm, proximity=70):
     if not RE_SCHEDULE.search(text_norm):
         return False
 
@@ -165,13 +179,25 @@ def _scheduled_stage2_sentence_level(text_norm, proximity=50):
     return False
 
 def _stage2_bucket(text_norm):
+    # 1) Performed exchange (tight)
     if RE_EXCHANGE.search(text_norm):
         return True, "EXCHANGE"
 
+    # 2) Performed TE removal + implant + action
     if RE_TE.search(text_norm) and RE_REMOVE.search(text_norm) and RE_IMPLANT.search(text_norm) and RE_ACTION.search(text_norm):
         return True, "EXPANDER_TO_IMPLANT"
 
-    if _scheduled_stage2_sentence_level(text_norm, proximity=50):
+    # 3) NEW: TE/expander + exchange/replace + implant (common phrasing; no explicit "remove")
+    if RE_TE.search(text_norm) and RE_EXCH_WORD.search(text_norm) and RE_IMPLANT.search(text_norm):
+        return True, "TE_EXCHANGE_IMPLANT_NO_REMOVE"
+
+    # 4) NEW: Permanent implant placement in reconstruction/stage2 context + action
+    # (helps when note says "placement of permanent implants" without expander words)
+    if (RE_PERMANENT.search(text_norm) or RE_IMPLANT.search(text_norm)) and RE_ACTION.search(text_norm) and (RE_RECON.search(text_norm) or RE_STAGE2_HINT.search(text_norm)):
+        return True, "PERMANENT_IMPLANT_RECON_ACTION"
+
+    # 5) Scheduled Stage2 (tight + guards, slightly wider proximity)
+    if _scheduled_stage2_sentence_level(text_norm, proximity=70):
         return True, "SCHEDULED_STAGE2_TIGHT"
 
     return False, ""
