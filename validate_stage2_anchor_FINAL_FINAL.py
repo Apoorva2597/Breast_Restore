@@ -43,7 +43,37 @@ def normalize_cols(df):
 
 
 def normalize_id(x):
-    return "" if x is None else str(x).strip()
+    """
+    Robust normalize for join keys:
+    - None/NaN/"nan" -> ""
+    - strip
+    - if looks like Excel float id "12345.0" -> "12345"
+    """
+    if x is None:
+        return ""
+    s = str(x).strip()
+    if not s:
+        return ""
+    if s.lower() == "nan":
+        return ""
+    # common Excel artifact: integers stored as floats
+    if s.endswith(".0"):
+        head = s[:-2]
+        if head.isdigit():
+            return head
+    return s
+
+
+def normalize_mrn(x):
+    """
+    MRN join normalization:
+    - apply normalize_id
+    - if numeric-only, drop leading/trailing spaces already handled
+    """
+    s = normalize_id(x)
+    # optional: if MRNs are strictly digits, keep only digits
+    # but don't force it if MRN format varies
+    return s
 
 
 def to01(v):
@@ -170,15 +200,17 @@ def main():
     if not op_mrn_col or not op_encpat_col:
         raise ValueError("Op notes must contain MRN and ENCRYPTED_PAT_ID (or equivalent). Found: {}".format(list(op.columns)))
 
-    op["MRN"] = op[op_mrn_col].map(normalize_id)
+    op["MRN"] = op[op_mrn_col].map(normalize_mrn)
     op["ENCRYPTED_PAT_ID"] = op[op_encpat_col].map(normalize_id)
-    id_map = op[["ENCRYPTED_PAT_ID", "MRN"]].dropna().drop_duplicates()
+
+    id_map = op[["ENCRYPTED_PAT_ID", "MRN"]].drop_duplicates()
+    id_map = id_map[(id_map["ENCRYPTED_PAT_ID"] != "") & (id_map["MRN"] != "")].copy()
 
     # --- Gold MRN + Stage2 applicable
     gold_mrn_col = pick_first_existing(gold, ["MRN", "mrn"])
     if not gold_mrn_col:
         raise ValueError("Gold missing MRN column.")
-    gold[gold_mrn_col] = gold[gold_mrn_col].map(normalize_id)
+    gold[gold_mrn_col] = gold[gold_mrn_col].map(normalize_mrn)
 
     gold_stage2_app_col = pick_first_existing(gold, ["Stage2_Applicable", "STAGE2_APPLICABLE"])
     if not gold_stage2_app_col:
@@ -190,7 +222,7 @@ def main():
     stage_pred_mrn_col = pick_first_existing(stage_pred, ["MRN", "mrn"])
 
     if stage_pred_mrn_col:
-        stage_pred["MRN"] = stage_pred[stage_pred_mrn_col].map(normalize_id)
+        stage_pred["MRN"] = stage_pred[stage_pred_mrn_col].map(normalize_mrn)
         print("Stage Pred join key: using MRN column =", stage_pred_mrn_col)
     elif stage_pred_encpat_col:
         stage_pred = stage_pred.rename(columns={stage_pred_encpat_col: "ENCRYPTED_PAT_ID"})
@@ -200,7 +232,7 @@ def main():
     else:
         raise ValueError("Stage prediction summary missing usable ID column (MRN or ENCRYPTED_PAT_ID). Found columns: {}".format(list(stage_pred.columns)))
 
-    stage_pred["MRN"] = stage_pred["MRN"].fillna("").map(normalize_id)
+    stage_pred["MRN"] = stage_pred["MRN"].fillna("").map(normalize_mrn)
 
     # --- Pred stage2 signal
     if "HAS_STAGE2" in stage_pred.columns:
@@ -223,9 +255,13 @@ def main():
         else:
             raise ValueError("Stage prediction file missing stage2 signal columns (HAS_STAGE2 / STAGE2_DATE / STAGE2_NOTE_ID / STAGE2_HITS).")
 
+    # --- Collapse to one row per MRN (max pred) to avoid duplicate-MRN merge issues
+    stage_pred = stage_pred[stage_pred["MRN"] != ""].copy()
+    stage_pred = stage_pred.groupby("MRN", as_index=False)["PRED_HAS_STAGE2"].max()
+
     # --- Merge gold + stage pred
     merged = gold.merge(
-        stage_pred[["MRN", "PRED_HAS_STAGE2"]],
+        stage_pred,
         left_on=gold_mrn_col,
         right_on="MRN",
         how="left",
