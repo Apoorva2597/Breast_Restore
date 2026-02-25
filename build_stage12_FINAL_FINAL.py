@@ -1,24 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-build_stage12_FINAL.py  (Python 3.6.8 compatible)
+build_stage12_FINAL_FINAL.py  (Python 3.6.8 compatible)
 
 Run from: ~/Breast_Restore
-Input:    ./_staging_inputs/HPI11526 Operation Notes.csv   (auto-detected if name differs)
-Outputs:  ./_outputs/patient_stage_summary.csv
-          ./_outputs/stage_event_level.csv
+Input:    ./_staging_inputs/HPI11526 Operation Notes.csv (or first CSV in _staging_inputs)
+Outputs:  ./_outputs/patient_stage_summary_FINAL_FINAL.csv
+          ./_outputs/stage_event_level_FINAL_FINAL.csv
 
-What it does:
-- Reads staged OP notes CSV
-- Detects Stage 1 vs Stage 2 signals from NOTE_TEXT
-- Emits patient-level earliest Stage1 and Stage2 dates + evidence
-- Emits event-level rows for every detected stage signal (for QA)
-
-Stage 2 fix in this version:
-- Stage 2 NO LONGER triggers on implant placement alone.
-- Stage 2 requires either:
-  (A) Expander removal/explant/take-out + implant (same note), OR
-  (B) Implant exchange/replace/replacement language (same note)
+Key fix vs prior version:
+- OP note exports are often LINE-level rows; Stage2 evidence can be split across lines.
+- This version aggregates NOTE_TEXT across all lines per NOTE_ID (sorted by LINE) BEFORE detection.
 """
 
 from __future__ import print_function
@@ -38,6 +30,7 @@ EXPECTED_COLS = [
     "NOTE_ID", "LINE", "NOTE_TEXT"
 ]
 
+
 # -------------------------
 # Helpers
 # -------------------------
@@ -46,10 +39,8 @@ def _safe_mkdir(path):
     if not os.path.isdir(path):
         os.makedirs(path)
 
+
 def _pick_input_csv():
-    """
-    Prefer the exact expected file name; otherwise pick the first CSV in _staging_inputs.
-    """
     preferred = os.path.join(STAGING_DIR, "HPI11526 Operation Notes.csv")
     if os.path.isfile(preferred):
         return preferred
@@ -59,6 +50,7 @@ def _pick_input_csv():
         raise IOError("No CSV found in staging dir: {0}".format(STAGING_DIR))
     return candidates[0]
 
+
 def _normalize_text(s):
     if s is None:
         return ""
@@ -66,10 +58,8 @@ def _normalize_text(s):
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
+
 def _parse_date_any(s):
-    """
-    Accepts common formats seen in exports. Returns YYYY-MM-DD string or "".
-    """
     if s is None:
         return ""
     s = str(s).strip()
@@ -116,89 +106,97 @@ def _parse_date_any(s):
 
     return ""
 
-def _best_note_date(row):
-    """
-    Prefer OPERATION_DATE, else NOTE_DATE_OF_SERVICE.
-    """
-    op = _parse_date_any(row.get("OPERATION_DATE", ""))
+
+def _best_note_date(meta):
+    op = _parse_date_any(meta.get("OPERATION_DATE", ""))
     if op:
         return op
-    dos = _parse_date_any(row.get("NOTE_DATE_OF_SERVICE", ""))
+    dos = _parse_date_any(meta.get("NOTE_DATE_OF_SERVICE", ""))
     return dos
+
+
+def _safe_int(x, default=0):
+    try:
+        return int(str(x).strip())
+    except Exception:
+        return default
+
 
 # -------------------------
 # Stage detection
 # -------------------------
 
-# Precompiled helpers for Stage 2 guardrails (Python 3.6 compatible)
 RE_TE = re.compile(r"\b(expander|expanders|tissue expander|te)\b", re.I)
-RE_REMOVE = re.compile(r"\b(remov(e|al|ed)?|explant(ed)?|take out)\b", re.I)
+RE_REMOVE = re.compile(r"\b(remov(e|al|ed)?|explant(ed)?|take out|excision)\b", re.I)
 RE_IMPLANT = re.compile(r"\bimplant(s)?\b", re.I)
 
-# Exchange bucket: implant + exchange/replace language
+# Exchange bucket: implant + exchange/replace language (any order)
 RE_EXCHANGE = re.compile(
     r"\bimplant(s)?\b.*\b(exchange|exchang(e|ed)|replace|replaced|replacement)\b"
     r"|\b(exchange|exchang(e|ed)|replace|replaced|replacement)\b.*\bimplant(s)?\b",
     re.I
 )
 
-# Additional “explicit stage 2” hints (kept conservative; does not include implant placement alone)
+# Specific common phrasing seen in notes (helps when "exchange" is present but "replace" isn't)
+RE_EXCHANGE_TE_FOR_IMPLANT = re.compile(
+    r"\bexchange\b.*\b(tissue expander|expanders|expander|te)\b.*\bfor\b.*\bimplant(s)?\b"
+    r"|\b(tissue expander|expanders|expander|te)\b.*\bexchang(e|ed)\b.*\bfor\b.*\bimplant(s)?\b",
+    re.I
+)
+
+# Conservative explicit stage2 hints (kept)
 STAGE2_HINT_PATTERNS = [
     r"\b(expander[- ]?to[- ]?implant)\b",
     r"\b(second stage)\b.*\b(reconstruction|exchange|implant)\b",
     r"\b(stage\s*2)\b.*\b(reconstruction|exchange|implant)\b",
+    r"\b(permanent implant)\b",
 ]
 
-# Stage 1: mastectomy + expander placement (or first stage reconstruction)
 STAGE1_PATTERNS = [
     r"\b(mastectomy|nipple[- ]?sparing mastectomy|skin[- ]?sparing mastectomy)\b.*\b(tissue expander|expanders|te)\b.*\b(place|placement|insert|insertion)\b",
     r"\b(place|placement|insert|insertion)\b.*\b(tissue expander|expanders|te)\b",
     r"\b(first stage)\b.*\b(reconstruction|tissue expander|expander|te)\b",
     r"\b(stage\s*1)\b.*\b(reconstruction|tissue expander|expander|te)\b",
-    # Backup: mastectomy mention (some notes omit explicit "placement" even when done)
     r"\b(mastectomy|nipple[- ]?sparing mastectomy|skin[- ]?sparing mastectomy)\b",
 ]
 
+
 def _stage2_bucket(text_norm):
-    """
-    Stage 2 = (TE + removal + implant) OR (implant exchange/replace language)
-    Returns: (True/False, matched_pattern_string)
-    """
-    # Bucket B: implant exchange/replace
+    # Bucket B1: implant exchange/replace language
     if RE_EXCHANGE.search(text_norm):
         return True, r"EXCHANGE: implant + (exchange|replace|replacement)"
 
-    # Bucket A: TE + remove + implant (all present anywhere in the note)
+    # Bucket B2: explicit "exchange tissue expander for implant"
+    if RE_EXCHANGE_TE_FOR_IMPLANT.search(text_norm):
+        return True, r"EXCHANGE: exchange (TE) for implant"
+
+    # Bucket A: TE + remove + implant
     if RE_TE.search(text_norm) and RE_REMOVE.search(text_norm) and RE_IMPLANT.search(text_norm):
         return True, r"EXPANDER->IMPLANT: (TE) + (remove/explant/take out) + implant"
 
-    # Conservative stage-2 hints (optional)
     for pat in STAGE2_HINT_PATTERNS:
-        if re.search(pat, text_norm):
+        if re.search(pat, text_norm, flags=re.I):
             return True, pat
 
     return False, ""
 
+
 def detect_stage(note_text):
-    """
-    Returns: (stage_label, matched_pattern)
-    stage_label in {"STAGE2","STAGE1",""}
-    """
     t = _normalize_text(note_text)
 
-    # Stage 2 first to avoid mislabeling (stage 2 notes often mention mastectomy history)
     ok2, pat2 = _stage2_bucket(t)
     if ok2:
         return "STAGE2", pat2
 
     for pat in STAGE1_PATTERNS:
-        if re.search(pat, t):
+        if re.search(pat, t, flags=re.I):
             return "STAGE1", pat
 
     return "", ""
 
+
 # -------------------------
-# Main
+# Read + aggregate NOTE_TEXT per NOTE_ID
 # -------------------------
 
 def read_rows(csv_path):
@@ -213,27 +211,70 @@ def read_rows(csv_path):
             rows.append(r)
     return rows
 
+
+def aggregate_notes(rows):
+    """
+    Returns dict key=(ENCRYPTED_PAT_ID, NOTE_ID) -> note_obj:
+      {
+        "ENCRYPTED_PAT_ID", "NOTE_ID", "NOTE_TYPE", "MRN",
+        "OPERATION_DATE", "NOTE_DATE_OF_SERVICE",
+        "NOTE_TEXT_FULL"
+      }
+    """
+    notes = {}
+    for r in rows:
+        pid = (r.get("ENCRYPTED_PAT_ID") or "").strip()
+        note_id = (r.get("NOTE_ID") or "").strip()
+        if not pid or not note_id:
+            continue
+
+        key = (pid, note_id)
+        if key not in notes:
+            notes[key] = {
+                "ENCRYPTED_PAT_ID": pid,
+                "NOTE_ID": note_id,
+                "NOTE_TYPE": (r.get("NOTE_TYPE") or "").strip(),
+                "MRN": (r.get("MRN") or "").strip(),
+                "OPERATION_DATE": (r.get("OPERATION_DATE") or "").strip(),
+                "NOTE_DATE_OF_SERVICE": (r.get("NOTE_DATE_OF_SERVICE") or "").strip(),
+                "_lines": []
+            }
+
+        line_no = _safe_int(r.get("LINE", ""), default=0)
+        txt = r.get("NOTE_TEXT", "")
+        notes[key]["_lines"].append((line_no, "" if txt is None else str(txt)))
+
+    # finalize full text
+    for key in list(notes.keys()):
+        lines = notes[key]["_lines"]
+        lines.sort(key=lambda x: x[0])
+        notes[key]["NOTE_TEXT_FULL"] = "\n".join([t for _, t in lines])
+        del notes[key]["_lines"]
+
+    return notes
+
+
+# -------------------------
+# Main build
+# -------------------------
+
 def build(outputs_dir, input_csv):
     _safe_mkdir(outputs_dir)
 
     rows = read_rows(input_csv)
+    notes = aggregate_notes(rows)
 
     patients = {}
     events = []
 
-    for r in rows:
-        pid = (r.get("ENCRYPTED_PAT_ID") or "").strip()
-        if not pid:
-            continue
-
-        date = _best_note_date(r)
-        note_id = (r.get("NOTE_ID") or "").strip()
-        note_type = (r.get("NOTE_TYPE") or "").strip()
-        text = r.get("NOTE_TEXT", "")
-
-        stage, pat = detect_stage(text)
+    for (pid, note_id), meta in notes.items():
+        text_full = meta.get("NOTE_TEXT_FULL", "")
+        stage, pat = detect_stage(text_full)
         if not stage:
             continue
+
+        date = _best_note_date(meta)
+        note_type = meta.get("NOTE_TYPE", "")
 
         events.append({
             "ENCRYPTED_PAT_ID": pid,
@@ -259,6 +300,7 @@ def build(outputs_dir, input_csv):
             }
 
         p = patients[pid]
+
         if stage == "STAGE1":
             p["stage1_hits"] += 1
             if date:
@@ -287,7 +329,7 @@ def build(outputs_dir, input_csv):
                     p["stage2_note_type"] = note_type
                     p["stage2_pattern"] = pat
 
-    patient_out = os.path.join(outputs_dir, "patient_stage_summary.csv")
+    patient_out = os.path.join(outputs_dir, "patient_stage_summary_FINAL_FINAL.csv")
     with open(patient_out, "w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=[
             "ENCRYPTED_PAT_ID",
@@ -314,7 +356,7 @@ def build(outputs_dir, input_csv):
                 "HAS_STAGE2": 1 if (p["stage2_hits"] > 0 or p["stage2_note_id"]) else 0,
             })
 
-    event_out = os.path.join(outputs_dir, "stage_event_level.csv")
+    event_out = os.path.join(outputs_dir, "stage_event_level_FINAL_FINAL.csv")
     with open(event_out, "w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=[
             "ENCRYPTED_PAT_ID", "STAGE", "EVENT_DATE", "NOTE_ID", "NOTE_TYPE", "MATCH_PATTERN"
@@ -328,21 +370,20 @@ def build(outputs_dir, input_csv):
         for e in sorted(events, key=_key):
             w.writerow(e)
 
-    n_pat = len(patients)
-    has_s1 = sum(1 for pid in patients if (patients[pid]["stage1_hits"] > 0 or patients[pid]["stage1_note_id"]))
-    has_s2 = sum(1 for pid in patients if (patients[pid]["stage2_hits"] > 0 or patients[pid]["stage2_note_id"]))
     print("OK: input:", input_csv)
     print("OK: outputs:", patient_out)
     print("OK: outputs:", event_out)
-    print("Patients with any stage signal:", n_pat)
-    print("Patients with Stage 1 evidence:", has_s1)
-    print("Patients with Stage 2 evidence:", has_s2)
+    print("Patients with any stage signal:", len(patients))
+    print("Patients with Stage 1 evidence:", sum(1 for pid in patients if (patients[pid]["stage1_hits"] > 0 or patients[pid]["stage1_note_id"])))
+    print("Patients with Stage 2 evidence:", sum(1 for pid in patients if (patients[pid]["stage2_hits"] > 0 or patients[pid]["stage2_note_id"])))
+
 
 def main():
     if not os.path.isdir(STAGING_DIR):
         raise IOError("Staging dir not found: {0}".format(STAGING_DIR))
     input_csv = _pick_input_csv()
     build(OUT_DIR, input_csv)
+
 
 if __name__ == "__main__":
     main()
