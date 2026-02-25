@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-debug_reop_mismatches.py  (Python 3.6.8 compatible)
+pick_exemplars_all_outcomes.py  (Python 3.6.8 compatible)
 
 Run from:  ~/Breast_Restore
-Reads:
+
+Input:
   ./_outputs/validation_merged.csv
-Writes:
-  ./_outputs/reop_FN_sample.csv
-  ./_outputs/reop_FP_sample.csv
 
-Also prints a compact terminal view.
+Output:
+  ./_outputs/exemplar_cases_by_outcome.csv
 
-Goal:
-- Reoperation FNs (gold=1 pred=0): include evidence fields (likely blank) + hint columns (STAGE2_DATE, window, sources/dates)
-- Reoperation FPs (gold=0 pred=1): include reop_evidence_snippet (+ pattern/source/date) + hint columns
+What it does:
+- For each outcome, picks up to 1 case each for FP/FN/TP/TN:
+    FP: gold=0 pred=1
+    FN: gold=1 pred=0
+    TP: gold=1 pred=1
+    TN: gold=0 pred=0
+- Includes MRN + ENCRYPTED_PAT_ID (if available) + STAGE2_DATE/window + evidence fields/snippets when present.
 """
 
 from __future__ import print_function
@@ -45,102 +48,158 @@ def to01(x):
         return 0
 
 
-def pick_cols(df, preferred):
-    out = []
-    for c in preferred:
-        if c in df.columns and c not in out:
-            out.append(c)
-    return out
+def pick_first_existing(cols, options):
+    for c in options:
+        if c in cols:
+            return c
+    return None
+
+
+def ensure_cols(df, cols):
+    for c in cols:
+        if c not in df.columns:
+            df[c] = ""
+    return df
 
 
 def main():
     root = os.path.abspath(".")
     in_path = os.path.join(root, "_outputs", "validation_merged.csv")
-    out_fn = os.path.join(root, "_outputs", "reop_FN_sample.csv")
-    out_fp = os.path.join(root, "_outputs", "reop_FP_sample.csv")
+    out_path = os.path.join(root, "_outputs", "exemplar_cases_by_outcome.csv")
 
     if not os.path.isfile(in_path):
         raise IOError("Missing input: {}".format(in_path))
 
     df = read_csv_robust(in_path, dtype=str, low_memory=False)
 
-    # Columns we expect (but handle alternate naming)
-    gold_col = "GOLD_Stage2_Reoperation" if "GOLD_Stage2_Reoperation" in df.columns else None
-    pred_col = "Stage2_Reoperation_pred" if "Stage2_Reoperation_pred" in df.columns else None
+    cols = list(df.columns)
 
-    if not gold_col:
-        raise ValueError("Could not find GOLD_Stage2_Reoperation in columns.")
-    if not pred_col:
-        raise ValueError("Could not find Stage2_Reoperation_pred in columns.")
+    # ID columns (best effort)
+    mrn_col = pick_first_existing(cols, ["MRN", "Mrn", "mrn"])
+    pid_col = pick_first_existing(cols, ["ENCRYPTED_PAT_ID", "ENCRYPTED_PATID", "ENCRYPTED_PATIENT_ID", "Encrypted_Pat_ID"])
 
-    df["_gold"] = df[gold_col].map(to01)
-    df["_pred"] = df[pred_col].map(to01)
+    # Date/window columns
+    stage2_col = pick_first_existing(cols, ["STAGE2_DATE", "Stage2_DATE"])
+    wstart_col = pick_first_existing(cols, ["WINDOW_START"])
+    wend_col = pick_first_existing(cols, ["WINDOW_END"])
 
-    fns = df[(df["_gold"] == 1) & (df["_pred"] == 0)].copy()
-    fps = df[(df["_gold"] == 0) & (df["_pred"] == 1)].copy()
+    # Outcomes we care about (gold, pred)
+    # NOTE: "MajorComp" pred is Stage2_MajorComp_pred; gold is often GOLD_Stage2_MajorComp
+    outcomes = [
+        ("MinorComp", "GOLD_Stage2_MinorComp", "Stage2_MinorComp_pred"),
+        ("Reoperation", "GOLD_Stage2_Reoperation", "Stage2_Reoperation_pred"),
+        ("Rehospitalization", "GOLD_Stage2_Rehospitalization", "Stage2_Rehospitalization_pred"),
+        ("MajorComp", "GOLD_Stage2_MajorComp", "Stage2_MajorComp_pred"),
+        ("Failure", "GOLD_Stage2_Failure", "Stage2_Failure_pred"),
+        ("Revision", "GOLD_Stage2_Revision", "Stage2_Revision_pred"),
+    ]
 
-    # Build a useful column set (keep if exists)
-    hint_cols = pick_cols(df, [
-        "MRN",
-        "ENCRYPTED_PAT_ID", "ENCRYPTED_PATID", "ENCRYPTED_PATIENT_ID",
-        "PatientID",
-        "STAGE2_DATE", "WINDOW_START", "WINDOW_END",
-        gold_col, pred_col,
-        # Evidence fields (your validator tends to carry these through)
-        "reop_evidence_date", "reop_evidence_source", "reop_evidence_note_id",
-        "reop_evidence_pattern", "reop_evidence_snippet",
-        # Sometimes scripts used *_note_id naming variants
-        "reop_evidence_noteid", "reop_evidence_note",
-        # Any extra “signal” columns you might have
-        "Stage2_MajorComp_pred", "Stage2_Rehospitalization_pred", "Stage2_Failure_pred", "Stage2_Revision_pred",
-        "GOLD_Stage2_MajorComp", "GOLD_Stage2_Rehospitalization", "GOLD_Stage2_Failure", "GOLD_Stage2_Revision",
-    ])
+    # Evidence columns (best effort mapping per outcome)
+    evidence_map = {
+        "MinorComp": ["minor_evidence_date", "minor_evidence_source", "minor_evidence_note_id", "minor_evidence_pattern", "minor_evidence_snippet"],
+        "Reoperation": ["reop_evidence_date", "reop_evidence_source", "reop_evidence_note_id", "reop_evidence_pattern", "reop_evidence_snippet"],
+        "Rehospitalization": ["rehosp_evidence_date", "rehosp_evidence_source", "rehosp_evidence_note_id", "rehosp_evidence_pattern", "rehosp_evidence_snippet"],
+        "Failure": ["failure_evidence_date", "failure_evidence_source", "failure_evidence_note_id", "failure_evidence_pattern", "failure_evidence_snippet"],
+        "Revision": ["revision_evidence_date", "revision_evidence_source", "revision_evidence_note_id", "revision_evidence_pattern", "revision_evidence_snippet"],
+        # MajorComp usually derived; still show reop/rehosp evidence if present
+        "MajorComp": ["reop_evidence_date", "reop_evidence_source", "reop_evidence_pattern", "reop_evidence_snippet",
+                      "rehosp_evidence_date", "rehosp_evidence_source", "rehosp_evidence_pattern", "rehosp_evidence_snippet"],
+    }
 
-    # Save samples (all rows; you can open and filter, or limit later)
-    fns_out = fns[hint_cols] if len(hint_cols) else fns
-    fps_out = fps[hint_cols] if len(hint_cols) else fps
+    rows = []
 
-    fns_out.to_csv(out_fn, index=False)
-    fps_out.to_csv(out_fp, index=False)
+    def add_one(outcome_name, gold_col, pred_col, label, subdf):
+        if len(subdf) == 0:
+            return
+        r = subdf.iloc[0]
 
-    # Terminal summary + top rows
+        row = {
+            "outcome": outcome_name,
+            "case_type": label,
+            "gold_col": gold_col,
+            "pred_col": pred_col,
+            "gold": str(r.get(gold_col, "")),
+            "pred": str(r.get(pred_col, "")),
+        }
+        if mrn_col:
+            row["MRN"] = str(r.get(mrn_col, ""))
+        else:
+            row["MRN"] = ""
+        if pid_col:
+            row["ENCRYPTED_PAT_ID"] = str(r.get(pid_col, ""))
+        else:
+            row["ENCRYPTED_PAT_ID"] = ""
+
+        row["STAGE2_DATE"] = str(r.get(stage2_col, "")) if stage2_col else ""
+        row["WINDOW_START"] = str(r.get(wstart_col, "")) if wstart_col else ""
+        row["WINDOW_END"] = str(r.get(wend_col, "")) if wend_col else ""
+
+        ev_cols = evidence_map.get(outcome_name, [])
+        for c in ev_cols:
+            row[c] = str(r.get(c, ""))
+
+        rows.append(row)
+
+    # Build exemplars
+    for name, gold_col, pred_col in outcomes:
+        if gold_col not in df.columns or pred_col not in df.columns:
+            # Skip if not present
+            continue
+
+        tmp = df.copy()
+        tmp["_g"] = tmp[gold_col].map(to01)
+        tmp["_p"] = tmp[pred_col].map(to01)
+
+        # Prefer rows that have MRN present (if possible) so you can de-id easily
+        if mrn_col:
+            tmp["_mrn_ok"] = tmp[mrn_col].notna() & (tmp[mrn_col].astype(str).str.strip() != "") & (tmp[mrn_col].astype(str).str.lower() != "nan")
+            tmp = tmp.sort_values(["_mrn_ok"], ascending=False)
+
+        add_one(name, gold_col, pred_col, "FP", tmp[(tmp["_g"] == 0) & (tmp["_p"] == 1)])
+        add_one(name, gold_col, pred_col, "FN", tmp[(tmp["_g"] == 1) & (tmp["_p"] == 0)])
+        add_one(name, gold_col, pred_col, "TP", tmp[(tmp["_g"] == 1) & (tmp["_p"] == 1)])
+        add_one(name, gold_col, pred_col, "TN", tmp[(tmp["_g"] == 0) & (tmp["_p"] == 0)])
+
+    out_df = pd.DataFrame(rows)
+
+    # Ensure columns exist consistently (so CSV is stable)
+    base_cols = ["outcome", "case_type", "MRN", "ENCRYPTED_PAT_ID", "STAGE2_DATE", "WINDOW_START", "WINDOW_END", "gold_col", "pred_col", "gold", "pred"]
+    all_ev = []
+    for k in evidence_map:
+        all_ev += evidence_map[k]
+    # dedupe preserve order
+    seen = set()
+    all_ev2 = []
+    for c in all_ev:
+        if c not in seen:
+            seen.add(c)
+            all_ev2.append(c)
+
+    out_df = ensure_cols(out_df, base_cols + all_ev2)
+    out_df = out_df[base_cols + all_ev2]
+
+    out_df.to_csv(out_path, index=False)
+
+    # Terminal output
     print("")
-    print("Loaded:", in_path)
-    print("Rows:", len(df))
-    print("Reoperation FNs (gold=1 pred=0):", len(fns_out))
-    print("Reoperation FPs (gold=0 pred=1):", len(fps_out))
-    print("")
-    print("Wrote:")
-    print(" ", out_fn)
-    print(" ", out_fp)
-    print("")
-
-    # Compact terminal preview (first 10)
-    pd.set_option("display.max_colwidth", 140)
-    pd.set_option("display.width", 200)
-
-    show_cols_fn = pick_cols(df, [
-        "MRN", "ENCRYPTED_PAT_ID", "STAGE2_DATE",
-        gold_col, pred_col,
-        "reop_evidence_date", "reop_evidence_source", "reop_evidence_pattern",
-        "reop_evidence_snippet",
-    ])
-    show_cols_fp = show_cols_fn
-
-    if len(fns_out) > 0:
-        print("=== FN preview (first 10) ===")
-        print(fns_out[show_cols_fn].head(10).to_string(index=False))
+    print("Wrote:", out_path)
+    print("Rows (exemplars):", len(out_df))
+    if len(out_df) > 0:
+        pd.set_option("display.max_colwidth", 120)
+        pd.set_option("display.width", 200)
         print("")
-    else:
-        print("No Reoperation FNs found.\n")
-
-    if len(fps_out) > 0:
-        print("=== FP preview (first 10) ===")
-        print(fps_out[show_cols_fp].head(10).to_string(index=False))
+        print(out_df[["outcome", "case_type", "MRN", "ENCRYPTED_PAT_ID", "gold", "pred"]].to_string(index=False))
         print("")
-    else:
-        print("No Reoperation FPs found.\n")
 
+    # Also print missing outcomes (if any)
+    missing = []
+    for name, gold_col, pred_col in outcomes:
+        if gold_col not in df.columns or pred_col not in df.columns:
+            missing.append((name, gold_col, pred_col))
+    if missing:
+        print("Skipped outcomes missing columns:")
+        for m in missing:
+            print("  -", m[0], "| missing:", (m[1] if m[1] not in df.columns else ""), (m[2] if m[2] not in df.columns else ""))
 
 if __name__ == "__main__":
     main()
