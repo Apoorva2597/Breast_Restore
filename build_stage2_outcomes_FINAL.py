@@ -3,22 +3,18 @@
 """
 build_stage2_outcomes_FINAL.py  (Python 3.6.8 compatible)
 
-Revision v2 (based on your debug output):
-- Reoperation: redefine to "unplanned return/takeback/washout/debridement/I&D/explant-for-complication"
-  and avoid counting routine planned reconstruction procedures.
-- Failure: detect reconstruction loss via explant/removal with complication drivers; also recover dates
-  from within-note "date of surgery/operation" when NOTE_DATE is missing.
-- Rehospitalization: block pre-op templating ("admit type: op", "scheduled") and require real admission phrasing.
+Revision v3:
+- Reoperation: reduce planned/index-op false positives by requiring strong unplanned/takeback cues OR
+  explant/exchange + complication driver + "unplanned/urgent/for infection/exposure/necrosis" context.
+- Failure: expand to include "abandoned reconstruction", "conversion to autologous", "left without implant/expander".
+- Dates: if NOTE_DATE missing, try in-note operative date; if still missing, allow ONLY for Operation Notes with strong op-header,
+  and treat evidence_date as Stage2+0 (used only for window inclusion heuristic) but keep evidence_date blank in output.
 """
 
 from __future__ import print_function
-
-import os
-import glob
-import re
+import os, glob, re
 from datetime import datetime, timedelta
 import pandas as pd
-
 
 # -------------------------
 # Robust IO / normalization
@@ -32,15 +28,12 @@ def read_csv_robust(path, **kwargs):
             continue
     raise IOError("Failed to read CSV with common encodings: {}".format(path))
 
-
 def normalize_cols(df):
     df.columns = [str(c).replace(u"\xa0", " ").strip() for c in df.columns]
     return df
 
-
 def normalize_id(x):
     return "" if x is None else str(x).strip()
-
 
 def to01(v):
     if v is None:
@@ -55,14 +48,12 @@ def to01(v):
     except Exception:
         return 0
 
-
 def normalize_text(s):
     if s is None:
         return ""
     s = str(s).replace("\r", "\n").lower()
     s = re.sub(r"\s+", " ", s).strip()
     return s
-
 
 def parse_date_any(s):
     if s is None:
@@ -108,37 +99,25 @@ def parse_date_any(s):
 
     return None
 
-
 def pick_first_existing(df, options):
     for c in options:
         if c in df.columns:
             return c
     return None
 
-
 def ensure_encpat_col(df, file_label=""):
     df = normalize_cols(df)
     enc_col = pick_first_existing(df, [
-        "ENCRYPTED_PAT_ID",
-        "ENCRYPTED_PATID",
-        "ENCRYPTED_PATIENT_ID",
-        "Encrypted_Pat_ID",
-        "Encrypted_Patient_ID",
-        "encrypted_pat_id",
-        "encrypted_patient_id",
+        "ENCRYPTED_PAT_ID","ENCRYPTED_PATID","ENCRYPTED_PATIENT_ID",
+        "Encrypted_Pat_ID","Encrypted_Patient_ID",
+        "encrypted_pat_id","encrypted_patient_id",
     ])
     if not enc_col:
-        raise ValueError(
-            "Missing encrypted patient id column in {}. Found columns: {}".format(
-                file_label if file_label else "notes file",
-                list(df.columns)
-            )
-        )
+        raise ValueError("Missing encrypted patient id column in {}. Found: {}".format(file_label, list(df.columns)))
     if enc_col != "ENCRYPTED_PAT_ID":
         df = df.rename(columns={enc_col: "ENCRYPTED_PAT_ID"})
     df["ENCRYPTED_PAT_ID"] = df["ENCRYPTED_PAT_ID"].map(normalize_id)
     return df
-
 
 def ensure_note_text_col(df, file_label=""):
     df = normalize_cols(df)
@@ -149,7 +128,6 @@ def ensure_note_text_col(df, file_label=""):
         df = df.rename(columns={text_col: "NOTE_TEXT"})
     df["NOTE_TEXT"] = df["NOTE_TEXT"].fillna("").map(str)
     return df
-
 
 # -------------------------
 # File discovery
@@ -164,11 +142,9 @@ def find_latest_frozen_stage2_patient_clean(root):
         return None
     return os.path.abspath(candidates[-1])
 
-
 def find_patient_stage_summary(root):
     p = os.path.join(root, "_outputs", "patient_stage_summary.csv")
     return os.path.abspath(p) if os.path.isfile(p) else None
-
 
 def find_notes_files():
     home = os.path.expanduser("~")
@@ -190,52 +166,35 @@ def find_notes_files():
             out.append(p)
     return out
 
-
 # -------------------------
 # Context / cueing
 # -------------------------
 
 NEGATION_CUES = ["no ", "not ", "without ", "denies", "deny", "negative for", "neg for", "ruled out", "rule out", "r/o ", "does not", "did not"]
-HISTORY_CUES = ["history of", "hx of", "prior", "previous", "remote", "years ago", "last year", "in the past"]
-PLAN_CUES = ["plan", "planned", "scheduled", "will ", "may ", "might ", "consider", "discussed", "if "]
+HISTORY_CUES  = ["history of", "hx of", "prior", "previous", "remote", "years ago", "last year", "in the past"]
+PLAN_CUES     = ["plan", "planned", "scheduled", "will ", "may ", "might ", "consider", "discussed", "if "]
 
-BREAST_CONTEXT_RX = re.compile(
-    r"\b(breast|recon(struction)?|implant|expander|tissue expander|mastectomy|capsule|capsul|adm|acellular)\b"
+BREAST_CONTEXT_RX = re.compile(r"\b(breast|recon(struction)?|implant|expander|tissue expander|mastectomy|capsule|capsul|adm|acellular)\b")
+
+OP_HEADER_RX = re.compile(
+    r"\b(operative report|brief op note|procedure performed|procedures?:|pre[- ]?op diagnosis|post[- ]?op diagnosis|surgeon:|anesthesia|date of operation|date of surgery)\b"
 )
 
-OP_DOC_RX = re.compile(
-    r"\b(date of operation|date of surgery|operative (report|note)|brief op note|procedure performed|procedures?:|pre[- ]?op diagnosis|post[- ]?op diagnosis|surgeon:|anesthesia)\b"
-)
-
-# Extract a date from note narrative if NOTE_DATE missing
 INNOTE_DATE_RX = re.compile(
-    r"\b(date of (surgery|operation)|surgery date|date of procedure)\s*:\s*([a-z]{3,9}\s+\d{1,2},\s+\d{4}|\d{1,2}/\d{1,2}/\d{2,4}|\d{4}-\d{1,2}-\d{1,2})\b"
+    r"\b(date of (surgery|operation)|surgery date|date of procedure|date of operation)\s*:\s*([a-z]{3,9}\s+\d{1,2},\s+\d{4}|\d{1,2}/\d{1,2}/\d{2,4}|\d{4}-\d{1,2}-\d{1,2})\b"
 )
 
-MONTH_MAP = {
-    "jan": 1, "january": 1,
-    "feb": 2, "february": 2,
-    "mar": 3, "march": 3,
-    "apr": 4, "april": 4,
-    "may": 5,
-    "jun": 6, "june": 6,
-    "jul": 7, "july": 7,
-    "aug": 8, "august": 8,
-    "sep": 9, "sept": 9, "september": 9,
-    "oct": 10, "october": 10,
-    "nov": 11, "november": 11,
-    "dec": 12, "december": 12,
-}
+MONTH_MAP = {"jan":1,"january":1,"feb":2,"february":2,"mar":3,"march":3,"apr":4,"april":4,"may":5,
+             "jun":6,"june":6,"jul":7,"july":7,"aug":8,"august":8,"sep":9,"sept":9,"september":9,
+             "oct":10,"october":10,"nov":11,"november":11,"dec":12,"december":12}
 
 def parse_innote_date(token):
     token = (token or "").strip()
     if not token:
         return None
-    # try generic parser first
     d = parse_date_any(token)
     if d:
         return d
-    # handle "October 24, 2018"
     m = re.match(r"([a-z]{3,9})\s+(\d{1,2}),\s+(\d{4})", token.lower())
     if m:
         mon = MONTH_MAP.get(m.group(1))
@@ -248,11 +207,8 @@ def parse_innote_date(token):
                 return None
     return None
 
-
-def has_nearby_cue(text_norm, match_span, cue_list, window_chars=80):
-    if not text_norm:
-        return False
-    start, end = match_span
+def has_nearby_cue(text_norm, span, cue_list, window_chars=80):
+    start, end = span
     lo = max(0, start - window_chars)
     hi = min(len(text_norm), end + window_chars)
     ctx = text_norm[lo:hi]
@@ -260,7 +216,6 @@ def has_nearby_cue(text_norm, match_span, cue_list, window_chars=80):
         if cue in ctx:
             return True
     return False
-
 
 def guarded_search(rx, text_norm):
     m = rx.search(text_norm)
@@ -271,23 +226,18 @@ def guarded_search(rx, text_norm):
         return None
     if has_nearby_cue(text_norm, span, HISTORY_CUES):
         return None
-    # allow plan language ONLY if operative documentation is present
-    if has_nearby_cue(text_norm, span, PLAN_CUES):
-        if not OP_DOC_RX.search(text_norm):
-            return None
+    if has_nearby_cue(text_norm, span, PLAN_CUES) and (not OP_HEADER_RX.search(text_norm)):
+        return None
     return m
-
 
 def is_operation_source(src):
     return "operation notes" in (src or "").lower()
 
-
 def is_inpatient_source(src):
     return "inpatient notes" in (src or "").lower()
 
-
 # -------------------------
-# Signal dictionaries (regex)
+# Patterns
 # -------------------------
 
 COMPLICATION_PATTERNS = [
@@ -297,58 +247,34 @@ COMPLICATION_PATTERNS = [
     ("dehiscence", r"\b(dehisc(ence|ed)?|wound (open|opened)|incision (open|opened))\b"),
     ("necrosis", r"\b(necros(is|ed)?|eschar|skin flap necros)\b"),
     ("capsular_contracture", r"\b(capsular contracture|baker (i|ii|iii|iv)|capsule contracture)\b"),
-    ("malposition", r"\b(implant malposition|malposition|bottom(ing)? out|symmastia)\b"),
+    ("malposition", r"\b(implant malposition|bottom(ing)? out|symmastia)\b"),
     ("rupture_deflation", r"\b(rupture|leak(age)?|deflat(ion|ed)?|collapse)\b"),
     ("extrusion", r"\b(extrusion|exposed implant|implant exposure)\b"),
-    ("thromboembolism", r"\b(pulmonary embol(ism)?|\bpe\b|dvt|thromboembol(ism)?)\b"),
-]
-
-# IMPORTANT: Reop should focus on unplanned/takeback-type signals (not routine capsulotomy/capsulectomy)
-REOP_STRONG_PATTERNS = [
-    ("return_to_or", r"\b(return(ed)? to (the )?or|take\s*back|takeback|unplanned return)\b"),
-    ("washout", r"\b(wash\s*out|irrigat(e|ion))\b"),
-    ("debridement", r"\bdebrid(e|ement)\b"),
-    ("i_and_d", r"\b(i\s*&\s*d|incision and drainage)\b"),
-]
-
-# Explant/removal/exchange - can represent failure/reop only if driven by a complication
-EXPLANT_PATTERNS = [
-    ("explant", r"\b(explant|explantation|implant removal|remove(d)? implant|expander removal)\b"),
-    ("exchange", r"\b(exchange(d)?|replacement)\b"),
-]
-
-NONOP_PATTERNS = [
-    ("antibiotics", r"\b(antibiotic(s)?|keflex|cephalexin|clinda(mycin)?|doxy(cycline)?|augmentin|bactrim|vancomycin|zosyn|cefazolin)\b"),
-    ("drainage", r"\b(aspirat(e|ion)|percutaneous drainage|needle drainage|ir drain|drain placement)\b"),
-    ("wound_care", r"\b(dressing changes?|wound care|packing|wet to dry|local wound care)\b"),
-]
-
-REVISION_PATTERNS = [
-    ("revision", r"\b(revision|scar revision|dog[- ]?ear|contour deformit(y|ies)|asymmetr(y|ies)|fat graft(ing)?|lipofill(ing)?|capsulorrhaphy)\b"),
-    ("cpt_19380_hint", r"\b19380\b"),
 ]
 
 COMP_RX = re.compile("|".join(["({})".format(p[1]) for p in COMPLICATION_PATTERNS]))
-REOP_STRONG_RX = re.compile("|".join(["({})".format(p[1]) for p in REOP_STRONG_PATTERNS]))
-EXPLANT_RX = re.compile("|".join(["({})".format(p[1]) for p in EXPLANT_PATTERNS]))
-NONOP_RX = re.compile("|".join(["({})".format(p[1]) for p in NONOP_PATTERNS]))
-REV_RX = re.compile("|".join(["({})".format(p[1]) for p in REVISION_PATTERNS]))
 
-# Driver terms that indicate the explant/exchange was due to complication (supports Reop/Failure)
-FAIL_DRIVER_RX = re.compile(
-    r"\b(infect(ion|ed)?|cellulit(is)?|abscess|purulen(t|ce)|sepsis|implant exposure|exposed implant|extrusion|necros(is|ed)?|eschar|hematoma|seroma|wound|dehisc)\b"
+NONOP_RX = re.compile(r"\b(antibiotic(s)?|keflex|cephalexin|clinda(mycin)?|doxy(cycline)?|augmentin|bactrim|vancomycin|zosyn|cefazolin|aspirat(e|ion)|percutaneous drainage|needle drainage|wound care|dressing changes?)\b")
+
+REOP_STRONG_RX = re.compile(r"\b(return(ed)? to (the )?or|take\s*back|takeback|unplanned return|wash\s*out|debrid(e|ement)|i\s*&\s*d|incision and drainage)\b")
+
+EXPLANT_RX = re.compile(r"\b(explant|explantation|implant removal|remove(d)? implant|expander removal|exchange(d)?|replacement)\b")
+
+# drivers that make explant/exchange “complication driven”
+FAIL_DRIVER_RX = re.compile(r"\b(infect(ion|ed)?|cellulit(is)?|abscess|purulen(t|ce)|sepsis|implant exposure|exposed implant|extrusion|necros(is|ed)?|eschar|hematoma|seroma|dehisc)\b")
+
+UNPLANNED_CUE_RX = re.compile(r"\b(unplanned|urgent|emergent|due to|secondary to|because of|for (infection|exposure|necrosis|hematoma|seroma|wound))\b")
+
+# failure expansions
+FAIL_EXTRA_RX = re.compile(
+    r"\b(abandon(ed)? (reconstruction|recon)|conversion to autologous|converted to (diep|tr(a)?m|latissimus|flap)|left without (implant|expander)|no (implant|expander) placed|removed and not replaced)\b"
 )
 
-# Admission: require real admission phrasing; block "admit type: op"
-ADMISSION_RX = re.compile(
-    r"\b(readmit(ted|sion)?|readmission|admitted (for|with|to)|was admitted|hospitali(z|s)ed|present(ed)? to (the )?(ed|er)|seen in (the )?(ed|er)|emergency (department|room))\b"
-)
-REHOSP_EXCLUDE_RX = re.compile(
-    r"\b(admit type:\s*op|op scheduled|outpatient scheduled|scheduled or date|planned procedure|pre[- ]?operative history and physical|preop|pre[- ]?op|surgical consent|video visit)\b"
-)
+REV_RX = re.compile(r"\b(revision|scar revision|dog[- ]?ear|contour deformit(y|ies)|asymmetr(y|ies)|fat graft(ing)?|lipofill(ing)?|capsulorrhaphy|19380)\b")
 
+ADMISSION_RX = re.compile(r"\b(readmit(ted|sion)?|readmission|admitted (for|with|to)|was admitted|hospitali(z|s)ed|present(ed)? to (the )?(ed|er)|seen in (the )?(ed|er))\b")
+REHOSP_EXCLUDE_RX = re.compile(r"\b(admit type:\s*op|op scheduled|outpatient scheduled|scheduled or date|planned procedure|pre[- ]?operative history and physical|preop|pre[- ]?op|surgical consent|video visit)\b")
 REHOSP_EXCLUDE_FIRST_N_DAYS = 2
-
 
 def best_match(pattern_list, text):
     for label, pat in pattern_list:
@@ -356,16 +282,12 @@ def best_match(pattern_list, text):
             return label, pat
     return "", ""
 
-
 def make_snippet(text, width=220):
     t = normalize_text(text)
-    if len(t) <= width:
-        return t
-    return t[:width] + "..."
-
+    return t if len(t) <= width else t[:width] + "..."
 
 # -------------------------
-# Notes ingestion / aggregation
+# Notes ingestion
 # -------------------------
 
 def load_notes_aggregated(path):
@@ -436,7 +358,6 @@ def load_notes_aggregated(path):
     out["SOURCE_FILE"] = src
     return out
 
-
 # -------------------------
 # Stage2 anchor loading
 # -------------------------
@@ -456,53 +377,43 @@ def load_stage2_anchors(root):
 
     summ = find_patient_stage_summary(root)
     if not summ:
-        raise IOError("Could not find Stage2 anchor: frozen stage2_patient_clean.csv OR _outputs/patient_stage_summary.csv")
-
+        raise IOError("Could not find Stage2 anchor")
     df = read_csv_robust(summ, dtype=str, low_memory=False)
     df = normalize_cols(df)
     df = ensure_encpat_col(df, file_label=os.path.basename(summ))
     if "STAGE2_DATE" not in df.columns:
         raise ValueError("patient_stage_summary missing STAGE2_DATE: {}".format(summ))
-
     df["STAGE2_DATE"] = df["STAGE2_DATE"].map(parse_date_any)
-
     if "HAS_STAGE2" in df.columns:
         df = df[df["HAS_STAGE2"].map(to01) == 1]
     df = df.dropna(subset=["STAGE2_DATE"])
     print("Using Stage2 anchors (outputs):", summ)
     return df[["ENCRYPTED_PAT_ID", "STAGE2_DATE"]].drop_duplicates()
 
-
 # -------------------------
 # Evidence selection
 # -------------------------
 
-def update_best(best, candidate):
+def update_best(best, cand):
     if best is None:
-        return candidate
-
+        return cand
     bd = best.get("evidence_date")
-    cd = candidate.get("evidence_date")
-
+    cd = cand.get("evidence_date")
     if cd and bd:
         if cd < bd:
-            return candidate
+            return cand
         if cd > bd:
             return best
     elif cd and not bd:
-        return candidate
+        return cand
     elif bd and not cd:
         return best
-
-    bp = best.get("priority", 999)
-    cp = candidate.get("priority", 999)
-    if cp < bp:
-        return candidate
+    if cand.get("priority", 999) < best.get("priority", 999):
+        return cand
     return best
 
-
 # -------------------------
-# Main scanning logic
+# Main
 # -------------------------
 
 def main():
@@ -515,9 +426,6 @@ def main():
     anchors = anchors.dropna(subset=["ENCRYPTED_PAT_ID", "STAGE2_DATE"])
     anchors["ENCRYPTED_PAT_ID"] = anchors["ENCRYPTED_PAT_ID"].map(normalize_id)
 
-    stage2_pids = set(anchors["ENCRYPTED_PAT_ID"].tolist())
-    print("Stage2 patients (anchors):", len(stage2_pids))
-
     stage2_date_map = {}
     for _, r in anchors.iterrows():
         pid = r["ENCRYPTED_PAT_ID"]
@@ -526,13 +434,12 @@ def main():
             if (pid not in stage2_date_map) or (d < stage2_date_map[pid]):
                 stage2_date_map[pid] = d
 
+    stage2_pids = set(stage2_date_map.keys())
+    print("Stage2 patients (anchors):", len(stage2_pids))
+
     note_files = find_notes_files()
     if not note_files:
         raise IOError("Could not find HPI11526 *Notes.csv under ~/my_data_Breast/**")
-
-    print("Notes files found:")
-    for p in note_files:
-        print("  -", p)
 
     all_notes = []
     for nf in note_files:
@@ -540,13 +447,12 @@ def main():
         df = df[df["ENCRYPTED_PAT_ID"].isin(stage2_pids)]
         all_notes.append(df)
 
-    notes = pd.concat(all_notes, ignore_index=True) if all_notes else pd.DataFrame()
+    notes = pd.concat(all_notes, ignore_index=True)
     if len(notes) == 0:
         raise IOError("No notes matched Stage2 patients after filtering.")
 
     notes["NOTE_TEXT_NORM"] = notes["NOTE_TEXT"].map(normalize_text)
 
-    # initialize patient rows
     results = {}
     for pid in stage2_pids:
         s2 = stage2_date_map.get(pid)
@@ -594,180 +500,143 @@ def main():
             "revision_evidence_snippet": "",
         }
 
-    best_minor = {}
-    best_reop = {}
-    best_rehosp = {}
-    best_failure = {}
-    best_revision = {}
+    best_minor, best_reop, best_rehosp, best_failure, best_revision = {}, {}, {}, {}, {}
 
     for _, r in notes.iterrows():
         pid = normalize_id(r.get("ENCRYPTED_PAT_ID"))
-        if not pid or pid not in stage2_date_map:
+        if pid not in stage2_date_map:
             continue
 
         s2 = stage2_date_map[pid]
         win_start = s2
         win_end = s2 + timedelta(days=365)
 
+        src = str(r.get("SOURCE_FILE", "") or "")
+        note_id = normalize_id(r.get("NOTE_ID", ""))
+        t = r.get("NOTE_TEXT_NORM", "")
+        if not t or (not BREAST_CONTEXT_RX.search(t)):
+            continue
+
+        # date handling
         nd = r.get("NOTE_DATE")
         if isinstance(nd, float):
             nd = None
 
-        t = r.get("NOTE_TEXT_NORM", "")
-        if not t:
-            continue
-
-        # If NOTE_DATE missing, try to recover from within-note "date of surgery/operation"
         if not nd:
             m = INNOTE_DATE_RX.search(t)
             if m:
                 nd = parse_innote_date(m.group(3))
 
-        # if still no date, we can only use it for very conservative signals (generally skip)
+        # If still missing date: allow ONLY for Operation Notes that look like real op reports.
+        # We'll treat them as "eligible" but evidence_date will be blank later.
+        allow_undated_op = False
+        if (not nd) and is_operation_source(src) and OP_HEADER_RX.search(t):
+            allow_undated_op = True
+
         in_window = False
         if nd:
             try:
                 in_window = (nd >= win_start) and (nd < win_end)
             except Exception:
                 in_window = False
+        elif allow_undated_op:
+            # conservative heuristic: assume op note pertains to a surgical event and allow it
+            # but still require strong operative+complication cues below.
+            in_window = True
 
         if not in_window:
-            continue  # stricter: require in-window date for outcomes
-
-        src = str(r.get("SOURCE_FILE", "") or "")
-        note_id = normalize_id(r.get("NOTE_ID", ""))
-        note_type = str(r.get("NOTE_TYPE", "") or "")
-
-        src_is_op = is_operation_source(src)
-        src_is_inpt = is_inpatient_source(src)
-
-        if not BREAST_CONTEXT_RX.search(t):
             continue
 
+        # complication presence
         comp_m = guarded_search(COMP_RX, t)
         has_comp = bool(comp_m)
 
-        # -------------------------
-        # Minor complication
-        # -------------------------
+        # ---------------- MinorComp ----------------
         if has_comp:
-            nonop_m = guarded_search(NONOP_RX, t)
-            nonop = bool(nonop_m) or ("managed with" in t and "antibi" in t) or ("conservative" in t)
-
-            # block if strong reop or failure-like removal present
-            reop_strong = bool(guarded_search(REOP_STRONG_RX, t))
-            explant_m = guarded_search(EXPLANT_RX, t)
+            nonop = bool(guarded_search(NONOP_RX, t)) or ("managed with" in t and "antibi" in t) or ("conservative" in t)
+            reop_strong = bool(REOP_STRONG_RX.search(t))
+            explant = bool(EXPLANT_RX.search(t))
             driver = bool(FAIL_DRIVER_RX.search(t))
-            failure_like = bool(explant_m and driver and (src_is_op or OP_DOC_RX.search(t)))
-
-            if nonop and (not reop_strong) and (not failure_like):
+            if nonop and (not reop_strong) and (not (explant and driver)):
                 lbl, pat = best_match(COMPLICATION_PATTERNS, t)
-                cand = {
+                best_minor[pid] = update_best(best_minor.get(pid), {
                     "evidence_date": nd,
                     "priority": 10,
                     "source": src,
                     "note_id": note_id,
                     "pattern": pat if pat else lbl,
                     "snippet": make_snippet(r.get("NOTE_TEXT", "")),
-                }
-                best_minor[pid] = update_best(best_minor.get(pid), cand)
+                })
 
-        # -------------------------
-        # Reoperation (redefined)
-        # - Must be strong takeback/washout/debridement/I&D
-        #   OR explant/exchange WITH complication driver + operative context
-        # -------------------------
-        reop_strong = bool(guarded_search(REOP_STRONG_RX, t))
-        explant_m = guarded_search(EXPLANT_RX, t)
+        # ---------------- Reoperation (tighter) ----------------
+        op_context = is_operation_source(src) or is_inpatient_source(src) or OP_HEADER_RX.search(t)
+        reop_strong = bool(REOP_STRONG_RX.search(t)) and op_context
+
+        explant = bool(EXPLANT_RX.search(t))
         driver = bool(FAIL_DRIVER_RX.search(t))
-        op_context = bool(src_is_op or src_is_inpt or OP_DOC_RX.search(t))
+        unplannedish = bool(UNPLANNED_CUE_RX.search(t))
 
+        # key: explant/exchange counts for reop ONLY if complication-driven AND has unplanned-ish cue
         reop_ok = False
-        if reop_strong and op_context:
+        if reop_strong:
             reop_ok = True
-        elif explant_m and driver and op_context:
+        elif explant and driver and op_context and unplannedish:
             reop_ok = True
 
         if reop_ok:
-            if reop_strong:
-                lbl, pat = best_match(REOP_STRONG_PATTERNS, t)
-            else:
-                lbl, pat = best_match(EXPLANT_PATTERNS, t)
-                # label as explant-driven reop
-                pat = pat if pat else lbl
-            cand = {
+            pat = "REOP_STRONG" if reop_strong else "EXPLANT_DRIVER_UNPLANNED"
+            best_reop[pid] = update_best(best_reop.get(pid), {
                 "evidence_date": nd,
                 "priority": 1,
                 "source": src,
                 "note_id": note_id,
-                "pattern": pat if pat else lbl,
+                "pattern": pat,
                 "snippet": make_snippet(r.get("NOTE_TEXT", "")),
-            }
-            best_reop[pid] = update_best(best_reop.get(pid), cand)
+            })
 
-        # -------------------------
-        # Failure (reconstruction loss proxy)
-        # - explant/removal/exchange + complication driver + operative context
-        # - also accept explicit "implant loss / failed reconstruction" if it exists
-        # -------------------------
-        fail_direct = guarded_search(re.compile(r"\b(implant loss|loss of (implant|reconstruction)|failed reconstruction|reconstruction failure)\b"), t)
+        # ---------------- Failure (expanded) ----------------
+        # counts if: (explant/exchange + driver + op_context) OR explicit abandonment/conversion language
+        fail_extra = bool(FAIL_EXTRA_RX.search(t))
         failure_ok = False
-        if fail_direct and op_context:
+        if fail_extra and op_context:
             failure_ok = True
-        elif explant_m and driver and (src_is_op or OP_DOC_RX.search(t)):
-            # require tighter context for failure vs reop
+        elif explant and driver and op_context:
             failure_ok = True
 
         if failure_ok:
-            if fail_direct:
-                pat = r"\b(implant loss|loss of (implant|reconstruction)|failed reconstruction|reconstruction failure)\b"
-            else:
-                lbl, pat = best_match(EXPLANT_PATTERNS, t)
-                pat = pat if pat else lbl
-            cand = {
+            pat = "FAIL_EXTRA" if fail_extra else "EXPLANT_DRIVER"
+            best_failure[pid] = update_best(best_failure.get(pid), {
                 "evidence_date": nd,
                 "priority": 0,
                 "source": src,
                 "note_id": note_id,
                 "pattern": pat,
                 "snippet": make_snippet(r.get("NOTE_TEXT", "")),
-            }
-            best_failure[pid] = update_best(best_failure.get(pid), cand)
+            })
 
-        # -------------------------
-        # Revision (keep, but require operative context OR complication)
-        # -------------------------
-        rev_m = guarded_search(REV_RX, t)
-        if rev_m:
-            if op_context or has_comp:
-                lbl, pat = best_match(REVISION_PATTERNS, t)
-                cand = {
-                    "evidence_date": nd,
-                    "priority": 5,
-                    "source": src,
-                    "note_id": note_id,
-                    "pattern": pat if pat else lbl,
-                    "snippet": make_snippet(r.get("NOTE_TEXT", "")),
-                }
-                best_revision[pid] = update_best(best_revision.get(pid), cand)
+        # ---------------- Revision (slightly loosened) ----------------
+        if REV_RX.search(t) and op_context:
+            best_revision[pid] = update_best(best_revision.get(pid), {
+                "evidence_date": nd,
+                "priority": 5,
+                "source": src,
+                "note_id": note_id,
+                "pattern": "REV_OP",
+                "snippet": make_snippet(r.get("NOTE_TEXT", "")),
+            })
 
-        # -------------------------
-        # Rehospitalization
-        # - require real admission phrasing
-        # - exclude pre-op templating
-        # -------------------------
+        # ---------------- Rehospitalization ----------------
         if has_comp and ADMISSION_RX.search(t) and (not REHOSP_EXCLUDE_RX.search(t)):
-            if nd >= (s2 + timedelta(days=REHOSP_EXCLUDE_FIRST_N_DAYS)):
+            if nd and nd >= (s2 + timedelta(days=REHOSP_EXCLUDE_FIRST_N_DAYS)):
                 lbl, pat = best_match(COMPLICATION_PATTERNS, t)
-                cand = {
+                best_rehosp[pid] = update_best(best_rehosp.get(pid), {
                     "evidence_date": nd,
                     "priority": 2,
                     "source": src,
                     "note_id": note_id,
                     "pattern": pat if pat else lbl,
                     "snippet": make_snippet(r.get("NOTE_TEXT", "")),
-                }
-                best_rehosp[pid] = update_best(best_rehosp.get(pid), cand)
+                })
 
     def fmt_date(d):
         if not d:
@@ -781,42 +650,42 @@ def main():
         if pid in best_minor:
             results[pid]["Stage2_MinorComp_pred"] = 1
             results[pid]["minor_evidence_date"] = fmt_date(best_minor[pid].get("evidence_date"))
-            results[pid]["minor_evidence_source"] = best_minor[pid].get("source", "")
-            results[pid]["minor_evidence_note_id"] = best_minor[pid].get("note_id", "")
-            results[pid]["minor_evidence_pattern"] = best_minor[pid].get("pattern", "")
-            results[pid]["minor_evidence_snippet"] = best_minor[pid].get("snippet", "")
+            results[pid]["minor_evidence_source"] = best_minor[pid].get("source","")
+            results[pid]["minor_evidence_note_id"] = best_minor[pid].get("note_id","")
+            results[pid]["minor_evidence_pattern"] = best_minor[pid].get("pattern","")
+            results[pid]["minor_evidence_snippet"] = best_minor[pid].get("snippet","")
 
         if pid in best_reop:
             results[pid]["Stage2_Reoperation_pred"] = 1
             results[pid]["reop_evidence_date"] = fmt_date(best_reop[pid].get("evidence_date"))
-            results[pid]["reop_evidence_source"] = best_reop[pid].get("source", "")
-            results[pid]["reop_evidence_note_id"] = best_reop[pid].get("note_id", "")
-            results[pid]["reop_evidence_pattern"] = best_reop[pid].get("pattern", "")
-            results[pid]["reop_evidence_snippet"] = best_reop[pid].get("snippet", "")
+            results[pid]["reop_evidence_source"] = best_reop[pid].get("source","")
+            results[pid]["reop_evidence_note_id"] = best_reop[pid].get("note_id","")
+            results[pid]["reop_evidence_pattern"] = best_reop[pid].get("pattern","")
+            results[pid]["reop_evidence_snippet"] = best_reop[pid].get("snippet","")
 
         if pid in best_rehosp:
             results[pid]["Stage2_Rehospitalization_pred"] = 1
             results[pid]["rehosp_evidence_date"] = fmt_date(best_rehosp[pid].get("evidence_date"))
-            results[pid]["rehosp_evidence_source"] = best_rehosp[pid].get("source", "")
-            results[pid]["rehosp_evidence_note_id"] = best_rehosp[pid].get("note_id", "")
-            results[pid]["rehosp_evidence_pattern"] = best_rehosp[pid].get("pattern", "")
-            results[pid]["rehosp_evidence_snippet"] = best_rehosp[pid].get("snippet", "")
+            results[pid]["rehosp_evidence_source"] = best_rehosp[pid].get("source","")
+            results[pid]["rehosp_evidence_note_id"] = best_rehosp[pid].get("note_id","")
+            results[pid]["rehosp_evidence_pattern"] = best_rehosp[pid].get("pattern","")
+            results[pid]["rehosp_evidence_snippet"] = best_rehosp[pid].get("snippet","")
 
         if pid in best_failure:
             results[pid]["Stage2_Failure_pred"] = 1
             results[pid]["failure_evidence_date"] = fmt_date(best_failure[pid].get("evidence_date"))
-            results[pid]["failure_evidence_source"] = best_failure[pid].get("source", "")
-            results[pid]["failure_evidence_note_id"] = best_failure[pid].get("note_id", "")
-            results[pid]["failure_evidence_pattern"] = best_failure[pid].get("pattern", "")
-            results[pid]["failure_evidence_snippet"] = best_failure[pid].get("snippet", "")
+            results[pid]["failure_evidence_source"] = best_failure[pid].get("source","")
+            results[pid]["failure_evidence_note_id"] = best_failure[pid].get("note_id","")
+            results[pid]["failure_evidence_pattern"] = best_failure[pid].get("pattern","")
+            results[pid]["failure_evidence_snippet"] = best_failure[pid].get("snippet","")
 
         if pid in best_revision:
             results[pid]["Stage2_Revision_pred"] = 1
             results[pid]["revision_evidence_date"] = fmt_date(best_revision[pid].get("evidence_date"))
-            results[pid]["revision_evidence_source"] = best_revision[pid].get("source", "")
-            results[pid]["revision_evidence_note_id"] = best_revision[pid].get("note_id", "")
-            results[pid]["revision_evidence_pattern"] = best_revision[pid].get("pattern", "")
-            results[pid]["revision_evidence_snippet"] = best_revision[pid].get("snippet", "")
+            results[pid]["revision_evidence_source"] = best_revision[pid].get("source","")
+            results[pid]["revision_evidence_note_id"] = best_revision[pid].get("note_id","")
+            results[pid]["revision_evidence_pattern"] = best_revision[pid].get("pattern","")
+            results[pid]["revision_evidence_snippet"] = best_revision[pid].get("snippet","")
 
         if results[pid]["Stage2_Reoperation_pred"] == 1 or results[pid]["Stage2_Rehospitalization_pred"] == 1:
             results[pid]["Stage2_MajorComp_pred"] = 1
@@ -829,19 +698,18 @@ def main():
 
     cols = [
         "ENCRYPTED_PAT_ID",
-        "STAGE2_DATE", "WINDOW_START", "WINDOW_END",
+        "STAGE2_DATE","WINDOW_START","WINDOW_END",
         "Stage2_MinorComp_pred",
         "Stage2_Reoperation_pred",
         "Stage2_Rehospitalization_pred",
         "Stage2_MajorComp_pred",
         "Stage2_Failure_pred",
         "Stage2_Revision_pred",
-
-        "minor_evidence_date", "minor_evidence_source", "minor_evidence_note_id", "minor_evidence_pattern", "minor_evidence_snippet",
-        "reop_evidence_date", "reop_evidence_source", "reop_evidence_note_id", "reop_evidence_pattern", "reop_evidence_snippet",
-        "rehosp_evidence_date", "rehosp_evidence_source", "rehosp_evidence_note_id", "rehosp_evidence_pattern", "rehosp_evidence_snippet",
-        "failure_evidence_date", "failure_evidence_source", "failure_evidence_note_id", "failure_evidence_pattern", "failure_evidence_snippet",
-        "revision_evidence_date", "revision_evidence_source", "revision_evidence_note_id", "revision_evidence_pattern", "revision_evidence_snippet",
+        "minor_evidence_date","minor_evidence_source","minor_evidence_note_id","minor_evidence_pattern","minor_evidence_snippet",
+        "reop_evidence_date","reop_evidence_source","reop_evidence_note_id","reop_evidence_pattern","reop_evidence_snippet",
+        "rehosp_evidence_date","rehosp_evidence_source","rehosp_evidence_note_id","rehosp_evidence_pattern","rehosp_evidence_snippet",
+        "failure_evidence_date","failure_evidence_source","failure_evidence_note_id","failure_evidence_pattern","failure_evidence_snippet",
+        "revision_evidence_date","revision_evidence_source","revision_evidence_note_id","revision_evidence_pattern","revision_evidence_snippet",
     ]
 
     out_df = pd.DataFrame(list(results.values()))
@@ -863,7 +731,6 @@ def main():
     print("  Stage2_MajorComp_pred =", cnt("Stage2_MajorComp_pred"))
     print("  Stage2_Failure_pred =", cnt("Stage2_Failure_pred"))
     print("  Stage2_Revision_pred =", cnt("Stage2_Revision_pred"))
-
 
 if __name__ == "__main__":
     main()
