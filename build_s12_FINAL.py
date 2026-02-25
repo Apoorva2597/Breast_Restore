@@ -1,18 +1,26 @@
 #!/usr/bin/env python3
 """
 Breast_Restore: Stage 1 / Stage 2 detector from Operation Notes CSV (line-split notes)
-Python 3.6.8 compatible (NO typing.Pattern, NO f-strings required).
+Python 3.6.8 compatible.
+
+Fix for your error:
+- Your file is named: "HPI11526 Operation Notes.csv" (spaces), NOT "HPI11526_Operation_Notes.csv" (underscores).
+- This script will:
+  1) Use --in if provided
+  2) Else auto-detect the correct Operation Notes CSV in the current directory
+  3) Else fall back to the common names (both spaced and underscored)
 
 USAGE
 -----
-# Run from Breast_Restore/ and read the CSV in the same folder:
+cd ~/Breast_Restore
 python build_s12_FINAL.py
 
-# Or point to the CSV explicitly:
+# Or explicit:
 python build_s12_FINAL.py --in "/home/apokol/my_data_Breast/HPI-11526/HPI11256/HPI11526 Operation Notes.csv"
 
-# Put outputs into Breast_Restore/outputs/BR_Final (no need for new repo):
-python build_s12_FINAL.py --outdir "outputs/BR_Final"
+Outputs:
+outputs/final_final_attempt/note_level_hits.csv
+outputs/final_final_attempt/patient_level_stage_labels.csv
 """
 
 from __future__ import print_function
@@ -51,7 +59,6 @@ def _extract_snippets(text, patterns, window=80, max_snips=6):
 # -----------------------------
 # Stage rules
 # -----------------------------
-# Stage 1 = expander placement / immediate reconstruction
 RX_TE_STRONG = [
     _rx(r"\btissue\s+expanders?\b"),
     _rx(r"\bexpander(s)?\b"),
@@ -63,7 +70,6 @@ RX_STAGE1_CONTEXT = [
     _rx(r"\breconstruction\b"),
 ]
 
-# Stage 2 = expander removal/exchange + implant placement/permanent implant
 RX_REMOVAL = [
     _rx(r"\b(remove(d)?|removal|explant(ed|ation)?|take(n)?\s+out|exchange(d)?)\b"),
     _rx(r"\bexpander\s+(removal|exchange|explant)\b"),
@@ -86,12 +92,6 @@ RX_NEGATIONS = [
 
 
 def detect_stage1(full_text):
-    """
-    Stage 1 heuristic:
-      - Must mention tissue expander(s)/expander AND
-      - Must include placement/reconstruction context.
-    Returns: (hit_bool, snippets_list)
-    """
     if not full_text:
         return False, []
     te_hit = any(rx.search(full_text) for rx in RX_TE_STRONG)
@@ -102,13 +102,6 @@ def detect_stage1(full_text):
 
 
 def detect_stage2(full_text):
-    """
-    Stage 2 heuristic:
-      - Must include removal/exchange language AND implant placement/permanent implant language
-        within the same note.
-    Returns:
-      hit_bool, snippets_list, removal_found_bool, implant_found_bool, neg_found_bool
-    """
     if not full_text:
         return False, [], False, False, False
 
@@ -127,6 +120,62 @@ def detect_stage2(full_text):
 # -----------------------------
 REQUIRED_COLS = ["ENCRYPTED_PAT_ID", "NOTE_ID", "LINE", "NOTE_TEXT", "OPERATION_DATE"]
 FALLBACK_DATE_COLS = ["NOTE_DATE_OF_SERVICE"]
+
+
+def _looks_like_operation_notes_csv(filename):
+    f = filename.lower()
+    return f.endswith(".csv") and ("operation" in f) and ("note" in f)
+
+
+def resolve_input_csv(user_path=None, search_dir="."):
+    """
+    Resolution order:
+    1) explicit --in
+    2) auto-detect any *Operation*Notes*.csv in CWD
+    3) fall back to common known names (spaces + underscores)
+    """
+    if user_path:
+        p = os.path.expanduser(user_path)
+        if os.path.exists(p):
+            return p
+        raise IOError("Input CSV not found (from --in): {0}".format(p))
+
+    search_dir = os.path.expanduser(search_dir)
+
+    # 2) auto-detect in CWD
+    try:
+        candidates = [f for f in os.listdir(search_dir) if _looks_like_operation_notes_csv(f)]
+    except Exception:
+        candidates = []
+
+    # Prefer the one that matches your screenshot name exactly if present
+    preferred_order = [
+        "HPI11526 Operation Notes.csv",
+        "HPI11526_Operation_Notes.csv",
+        "HPI11526 Operation_Notes.csv",
+        "HPI11526_Operation Notes.csv",
+    ]
+    for name in preferred_order:
+        p = os.path.join(search_dir, name)
+        if os.path.exists(p):
+            return p
+
+    if candidates:
+        # deterministic pick: shortest name, then alpha
+        candidates = sorted(candidates, key=lambda x: (len(x), x.lower()))
+        return os.path.join(search_dir, candidates[0])
+
+    # 3) final fallbacks
+    for name in preferred_order:
+        p = os.path.join(search_dir, name)
+        if os.path.exists(p):
+            return p
+
+    raise IOError(
+        "Could not find an Operation Notes CSV in {0}. "
+        "Either pass --in with the full path, or ensure the file is in the current folder."
+        .format(os.path.abspath(search_dir))
+    )
 
 
 def read_and_validate(csv_path):
@@ -155,7 +204,6 @@ def read_and_validate(csv_path):
     else:
         df["SURGERY_DATE"] = df["OPERATION_DATE"]
 
-    # Optional columns (keep pipeline stable)
     for col in ["NOTE_TYPE", "ENCRYPTED_CSN", "MRN"]:
         if col not in df.columns:
             df[col] = pd.NA
@@ -286,8 +334,8 @@ def main():
     parser.add_argument(
         "--in",
         dest="in_path",
-        default="HPI11526 Operation Notes.csv",
-        help="Path to Operation Notes CSV (default: ./HPI11526 Operation Notes.csv)",
+        default=None,
+        help="Path to Operation Notes CSV. If omitted, auto-detect in current directory.",
     )
     parser.add_argument(
         "--outdir",
@@ -303,13 +351,14 @@ def main():
     )
     args = parser.parse_args()
 
-    in_path = os.path.expanduser(args.in_path)
     outdir = os.path.expanduser(args.outdir)
     tag = args.tag.strip().replace(" ", "_")
-
     run_dir = os.path.join(outdir, tag)
     if not os.path.exists(run_dir):
         os.makedirs(run_dir)
+
+    # Resolve input (this is the key fix)
+    in_path = resolve_input_csv(args.in_path, search_dir=".")
 
     out_note = os.path.join(run_dir, "note_level_hits.csv")
     out_patient = os.path.join(run_dir, "patient_level_stage_labels.csv")
