@@ -87,7 +87,7 @@ STAGE2_PATTERNS = [
 RX_STAGE2 = re.compile("|".join(["({})".format(p) for p in STAGE2_PATTERNS]), re.I)
 
 
-def extract_snippets(text, rx, max_snips=5, ctx=150):
+def extract_snippets(text, rx, max_snips=4, ctx=80):
     if not text:
         return []
 
