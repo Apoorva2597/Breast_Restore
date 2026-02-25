@@ -1,24 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-build_stage12_WITH_AUDIT_tunedFP.py (Python 3.6.8 compatible)
+build_stage12_WITH_AUDIT_tunedFP_v2.py (Python 3.6.8 compatible)
 
-Goal: reduce FP while keeping the audit outputs.
+Goal: reduce FN without reopening FP too much, keep audit outputs.
 
-Key tuning (FP control):
-- OPONLY_IMPLANT_PLACEMENT_RECON now EXCLUDES likely direct-to-implant/immediate mastectomy cases
-  unless expander/TE is also mentioned.
-- OPONLY_IMPLANT_EXCHANGE now requires a stronger Stage2 anchor:
-  (expander/TE OR capsule-work) present somewhere in note.
-- Adds "HISTORY/PRIOR" guard at sentence-level for OPONLY + SCHEDULED triggers:
-  skips matches in sentences that look like past history rather than performed/current.
-- Keeps audit outputs:
-  - ./_outputs/patient_stage_summary.csv
-  - ./_outputs/stage_event_level.csv
+Change vs tunedFP_v1:
+- Expand operative-context detection:
+  operative_context = NOTE_TYPE matches operative-like OR NOTE_TEXT contains strong op-report cues.
+  This catches true Stage2 documented in OP reports where NOTE_TYPE is missing/odd.
+
+Keeps FP-control:
+- OPONLY_IMPLANT_EXCHANGE requires implant + exchange AND (TE/expander OR capsule-work)
+- OPONLY_IMPLANT_PLACEMENT_RECON excludes likely DTI/immediate mastectomy implants unless TE present
+- HISTORY/PRIOR guard for OPONLY + SCHEDULED (sentence-level for scheduled)
 
 Inputs:
 - ./_staging_inputs/HPI11526 Operation Notes.csv
 - ./_staging_inputs/HPI11526 Clinic Notes.csv
+
+Outputs:
+- ./_outputs/patient_stage_summary.csv
+- ./_outputs/stage_event_level.csv
 """
 
 from __future__ import print_function
@@ -88,7 +91,6 @@ def _make_snippet(text_norm, start, end, width=150):
     return text_norm[lo:hi].strip()
 
 def _sentences(text_norm):
-    # crude but stable for normalized text
     return re.split(r"[.;]\s+|\n+", text_norm)
 
 # -------------------------
@@ -97,6 +99,14 @@ def _sentences(text_norm):
 
 RE_OPERATIVE_TYPE = re.compile(
     r"\b(operative|op note|brief op|operation|surgical|procedure|or note)\b",
+    re.I
+)
+
+# Strong op-report cues (NOTE_TEXT-based) to treat as operative context even if NOTE_TYPE is messy
+RE_OP_REPORT_CUE = re.compile(
+    r"\b(pre[- ]?op diagnosis|post[- ]?op diagnosis|procedure(s)? performed|anesthesia|estimated blood loss|ebl|"
+    r"findings:|specimen(s)?:|drains?:|indications?:|surgeon:|assistant:|"
+    r"implants?:|implant name|implant size|serial (no|number)|lot (no|number))\b",
     re.I
 )
 
@@ -115,24 +125,20 @@ RE_RECON = re.compile(r"\b(breast reconstruction|reconstruction)\b", re.I)
 RE_STAGE2_HINT = re.compile(r"\b(second stage|stage\s*2)\b", re.I)
 RE_CAPSULE = re.compile(r"\b(capsulectomy|capsulotomy)\b", re.I)
 
-# guard against direct-to-implant (DTI) / immediate implant at mastectomy (common FP)
 RE_MASTECTOMY = re.compile(r"\b(mastectomy)\b", re.I)
 RE_IMMEDIATE = re.compile(r"\b(immediate|direct[- ]?to[- ]?implant|dti)\b", re.I)
 
-# history / prior guard
 RE_HISTORY_GUARD = re.compile(
-    r"\b(history of|h/o|prior|previous(ly)?|s\/p|status post|had (an|a)|had (the)?|was|were)\b",
+    r"\b(history of|h/o|prior|previous(ly)?|s\/p|status post)\b",
     re.I
 )
 
-# Performed exchange (tight)
 RE_EXCHANGE_TIGHT = re.compile(
     r"\b(implant|expander)\b.{0,50}\b(exchange|exchanged|replace|replaced|replacement)\b"
     r"|\b(exchange|exchanged|replace|replaced|replacement)\b.{0,50}\b(implant|expander)\b",
     re.I
 )
 
-# Scheduled (as before)
 RE_SCHEDULE = re.compile(r"\b(schedule(d)?|planned|plan)\b", re.I)
 RE_SCHEDULED_FOR = re.compile(r"\bscheduled\b.{0,12}\bfor\b", re.I)
 RE_PROC_CUE = re.compile(r"\b(surgery|procedure|operation|or|operative)\b", re.I)
@@ -222,7 +228,6 @@ def _scheduled_stage2_sentence_level(text_norm, proximity=50):
     return False, "", "", 0, 0
 
 def _oponly_implant_exchange_ok(text_norm):
-    # tighten: require implant + exchange AND (expander OR capsule-work) somewhere (strong stage2 anchor)
     if not (RE_IMPLANT.search(text_norm) and RE_EXCH_WORD.search(text_norm)):
         return False
     if RE_TE.search(text_norm) or RE_CAPSULE.search(text_norm):
@@ -230,59 +235,60 @@ def _oponly_implant_exchange_ok(text_norm):
     return False
 
 def _oponly_implant_placement_recon_ok(text_norm):
-    # tighten: block likely DTI/immediate mastectomy implant cases unless expander present
     if not (RE_IMPLANT.search(text_norm) and re.search(r"\b(place(d|ment)?|insert(ed|ion)?)\b", text_norm, re.I)):
         return False
     if not (RE_RECON.search(text_norm) or RE_STAGE2_HINT.search(text_norm)):
         return False
-
-    # if mastectomy + immediate/DTI present AND no expander mention -> likely NOT stage2
     if RE_MASTECTOMY.search(text_norm) and RE_IMMEDIATE.search(text_norm) and (not RE_TE.search(text_norm)):
         return False
-
-    # also require NOT dominated by history language (note-level)
     return True
 
+def _is_operative_context(note_type_norm, text_norm):
+    if RE_OPERATIVE_TYPE.search(note_type_norm):
+        return 1
+    if RE_OP_REPORT_CUE.search(text_norm):
+        return 1
+    return 0
+
 def _stage2_bucket(text_norm, note_type_norm):
-    is_operative = 1 if RE_OPERATIVE_TYPE.search(note_type_norm) else 0
+    operative_ctx = _is_operative_context(note_type_norm, text_norm)
 
     m = RE_EXCHANGE_TIGHT.search(text_norm)
     if m:
-        return True, "EXCHANGE_TIGHT", "EXCHANGE_TIGHT", m.start(), m.end(), is_operative
+        return True, "EXCHANGE_TIGHT", "EXCHANGE_TIGHT", m.start(), m.end(), operative_ctx
 
     if RE_TE.search(text_norm) and RE_REMOVE.search(text_norm) and RE_IMPLANT.search(text_norm) and RE_ACTION.search(text_norm):
         m2 = RE_REMOVE.search(text_norm) or RE_ACTION.search(text_norm)
         st, en = (m2.start(), m2.end()) if m2 else (0, min(len(text_norm), 60))
-        return True, "EXPANDER_TO_IMPLANT", "TE+REMOVE+IMPLANT+ACTION", st, en, is_operative
+        return True, "EXPANDER_TO_IMPLANT", "TE+REMOVE+IMPLANT+ACTION", st, en, operative_ctx
 
-    # OPONLY (tightened)
-    if is_operative and _oponly_implant_exchange_ok(text_norm):
+    if operative_ctx and _oponly_implant_exchange_ok(text_norm) and (not RE_HISTORY_GUARD.search(text_norm)):
         m3 = RE_EXCH_WORD.search(text_norm) or RE_IMPLANT.search(text_norm)
         st, en = (m3.start(), m3.end()) if m3 else (0, min(len(text_norm), 60))
-        return True, "OPONLY_IMPLANT_EXCHANGE_TIGHT", "OPONLY_IMPLANT_EXCHANGE_TIGHT", st, en, is_operative
+        return True, "OPONLY_IMPLANT_EXCHANGE_TIGHT", "OPONLY_IMPLANT_EXCHANGE_TIGHT", st, en, operative_ctx
 
-    if is_operative and _oponly_implant_placement_recon_ok(text_norm) and (not RE_HISTORY_GUARD.search(text_norm)):
+    if operative_ctx and _oponly_implant_placement_recon_ok(text_norm) and (not RE_HISTORY_GUARD.search(text_norm)):
         m4 = re.search(r"\b(place(d|ment)?|insert(ed|ion)?)\b", text_norm, re.I) or RE_IMPLANT.search(text_norm)
         st, en = (m4.start(), m4.end()) if m4 else (0, min(len(text_norm), 60))
-        return True, "OPONLY_IMPLANT_PLACEMENT_RECON_TIGHT", "OPONLY_IMPLANT_PLACEMENT_RECON_TIGHT", st, en, is_operative
+        return True, "OPONLY_IMPLANT_PLACEMENT_RECON_TIGHT", "OPONLY_IMPLANT_PLACEMENT_RECON_TIGHT", st, en, operative_ctx
 
-    if is_operative and RE_CAPSULE.search(text_norm) and RE_IMPLANT.search(text_norm) and (not RE_HISTORY_GUARD.search(text_norm)):
+    if operative_ctx and RE_CAPSULE.search(text_norm) and RE_IMPLANT.search(text_norm) and (not RE_HISTORY_GUARD.search(text_norm)):
         m5 = RE_CAPSULE.search(text_norm)
-        return True, "OPONLY_CAPSULE_PLUS_IMPLANT", "OPONLY_CAPSULE_PLUS_IMPLANT", m5.start(), m5.end(), is_operative
+        return True, "OPONLY_CAPSULE_PLUS_IMPLANT", "OPONLY_CAPSULE_PLUS_IMPLANT", m5.start(), m5.end(), operative_ctx
 
     ok, bucket, patname, st, en = _scheduled_stage2_sentence_level(text_norm, proximity=50)
     if ok:
-        return True, bucket, patname, st, en, is_operative
+        return True, bucket, patname, st, en, operative_ctx
 
-    return False, "", "", 0, 0, is_operative
+    return False, "", "", 0, 0, operative_ctx
 
 def detect_stage(note_text, note_type):
     t = _normalize_text(note_text)
     nt = _normalize_text(note_type)
 
-    ok2, bucket, patname, st, en, isop = _stage2_bucket(t, nt)
+    ok2, bucket, patname, st, en, opctx = _stage2_bucket(t, nt)
     if ok2:
-        return "STAGE2", bucket, patname, st, en, isop
+        return "STAGE2", bucket, patname, st, en, opctx
 
     for pat in STAGE1_PATTERNS:
         m = re.search(pat, t)
@@ -324,7 +330,7 @@ def build(outputs_dir, input_csvs):
         note_type = (r.get("NOTE_TYPE") or "").strip()
         text = r.get("NOTE_TEXT", "")
 
-        stage, bucket, patname, st, en, isop = detect_stage(text, note_type)
+        stage, bucket, patname, st, en, opctx = detect_stage(text, note_type)
         if not stage:
             continue
 
@@ -360,7 +366,7 @@ def build(outputs_dir, input_csvs):
             "NOTE_TYPE": note_type,
             "DETECTION_BUCKET": bucket,
             "PATTERN_NAME": patname,
-            "IS_OPERATIVE_CONTEXT": int(isop),
+            "IS_OPERATIVE_CONTEXT": int(opctx),
             "EVIDENCE_SNIPPET": snippet
         })
 
