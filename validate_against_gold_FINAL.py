@@ -2,183 +2,174 @@
 # -*- coding: utf-8 -*-
 
 """
-Validate stage predictions vs gold.
-
-Inputs (default locations):
-- ./gold_cleaned_for_cedar.csv
-- ./outputs/patient_stage_summary.csv
-- Op notes CSV containing both MRN and ENCRYPTED_PAT_ID (auto-discovered)
-
-Outputs:
-- ./outputs/validation_merged.csv
-- ./outputs/validation_mismatches.csv
-- ./outputs/validation_metrics.txt
+VALIDATE STAGE PIPELINE AGAINST GOLD
+Python 3.6.8 compatible
 """
 
 from __future__ import print_function
 import os
-import sys
 import glob
 import pandas as pd
 
 
-def _find_op_notes_csv():
-    """
-    Try common locations + name patterns.
-    Adjust patterns if your filenames differ.
-    """
+# --------------------------------------------------
+# Robust CSV reader (fixes UTF-8 / cp1252 issues)
+# --------------------------------------------------
+
+def read_csv_robust(path, **kwargs):
+    for enc in ["utf-8", "utf-8-sig", "cp1252", "latin1"]:
+        try:
+            return pd.read_csv(path, encoding=enc, **kwargs)
+        except UnicodeDecodeError:
+            continue
+    raise IOError("Failed to read CSV with common encodings: {}".format(path))
+
+
+# --------------------------------------------------
+# Auto-find prediction summary
+# --------------------------------------------------
+
+def find_prediction_csv(root):
     candidates = []
+    candidates += glob.glob(os.path.join(root, "_outputs", "*stage*summary*.csv"))
+    candidates += glob.glob(os.path.join(root, "_outputs", "*patient*stage*.csv"))
+    candidates += glob.glob(os.path.join(root, "**", "*stage*summary*.csv"), recursive=True)
 
-    # Common spots in your workflow
-    candidates += glob.glob(os.path.join(".", "_staging_inputs", "*Operation Notes*.csv"))
-    candidates += glob.glob(os.path.join(".", "_staging_inputs", "*Operation_Notes*.csv"))
-    candidates += glob.glob(os.path.join(".", "*Operation Notes*.csv"))
-    candidates += glob.glob(os.path.join(".", "*Operation_Notes*.csv"))
-
-    # Also try nested data folders if you copied them into repo
-    candidates += glob.glob(os.path.join(".", "**", "*Operation Notes*.csv"), recursive=True)
-    candidates += glob.glob(os.path.join(".", "**", "*Operation_Notes*.csv"), recursive=True)
-
-    # de-dupe while preserving order
     seen = set()
     uniq = []
     for c in candidates:
-        c_abs = os.path.abspath(c)
-        if c_abs not in seen and os.path.isfile(c_abs):
-            uniq.append(c_abs)
-            seen.add(c_abs)
+        if os.path.isfile(c):
+            ab = os.path.abspath(c)
+            if ab not in seen:
+                uniq.append(ab)
+                seen.add(ab)
 
     if not uniq:
         return None
 
-    # Prefer a file inside _staging_inputs if available
-    for p in uniq:
-        if os.sep + "_staging_inputs" + os.sep in p:
-            return p
-
-    # Otherwise return first
+    uniq.sort(key=lambda x: len(x))
     return uniq[0]
 
 
-def _require_cols(df, cols, label):
-    missing = [c for c in cols if c not in df.columns]
-    if missing:
-        raise ValueError(
-            "{} is missing required columns: {}. Found columns: {}".format(
-                label, missing, list(df.columns)[:50]
-            )
-        )
+# --------------------------------------------------
+# Auto-find op notes file
+# --------------------------------------------------
 
+def find_op_notes_csv(root):
+    candidates = []
+    candidates += glob.glob(os.path.join(root, "_staging_inputs", "*Operation Notes*.csv"))
+    candidates += glob.glob(os.path.join(root, "**", "*Operation Notes*.csv"), recursive=True)
+
+    for c in candidates:
+        if os.path.isfile(c):
+            return os.path.abspath(c)
+
+    return None
+
+
+# --------------------------------------------------
+# Utility
+# --------------------------------------------------
+
+def normalize_id(x):
+    if x is None:
+        return ""
+    return str(x).strip()
+
+
+def to01(v):
+    if v is None:
+        return 0
+    s = str(v).strip().lower()
+    if s in ["1", "y", "yes", "true", "t"]:
+        return 1
+    if s in ["0", "n", "no", "false", "f", ""]:
+        return 0
+    try:
+        return 1 if float(s) != 0.0 else 0
+    except:
+        return 0
+
+
+# --------------------------------------------------
+# Main
+# --------------------------------------------------
 
 def main():
+
     root = os.path.abspath(".")
+
     gold_path = os.path.join(root, "gold_cleaned_for_cedar.csv")
-    pred_path = os.path.join(root, "_outputs", "patient_stage_summary.csv")
+    pred_path = find_prediction_csv(root)
+    op_path = find_op_notes_csv(root)
 
     if not os.path.isfile(gold_path):
-        raise IOError("Gold CSV not found at: {}".format(gold_path))
-    if not os.path.isfile(pred_path):
-        raise IOError("Prediction summary not found at: {}".format(pred_path))
+        raise IOError("Gold file not found: {}".format(gold_path))
 
-    op_path = _find_op_notes_csv()
+    if not pred_path:
+        raise IOError("Prediction summary not found under _outputs/")
+
     if not op_path:
-        raise IOError(
-            "Could not auto-find Op Notes CSV. Put/copy it into ./_staging_inputs/ "
-            "or rename it to include 'Operation Notes'."
-        )
+        raise IOError("Operation Notes CSV not found.")
 
-    # Load
-    gold = pd.read_csv(gold_path, dtype=str, low_memory=False)
-    pred = pd.read_csv(pred_path, dtype=str, low_memory=False)
-    def read_csv_robust(path, **kwargs):
-    # Python 3.6 compatible; handles common Excel/Windows encodings
-    try:
-        return pd.read_csv(path, encoding="utf-8", **kwargs)
-    except UnicodeDecodeError:
-        pass
-    try:
-        return pd.read_csv(path, encoding="utf-8-sig", **kwargs)
-    except UnicodeDecodeError:
-        pass
-    try:
-        return pd.read_csv(path, encoding="cp1252", **kwargs)
-    except UnicodeDecodeError:
-        pass
-    return pd.read_csv(path, encoding="latin1", **kwargs)
+    print("Using:")
+    print("  Gold:", gold_path)
+    print("  Pred:", pred_path)
+    print("  Op  :", op_path)
+    print("")
 
-op = read_csv_robust(op_path, dtype=str, low_memory=False)
+    gold = read_csv_robust(gold_path, dtype=str, low_memory=False)
+    pred = read_csv_robust(pred_path, dtype=str, low_memory=False)
+    op = read_csv_robust(op_path, dtype=str, low_memory=False)
+
+    # Clean non-breaking spaces
+    gold.columns = [c.replace(u"\xa0", " ").strip() for c in gold.columns]
+    pred.columns = [c.replace(u"\xa0", " ").strip() for c in pred.columns]
+    op.columns = [c.replace(u"\xa0", " ").strip() for c in op.columns]
 
     # Required columns
-    _require_cols(op, ["MRN", "ENCRYPTED_PAT_ID"], "Op Notes")
-    _require_cols(pred, ["ENCRYPTED_PAT_ID"], "patient_stage_summary")
-    _require_cols(gold, ["MRN"], "gold_cleaned_for_cedar")
+    if "MRN" not in op.columns or "ENCRYPTED_PAT_ID" not in op.columns:
+        raise ValueError("Op Notes must contain MRN and ENCRYPTED_PAT_ID")
+
+    if "ENCRYPTED_PAT_ID" not in pred.columns:
+        raise ValueError("Prediction summary missing ENCRYPTED_PAT_ID")
+
+    if "MRN" not in gold.columns:
+        raise ValueError("Gold file missing MRN")
 
     # Normalize IDs
-    def norm(s):
-        if s is None:
-            return s
-        return str(s).strip()
+    op["MRN"] = op["MRN"].map(normalize_id)
+    op["ENCRYPTED_PAT_ID"] = op["ENCRYPTED_PAT_ID"].map(normalize_id)
+    gold["MRN"] = gold["MRN"].map(normalize_id)
+    pred["ENCRYPTED_PAT_ID"] = pred["ENCRYPTED_PAT_ID"].map(normalize_id)
 
-    for df, col in [(op, "MRN"), (op, "ENCRYPTED_PAT_ID"), (pred, "ENCRYPTED_PAT_ID"), (gold, "MRN")]:
-        df[col] = df[col].map(norm)
-
-    # Build crosswalk (one MRN per encrypted id; if multiple, keep the most frequent)
-    x = op[["ENCRYPTED_PAT_ID", "MRN"]].dropna()
-    x = x[(x["ENCRYPTED_PAT_ID"] != "") & (x["MRN"] != "")]
-    # Resolve potential many-to-many by choosing the modal MRN per ENCRYPTED_PAT_ID
-    counts = x.groupby(["ENCRYPTED_PAT_ID", "MRN"]).size().reset_index(name="n")
-    counts = counts.sort_values(["ENCRYPTED_PAT_ID", "n"], ascending=[True, False])
-    id_map = counts.drop_duplicates(subset=["ENCRYPTED_PAT_ID"], keep="first")[["ENCRYPTED_PAT_ID", "MRN"]]
+    # Build ID map
+    id_map = op[["ENCRYPTED_PAT_ID", "MRN"]].dropna()
+    id_map = id_map.drop_duplicates()
 
     # Attach MRN to predictions
-    pred_m = pred.merge(id_map, on="ENCRYPTED_PAT_ID", how="left")
+    pred = pred.merge(id_map, on="ENCRYPTED_PAT_ID", how="left")
 
-    # Coerce pipeline prediction flags
-    # HAS_STAGE2 is already in your summary; if missing, derive from STAGE2_DATE presence
-    if "HAS_STAGE2" not in pred_m.columns:
-        pred_m["HAS_STAGE2"] = pred_m["STAGE2_DATE"].notna().astype(int).astype(str)
-
-    # Gold label column selection
-    # Prefer Stage2_Applicable if present; otherwise fail loudly so you choose the right column.
-    gold_label_col = None
-    for c in ["Stage2_Applicable", "STAGE2_APPLICABLE", "stage2_applicable"]:
+    # Determine gold Stage2 label column
+    gold_label = None
+    for c in ["Stage2_Applicable", "STAGE2_APPLICABLE"]:
         if c in gold.columns:
-            gold_label_col = c
+            gold_label = c
             break
-    if gold_label_col is None:
-        raise ValueError(
-            "Could not find Stage2 label column in gold. Expected 'Stage2_Applicable' (case-insensitive variants). "
-            "Please tell me the exact gold column that represents Stage 2 presence."
-        )
 
-    # Standardize gold label to 0/1
-    def to01(v):
-        if v is None:
-            return 0
-        s = str(v).strip().lower()
-        if s in ["1", "y", "yes", "true", "t"]:
-            return 1
-        if s in ["0", "n", "no", "false", "f", ""]:
-            return 0
-        # if weird values, treat non-zero numeric as 1
-        try:
-            return 1 if float(s) != 0.0 else 0
-        except Exception:
-            return 0
+    if not gold_label:
+        raise ValueError("Could not find Stage2_Applicable column in gold.")
 
-    gold["GOLD_HAS_STAGE2"] = gold[gold_label_col].map(to01).astype(int)
-    pred_m["PRED_HAS_STAGE2"] = pred_m["HAS_STAGE2"].map(to01).astype(int)
+    gold["GOLD_HAS_STAGE2"] = gold[gold_label].map(to01).astype(int)
 
-    # Merge gold ↔ predictions by MRN
-    merged = gold.merge(
-        pred_m,
-        on="MRN",
-        how="left",
-        suffixes=("_GOLD", "_PRED")
-    )
+    if "HAS_STAGE2" in pred.columns:
+        pred["PRED_HAS_STAGE2"] = pred["HAS_STAGE2"].map(to01).astype(int)
+    else:
+        pred["PRED_HAS_STAGE2"] = pred["STAGE2_DATE"].notna().astype(int)
 
-    # Confusion matrix (Stage2)
-    # If no prediction row found for an MRN, treat as predicted 0
+    # Merge
+    merged = gold.merge(pred, on="MRN", how="left")
+
     merged["PRED_HAS_STAGE2"] = merged["PRED_HAS_STAGE2"].fillna(0).astype(int)
 
     tp = int(((merged["GOLD_HAS_STAGE2"] == 1) & (merged["PRED_HAS_STAGE2"] == 1)).sum())
@@ -186,7 +177,6 @@ op = read_csv_robust(op_path, dtype=str, low_memory=False)
     fn = int(((merged["GOLD_HAS_STAGE2"] == 1) & (merged["PRED_HAS_STAGE2"] == 0)).sum())
     tn = int(((merged["GOLD_HAS_STAGE2"] == 0) & (merged["PRED_HAS_STAGE2"] == 0)).sum())
 
-    # Derived metrics with safe division
     def safe_div(a, b):
         return float(a) / float(b) if b else 0.0
 
@@ -194,7 +184,7 @@ op = read_csv_robust(op_path, dtype=str, low_memory=False)
     recall = safe_div(tp, tp + fn)
     f1 = safe_div(2 * precision * recall, precision + recall) if (precision + recall) else 0.0
 
-    out_dir = os.path.join(root, "outputs")
+    out_dir = os.path.join(root, "_outputs")
     if not os.path.isdir(out_dir):
         os.makedirs(out_dir)
 
@@ -204,39 +194,21 @@ op = read_csv_robust(op_path, dtype=str, low_memory=False)
 
     merged.to_csv(merged_path, index=False)
 
-    mism = merged[merged["GOLD_HAS_STAGE2"] != merged["PRED_HAS_STAGE2"]].copy()
-    # Keep a compact set of columns helpful for review
-    keep = []
-    for c in [
-        "__excel_row__", "MRN", "PatientID", "DOB",
-        "GOLD_HAS_STAGE2", gold_label_col,
-        "PRED_HAS_STAGE2", "ENCRYPTED_PAT_ID",
-        "STAGE2_DATE", "STAGE2_NOTE_ID", "STAGE2_NOTE_TYPE", "STAGE2_MATCH_PATTERN", "STAGE2_HITS",
-        "STAGE1_DATE", "STAGE1_NOTE_ID", "STAGE1_NOTE_TYPE", "STAGE1_MATCH_PATTERN", "STAGE1_HITS"
-    ]:
-        if c in mism.columns and c not in keep:
-            keep.append(c)
-    if keep:
-        mism = mism[keep]
+    mism = merged[merged["GOLD_HAS_STAGE2"] != merged["PRED_HAS_STAGE2"]]
     mism.to_csv(mism_path, index=False)
 
     with open(metrics_path, "w") as f:
-        f.write("Gold file: {}\n".format(gold_path))
-        f.write("Pred file: {}\n".format(pred_path))
-        f.write("Op notes file used for ID map: {}\n".format(op_path))
-        f.write("Gold Stage2 label column: {}\n\n".format(gold_label_col))
-        f.write("STAGE2 confusion matrix:\n")
-        f.write("TP: {}\nFP: {}\nFN: {}\nTN: {}\n\n".format(tp, fp, fn, tn))
-        f.write("Precision: {:.4f}\nRecall: {:.4f}\nF1: {:.4f}\n".format(precision, recall, f1))
-        f.write("\nMerged rows: {}\nMismatches: {}\n".format(len(merged), len(mism)))
+        f.write("TP: {}\nFP: {}\nFN: {}\nTN: {}\n".format(tp, fp, fn, tn))
+        f.write("Precision: {:.4f}\n".format(precision))
+        f.write("Recall: {:.4f}\n".format(recall))
+        f.write("F1: {:.4f}\n".format(f1))
 
-    print("OK: wrote")
-    print(" - {}".format(merged_path))
-    print(" - {}".format(mism_path))
-    print(" - {}".format(metrics_path))
-    print("Stage2: TP={} FP={} FN={} TN={} | Precision={:.3f} Recall={:.3f} F1={:.3f}".format(
-        tp, fp, fn, tn, precision, recall, f1
-    ))
+    print("")
+    print("Validation complete.")
+    print("TP={} FP={} FN={} TN={}".format(tp, fp, fn, tn))
+    print("Precision={:.3f} Recall={:.3f} F1={:.3f}".format(precision, recall, f1))
+    print("")
+    print("Files written to:", out_dir)
 
 
 if __name__ == "__main__":
