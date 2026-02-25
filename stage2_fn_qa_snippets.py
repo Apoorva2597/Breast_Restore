@@ -5,12 +5,9 @@ stage2_fn_qa_snippets_RAW_NOTES.py  (Python 3.6.8 compatible)
 
 UPDATED:
 - Uses RAW notes (Clinic + Inpatient + Operation Notes CSVs)
-- Does NOT use de-id bundles
+- Shorter snippets for faster manual review
 - Broad Stage2 discovery search
-- Outputs MRN + ENCRYPTED_PAT_ID + raw snippets (YOU will manually de-id before pasting)
-
-Output:
-- _outputs/stage2_fn_raw_note_snippets.csv
+- Outputs MRN + ENCRYPTED_PAT_ID + raw snippets
 """
 
 from __future__ import print_function
@@ -90,7 +87,7 @@ STAGE2_PATTERNS = [
 RX_STAGE2 = re.compile("|".join(["({})".format(p) for p in STAGE2_PATTERNS]), re.I)
 
 
-def extract_snippets(text, rx, max_snips=6, ctx=350):
+def extract_snippets(text, rx, max_snips=5, ctx=150):
     if not text:
         return []
 
@@ -140,7 +137,6 @@ def main():
     fn = merged[(merged["GOLD_HAS_STAGE2"] == 1) &
                 (merged["PRED_HAS_STAGE2"] == 0)].copy()
 
-    # Load all raw notes (clinic, inpatient, op)
     note_files = glob.glob(os.path.join(staging_dir, "*Notes*.csv"))
     notes_list = []
 
@@ -171,7 +167,7 @@ def main():
         for _, nrow in patient_notes.iterrows():
             snips = extract_snippets(nrow["NOTE_TEXT"], RX_STAGE2)
             snippets_all.extend(snips)
-            if len(snippets_all) >= 6:
+            if len(snippets_all) >= 5:
                 break
 
         row = {
@@ -179,7 +175,7 @@ def main():
             "ENCRYPTED_PAT_ID": r.get("ENCRYPTED_PAT_ID", "")
         }
 
-        for i in range(6):
+        for i in range(5):
             row["SNIP_{:02d}".format(i+1)] = snippets_all[i] if i < len(snippets_all) else ""
 
         rows.append(row)
