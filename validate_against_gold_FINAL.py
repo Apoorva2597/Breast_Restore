@@ -90,7 +90,23 @@ def main():
     # Load
     gold = pd.read_csv(gold_path, dtype=str, low_memory=False)
     pred = pd.read_csv(pred_path, dtype=str, low_memory=False)
-    op = pd.read_csv(op_path, dtype=str, low_memory=False)
+    def read_csv_robust(path, **kwargs):
+    # Python 3.6 compatible; handles common Excel/Windows encodings
+    try:
+        return pd.read_csv(path, encoding="utf-8", **kwargs)
+    except UnicodeDecodeError:
+        pass
+    try:
+        return pd.read_csv(path, encoding="utf-8-sig", **kwargs)
+    except UnicodeDecodeError:
+        pass
+    try:
+        return pd.read_csv(path, encoding="cp1252", **kwargs)
+    except UnicodeDecodeError:
+        pass
+    return pd.read_csv(path, encoding="latin1", **kwargs)
+
+op = read_csv_robust(op_path, dtype=str, low_memory=False)
 
     # Required columns
     _require_cols(op, ["MRN", "ENCRYPTED_PAT_ID"], "Op Notes")
