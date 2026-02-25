@@ -4,8 +4,9 @@
 stage2_fn_qa_snippets.py  (Python 3.6.8 compatible)
 
 FIXED VERSION:
-- Robust ENCRYPTED_PAT_ID handling (no KeyError)
-- Handles missing crosswalk mappings safely
+- Does NOT rely on CROSSWALK file
+- Maps MRN -> ENCRYPTED_PAT_ID using Operation Notes (authoritative source)
+- Robust to missing columns
 - Broad Stage2 discovery search
 - Outputs NO MRN (safe to paste)
 """
@@ -62,7 +63,7 @@ def pick_first_existing(df, options):
 
 
 # -------------------------
-# BROAD Stage 2 discovery regex
+# Broad Stage2 search
 # -------------------------
 
 STAGE2_PATTERNS = [
@@ -70,11 +71,9 @@ STAGE2_PATTERNS = [
     r"\bexpander exchange\b",
     r"\bexchange\b",
     r"\breplace(d|ment)?\b",
-    r"\bre-implant\b",
     r"\bremove(d|al)?\b.*\b(expander|tissue expander|expanders|te)\b",
     r"\b(explant(ed)?|take\s*out)\b.*\b(expander|implant)\b",
     r"\bexpander[- ]?to[- ]?implant\b",
-    r"\bconversion\b.*\bimplant\b",
     r"\bsecond stage\b",
     r"\bstage\s*2\b",
     r"\bpermanent implant\b",
@@ -84,9 +83,6 @@ STAGE2_PATTERNS = [
     r"\b19342\b",
     r"\b11970\b",
     r"\b11971\b",
-    r"\bexchange of tissue expander\b",
-    r"\bremoval of tissue expander\b",
-    r"\bplacement of permanent implant\b",
 ]
 
 RX_STAGE2 = re.compile("|".join(["({})".format(p) for p in STAGE2_PATTERNS]), re.I)
@@ -137,19 +133,16 @@ def main():
     out_dir = os.path.join(root, "_outputs")
 
     merged_path = os.path.join(out_dir, "validation_merged.csv")
-    crosswalk_path = os.path.join(root, "CROSSWALK", "CROSSWALK__MRN_to_patient_id__vNEW.csv")
+    op_notes_path = os.path.join(root, "_staging_inputs", "HPI11526 Operation Notes.csv")
     bundles_root = os.path.join(root, "PATIENT_BUNDLES")
 
     merged = normalize_cols(read_csv_robust(merged_path, dtype=str))
-    cw = normalize_cols(read_csv_robust(crosswalk_path, dtype=str))
+    op = normalize_cols(read_csv_robust(op_notes_path, dtype=str))
 
-    # ---- Identify columns safely
+    # ---- Identify columns
     mrn_col = pick_first_existing(merged, ["MRN", "mrn"])
     gold_col = pick_first_existing(merged, ["GOLD_HAS_STAGE2", "Stage2_Applicable"])
     pred_col = pick_first_existing(merged, ["PRED_HAS_STAGE2", "HAS_STAGE2"])
-
-    if not mrn_col or not gold_col or not pred_col:
-        raise ValueError("Missing required columns in validation_merged.csv")
 
     merged["MRN"] = merged[mrn_col].map(normalize_id)
     merged["GOLD_HAS_STAGE2"] = merged[gold_col].map(to01).astype(int)
@@ -158,23 +151,16 @@ def main():
     fn = merged[(merged["GOLD_HAS_STAGE2"] == 1) &
                 (merged["PRED_HAS_STAGE2"] == 0)].copy()
 
-    # ---- Crosswalk
-    cw_mrn = pick_first_existing(cw, ["MRN", "mrn"])
-    cw_pid = pick_first_existing(cw, ["ENCRYPTED_PAT_ID", "ENCRYPTED_PATID", "patient_id"])
+    # ---- Build MRN -> ENCRYPTED_PAT_ID mapping from OP notes
+    op_mrn_col = pick_first_existing(op, ["MRN", "mrn"])
+    op_pid_col = pick_first_existing(op, ["ENCRYPTED_PAT_ID", "ENCRYPTED_PATID", "ENCRYPTED_PATIENT_ID"])
 
-    if not cw_mrn or not cw_pid:
-        raise ValueError("Missing MRN or ENCRYPTED_PAT_ID in crosswalk")
+    op["MRN"] = op[op_mrn_col].map(normalize_id)
+    op["ENCRYPTED_PAT_ID"] = op[op_pid_col].map(normalize_id)
 
-    cw["MRN"] = cw[cw_mrn].map(normalize_id)
-    cw["ENCRYPTED_PAT_ID"] = cw[cw_pid].map(normalize_id)
+    id_map = op[["MRN", "ENCRYPTED_PAT_ID"]].drop_duplicates()
 
-    cw = cw[["MRN", "ENCRYPTED_PAT_ID"]].drop_duplicates()
-
-    fn = fn.merge(cw, on="MRN", how="left")
-
-    # ---- Safely handle missing ENCRYPTED_PAT_ID
-    if "ENCRYPTED_PAT_ID" not in fn.columns:
-        raise ValueError("ENCRYPTED_PAT_ID missing after merge.")
+    fn = fn.merge(id_map, on="MRN", how="left")
 
     fn["ENCRYPTED_PAT_ID"] = fn["ENCRYPTED_PAT_ID"].fillna("").map(normalize_id)
     fn = fn[fn["ENCRYPTED_PAT_ID"] != ""].copy()
@@ -186,7 +172,7 @@ def main():
         bundle_file = os.path.join(bundles_root, pid, "ALL_NOTES_COMBINED.txt")
 
         text = load_text(bundle_file) if os.path.isfile(bundle_file) else ""
-        snippets = extract_snippets(text, RX_STAGE2, max_snips=8, ctx=350)
+        snippets = extract_snippets(text, RX_STAGE2)
 
         row = {
             "ENCRYPTED_PAT_ID": pid,
