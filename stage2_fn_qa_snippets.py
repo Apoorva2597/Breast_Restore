@@ -3,10 +3,10 @@
 """
 stage2_fn_qa_snippets.py  (Python 3.6.8 compatible)
 
-FIXED VERSION:
-- Does NOT rely on CROSSWALK file
-- Maps MRN -> ENCRYPTED_PAT_ID using Operation Notes (authoritative source)
-- Robust to missing columns
+ROBUST VERSION:
+- Does NOT assume any specific ENCRYPTED_PAT_ID column name
+- Dynamically detects patient id column in OP notes
+- Never hard-codes ENCRYPTED_PAT_ID
 - Broad Stage2 discovery search
 - Outputs NO MRN (safe to paste)
 """
@@ -15,7 +15,6 @@ from __future__ import print_function
 
 import os
 import re
-import glob
 import pandas as pd
 
 
@@ -139,7 +138,7 @@ def main():
     merged = normalize_cols(read_csv_robust(merged_path, dtype=str))
     op = normalize_cols(read_csv_robust(op_notes_path, dtype=str))
 
-    # ---- Identify columns
+    # Identify columns in merged
     mrn_col = pick_first_existing(merged, ["MRN", "mrn"])
     gold_col = pick_first_existing(merged, ["GOLD_HAS_STAGE2", "Stage2_Applicable"])
     pred_col = pick_first_existing(merged, ["PRED_HAS_STAGE2", "HAS_STAGE2"])
@@ -151,24 +150,37 @@ def main():
     fn = merged[(merged["GOLD_HAS_STAGE2"] == 1) &
                 (merged["PRED_HAS_STAGE2"] == 0)].copy()
 
-    # ---- Build MRN -> ENCRYPTED_PAT_ID mapping from OP notes
+    # Identify MRN + patient id columns in op notes dynamically
     op_mrn_col = pick_first_existing(op, ["MRN", "mrn"])
-    op_pid_col = pick_first_existing(op, ["ENCRYPTED_PAT_ID", "ENCRYPTED_PATID", "ENCRYPTED_PATIENT_ID"])
+    op_pid_col = pick_first_existing(op, [
+        "ENCRYPTED_PAT_ID",
+        "ENCRYPTED_PATID",
+        "ENCRYPTED_PATIENT_ID",
+        "patient_id",
+        "PATIENT_ID"
+    ])
+
+    if not op_mrn_col or not op_pid_col:
+        raise ValueError("Could not detect MRN and patient id columns in OP notes.")
 
     op["MRN"] = op[op_mrn_col].map(normalize_id)
-    op["ENCRYPTED_PAT_ID"] = op[op_pid_col].map(normalize_id)
+    op["PATIENT_ID"] = op[op_pid_col].map(normalize_id)
 
-    id_map = op[["MRN", "ENCRYPTED_PAT_ID"]].drop_duplicates()
+    id_map = op[["MRN", "PATIENT_ID"]].drop_duplicates()
 
     fn = fn.merge(id_map, on="MRN", how="left")
 
-    fn["ENCRYPTED_PAT_ID"] = fn["ENCRYPTED_PAT_ID"].fillna("").map(normalize_id)
-    fn = fn[fn["ENCRYPTED_PAT_ID"] != ""].copy()
+    # Ensure PATIENT_ID exists safely
+    if "PATIENT_ID" not in fn.columns:
+        raise ValueError("Patient ID column missing after merge.")
+
+    fn["PATIENT_ID"] = fn["PATIENT_ID"].fillna("").map(normalize_id)
+    fn = fn[fn["PATIENT_ID"] != ""].copy()
 
     rows = []
 
     for _, r in fn.iterrows():
-        pid = r["ENCRYPTED_PAT_ID"]
+        pid = r["PATIENT_ID"]
         bundle_file = os.path.join(bundles_root, pid, "ALL_NOTES_COMBINED.txt")
 
         text = load_text(bundle_file) if os.path.isfile(bundle_file) else ""
