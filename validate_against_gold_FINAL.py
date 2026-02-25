@@ -73,7 +73,7 @@ def _require_cols(df, cols, label):
 def main():
     root = os.path.abspath(".")
     gold_path = os.path.join(root, "gold_cleaned_for_cedar.csv")
-    pred_path = os.path.join(root, "outputs", "patient_stage_summary.csv")
+    pred_path = os.path.join(root, "_outputs", "patient_stage_summary.csv")
 
     if not os.path.isfile(gold_path):
         raise IOError("Gold CSV not found at: {}".format(gold_path))
