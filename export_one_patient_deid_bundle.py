@@ -38,7 +38,7 @@ DEFAULT_ENCOUNTER_INPUTS = [
 ]
 
 # MRN -> ENCRYPTED_PAT_ID crosswalk
-DEFAULT_MRN_CROSSWALK = "/home/apokol/Breast_Restore/MRN_TO_ENCRYPTED_PAT_ID.csv"
+DEFAULT_MRN_CROSSWALK = "/home/apokol/Breast_Restore/CROSSWALK/CROSSWALK__MRN_to_patient_id__vNEW.csv"
 
 # Validation merged default
 DEFAULT_VALIDATION_MERGED = "/home/apokol/Breast_Restore/_outputs/validation_merged.csv"
