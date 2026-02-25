@@ -1,25 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-stage2_fn_qa_snippets.py  (Python 3.6.8 compatible)
+stage2_fn_qa_snippets_RAW_NOTES.py  (Python 3.6.8 compatible)
 
-ROBUST VERSION:
-- Does NOT assume any specific ENCRYPTED_PAT_ID column name
-- Dynamically detects patient id column in OP notes
-- Never hard-codes ENCRYPTED_PAT_ID
+UPDATED:
+- Uses RAW notes (Clinic + Inpatient + Operation Notes CSVs)
+- Does NOT use de-id bundles
 - Broad Stage2 discovery search
-- Outputs NO MRN (safe to paste)
+- Outputs MRN + ENCRYPTED_PAT_ID + raw snippets (YOU will manually de-id before pasting)
+
+Output:
+- _outputs/stage2_fn_raw_note_snippets.csv
 """
 
 from __future__ import print_function
 
 import os
 import re
+import glob
 import pandas as pd
 
 
 # -------------------------
-# IO helpers
+# Helpers
 # -------------------------
 
 def read_csv_robust(path, **kwargs):
@@ -62,7 +65,7 @@ def pick_first_existing(df, options):
 
 
 # -------------------------
-# Broad Stage2 search
+# Broad Stage2 discovery regex
 # -------------------------
 
 STAGE2_PATTERNS = [
@@ -87,17 +90,7 @@ STAGE2_PATTERNS = [
 RX_STAGE2 = re.compile("|".join(["({})".format(p) for p in STAGE2_PATTERNS]), re.I)
 
 
-def load_text(path):
-    for enc in ["utf-8", "utf-8-sig", "cp1252", "latin1"]:
-        try:
-            with open(path, "r", encoding=enc, errors="replace") as f:
-                return f.read()
-        except:
-            continue
-    return ""
-
-
-def extract_snippets(text, rx, max_snips=8, ctx=350):
+def extract_snippets(text, rx, max_snips=6, ctx=350):
     if not text:
         return []
 
@@ -132,13 +125,10 @@ def main():
     out_dir = os.path.join(root, "_outputs")
 
     merged_path = os.path.join(out_dir, "validation_merged.csv")
-    op_notes_path = os.path.join(root, "_staging_inputs", "HPI11526 Operation Notes.csv")
-    bundles_root = os.path.join(root, "PATIENT_BUNDLES")
+    staging_dir = os.path.join(root, "_staging_inputs")
 
     merged = normalize_cols(read_csv_robust(merged_path, dtype=str))
-    op = normalize_cols(read_csv_robust(op_notes_path, dtype=str))
 
-    # Identify columns in merged
     mrn_col = pick_first_existing(merged, ["MRN", "mrn"])
     gold_col = pick_first_existing(merged, ["GOLD_HAS_STAGE2", "Stage2_Applicable"])
     pred_col = pick_first_existing(merged, ["PRED_HAS_STAGE2", "HAS_STAGE2"])
@@ -150,55 +140,53 @@ def main():
     fn = merged[(merged["GOLD_HAS_STAGE2"] == 1) &
                 (merged["PRED_HAS_STAGE2"] == 0)].copy()
 
-    # Identify MRN + patient id columns in op notes dynamically
-    op_mrn_col = pick_first_existing(op, ["MRN", "mrn"])
-    op_pid_col = pick_first_existing(op, [
-        "ENCRYPTED_PAT_ID",
-        "ENCRYPTED_PATID",
-        "ENCRYPTED_PATIENT_ID",
-        "patient_id",
-        "PATIENT_ID"
-    ])
+    # Load all raw notes (clinic, inpatient, op)
+    note_files = glob.glob(os.path.join(staging_dir, "*Notes*.csv"))
+    notes_list = []
 
-    if not op_mrn_col or not op_pid_col:
-        raise ValueError("Could not detect MRN and patient id columns in OP notes.")
+    for f in note_files:
+        df = normalize_cols(read_csv_robust(f, dtype=str))
+        mrn_note_col = pick_first_existing(df, ["MRN", "mrn"])
+        text_col = pick_first_existing(df, ["NOTE_TEXT", "Note_Text", "note_text"])
 
-    op["MRN"] = op[op_mrn_col].map(normalize_id)
-    op["PATIENT_ID"] = op[op_pid_col].map(normalize_id)
+        if mrn_note_col and text_col:
+            df["MRN"] = df[mrn_note_col].map(normalize_id)
+            df["NOTE_TEXT"] = df[text_col].fillna("").map(str)
+            notes_list.append(df[["MRN", "NOTE_TEXT"]])
 
-    id_map = op[["MRN", "PATIENT_ID"]].drop_duplicates()
+    if not notes_list:
+        raise ValueError("No usable note files found.")
 
-    fn = fn.merge(id_map, on="MRN", how="left")
-
-    # Ensure PATIENT_ID exists safely
-    if "PATIENT_ID" not in fn.columns:
-        raise ValueError("Patient ID column missing after merge.")
-
-    fn["PATIENT_ID"] = fn["PATIENT_ID"].fillna("").map(normalize_id)
-    fn = fn[fn["PATIENT_ID"] != ""].copy()
+    notes = pd.concat(notes_list, ignore_index=True)
 
     rows = []
 
     for _, r in fn.iterrows():
-        pid = r["PATIENT_ID"]
-        bundle_file = os.path.join(bundles_root, pid, "ALL_NOTES_COMBINED.txt")
+        mrn = r["MRN"]
 
-        text = load_text(bundle_file) if os.path.isfile(bundle_file) else ""
-        snippets = extract_snippets(text, RX_STAGE2)
+        patient_notes = notes[notes["MRN"] == mrn]
+
+        snippets_all = []
+
+        for _, nrow in patient_notes.iterrows():
+            snips = extract_snippets(nrow["NOTE_TEXT"], RX_STAGE2)
+            snippets_all.extend(snips)
+            if len(snippets_all) >= 6:
+                break
 
         row = {
-            "ENCRYPTED_PAT_ID": pid,
-            "BUNDLE_FOUND": 1 if os.path.isfile(bundle_file) else 0
+            "MRN": mrn,
+            "ENCRYPTED_PAT_ID": r.get("ENCRYPTED_PAT_ID", "")
         }
 
-        for i in range(8):
-            row["SNIP_{:02d}".format(i+1)] = snippets[i] if i < len(snippets) else ""
+        for i in range(6):
+            row["SNIP_{:02d}".format(i+1)] = snippets_all[i] if i < len(snippets_all) else ""
 
         rows.append(row)
 
     qa_df = pd.DataFrame(rows)
 
-    out_csv = os.path.join(out_dir, "stage2_fn_qa_snippets.csv")
+    out_csv = os.path.join(out_dir, "stage2_fn_raw_note_snippets.csv")
     qa_df.to_csv(out_csv, index=False)
 
     print("Wrote:", out_csv)
