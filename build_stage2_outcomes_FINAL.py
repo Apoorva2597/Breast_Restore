@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-stage2_complications_from_notes.py  (Python 3.6.8 compatible)
+build_stage2_outcomes_FINAL.py  (Python 3.6.8 compatible)
 
 Run from:  ~/Breast_Restore
 Inputs:
@@ -23,9 +23,13 @@ What it does (high level):
 - Scans NOTE_TEXT in Clinic/Inpatient/Operation NOTES for complication/treatment signals
 - Produces patient-level outcome flags + “best evidence” (date/source/note_id/snippet/pattern)
 
-Notes:
-- Conservative: does NOT infer complications from encounter reasons.
-- Requires explicit complication/treatment language in note text (plus strong cues for reop/failure/revision).
+Updates in this version:
+- Adds negation/history/plan guards around matches to reduce false positives
+- Tightens Rehospitalization: requires explicit readmit/admit/ED language (not just inpatient note source)
+- Tightens Reoperation: requires procedure/action language + breast recon context
+- Tightens Failure: requires explant/removal + complication driver (infection/exposure/necrosis/etc.)
+- Tightens Revision: requires procedure/performed cue OR complication context
+- Optional: excludes first N days post-Stage2 for rehosp (index-admission bleed), default 2 days
 """
 
 from __future__ import print_function
@@ -138,7 +142,6 @@ def pick_first_existing(df, options):
 def ensure_encpat_col(df, file_label=""):
     """
     Ensure a consistent ENCRYPTED_PAT_ID column exists.
-    This is the *proper* fix for your KeyError.
     """
     df = normalize_cols(df)
     enc_col = pick_first_existing(df, [
@@ -216,6 +219,71 @@ def find_notes_files():
 
 
 # -------------------------
+# NEW: guardrails for FP reduction
+# -------------------------
+
+# Simple token-window guards (cheap but effective)
+NEGATION_CUES = [
+    "no ", "not ", "without ", "denies", "deny", "negative for", "neg for",
+    "ruled out", "rule out", "r/o ", "does not", "did not"
+]
+HISTORY_CUES = [
+    "history of", "hx of", "prior", "previous", "remote", "years ago", "last year", "in the past"
+]
+PLAN_CUES = [
+    "plan", "planned", "scheduled", "will ", "may ", "might ", "consider", "discussed", "if "
+]
+
+# Explicit admission cues for rehosp (instead of "inpatient note source")
+ADMISSION_RX = re.compile(r"\b(readmit(ted|sion)?|admit(ted|sion)?|hospitali(z|s)ed|present(ed)? to (ed|er)|seen in (ed|er)|emergency (department|room))\b")
+
+# Breast reconstruction context requirement for reop/failure (to avoid unrelated surgery)
+BREAST_CONTEXT_RX = re.compile(r"\b(breast|recon(struction)?|implant|expander|tissue expander|capsulectomy|capsulotomy|adm|acellular|mastectomy)\b")
+
+# Procedure certainty cues (to separate "discussed" vs "performed")
+PERFORMED_RX = re.compile(r"\b(underwent|performed|taken to (the )?or|returned to (the )?or|procedure performed|op note|date of operation|operative|surgery date|went to the or)\b")
+
+# Index-admission bleed guard for rehosp: ignore first N days post Stage2 by default
+REHOSP_EXCLUDE_FIRST_N_DAYS = 2
+
+
+def has_nearby_cue(text_norm, match_span, cue_list, window_chars=80):
+    """
+    Check for cue strings within a +/- window around the match.
+    Uses chars (not tokens) to stay Python 3.6 simple and fast.
+    """
+    if not text_norm:
+        return False
+    start, end = match_span
+    lo = max(0, start - window_chars)
+    hi = min(len(text_norm), end + window_chars)
+    ctx = text_norm[lo:hi]
+    for cue in cue_list:
+        if cue in ctx:
+            return True
+    return False
+
+
+def guarded_match(rx, text_norm):
+    """
+    Return match object if rx matches and the match is NOT negated/historical/planned nearby.
+    """
+    m = rx.search(text_norm)
+    if not m:
+        return None
+    span = m.span()
+    if has_nearby_cue(text_norm, span, NEGATION_CUES):
+        return None
+    if has_nearby_cue(text_norm, span, HISTORY_CUES):
+        return None
+    if has_nearby_cue(text_norm, span, PLAN_CUES):
+        # allow "planned" ONLY if there is strong performed/procedure cue in the note
+        if not PERFORMED_RX.search(text_norm):
+            return None
+    return m
+
+
+# -------------------------
 # Signal dictionaries (regex)
 # -------------------------
 
@@ -247,10 +315,12 @@ NONOP_PATTERNS = [
     ("wound_care", r"\b(dressing changes?|wound care|packing|wet to dry|local wound care)\b"),
 ]
 
+# UPDATED failure: include exposure/extrusion/necrosis + explant/removal linkage
 FAILURE_PATTERNS = [
-    ("implant_removed", r"\b(explant|implant removal|remove(d)? implant)\b"),
-    ("flap_loss", r"\b(flap loss|failed flap|takeback.*flap)\b"),
-    ("extrusion_failure", r"\b(extrusion|implant exposure)\b.*\b(explant|remov)\b"),
+    ("implant_removed", r"\b(explant|implant removal|remove(d)? implant|expander removal)\b"),
+    ("flap_loss", r"\b(flap loss|failed flap)\b"),
+    ("exposure_extrusion", r"\b(extrusion|implant exposure|exposed implant)\b"),
+    ("necrosis", r"\b(necros(is|ed)?|eschar)\b"),
 ]
 
 REVISION_PATTERNS = [
@@ -546,7 +616,6 @@ def main():
         win_end = s2 + timedelta(days=365)
 
         nd = r.get("NOTE_DATE")
-        # Handle NaN
         if isinstance(nd, float):
             nd = None
 
@@ -565,14 +634,30 @@ def main():
         note_id = normalize_id(r.get("NOTE_ID", ""))
         note_type = str(r.get("NOTE_TYPE", "") or "")
 
-        has_comp = bool(COMP_RX.search(t))
+        # --- guarded complication presence ---
+        comp_m = guarded_match(COMP_RX, t)
+        has_comp = bool(comp_m)
 
-        # Minor complication: complication + non-op, no reop, no failure; must be in-window
+        # -------------------------
+        # Minor complication:
+        #   - must be in-window
+        #   - guarded complication term
+        #   - non-op management cues
+        #   - NOT reop/failure
+        # -------------------------
         if in_window and has_comp:
-            nonop = bool(NONOP_RX.search(t)) or ("conservative" in t) or ("managed with" in t and "antibi" in t)
-            fail = bool(FAIL_RX.search(t))
-            reop = bool(REOP_RX.search(t))
-            if nonop and (not reop) and (not fail):
+            nonop_m = guarded_match(NONOP_RX, t)
+            nonop = bool(nonop_m) or ("managed with" in t and "antibi" in t) or ("conservative" in t)
+            # Reop/failure are stricter now; still block minor if those appear with procedure certainty + breast context
+            reop_possible = (guarded_match(REOP_RX, t) is not None) and BREAST_CONTEXT_RX.search(t) and (PERFORMED_RX.search(t) is not None)
+            # Failure is handled below; use its strict definition here too
+            failure_possible = False
+            if BREAST_CONTEXT_RX.search(t) and PERFORMED_RX.search(t):
+                if guarded_match(re.compile(r"\b(explant|implant removal|remove(d)? implant|expander removal)\b"), t):
+                    if re.search(r"\b(infect(ion|ed)?|cellulit(is)?|abscess|purulen(t|ce)|sepsis|exposure|exposed|extrusion|necros)\b", t):
+                        failure_possible = True
+
+            if nonop and (not reop_possible) and (not failure_possible):
                 lbl, pat = best_match(COMPLICATION_PATTERNS, t)
                 cand = {
                     "evidence_date": nd,
@@ -584,52 +669,88 @@ def main():
                 }
                 best_minor[pid] = update_best(best_minor.get(pid), cand)
 
-        # Reoperation: in-window + comp + reop
-        # If NOTE_DATE missing, require comp + (reop OR failure) to reduce false positives
-        if (in_window and has_comp and REOP_RX.search(t)) or ((not nd) and has_comp and (REOP_RX.search(t) or FAIL_RX.search(t))):
-            lbl, pat = best_match(REOP_PATTERNS, t)
-            if not pat:
-                lbl2, pat2 = best_match(COMPLICATION_PATTERNS, t)
-                pat = pat2 or lbl2
-            cand = {
-                "evidence_date": nd,
-                "priority": 1,
-                "source": src,
-                "note_id": note_id,
-                "pattern": pat if pat else lbl,
-                "snippet": make_snippet(r.get("NOTE_TEXT", "")),
-            }
-            best_reop[pid] = update_best(best_reop.get(pid), cand)
+        # -------------------------
+        # Reoperation (tightened):
+        #   - in-window
+        #   - guarded reop term
+        #   - breast recon context
+        #   - performed/procedure certainty cue
+        # -------------------------
+        if in_window:
+            reop_m = guarded_match(REOP_RX, t)
+            if reop_m and BREAST_CONTEXT_RX.search(t) and PERFORMED_RX.search(t):
+                lbl, pat = best_match(REOP_PATTERNS, t)
+                if not pat:
+                    lbl2, pat2 = best_match(COMPLICATION_PATTERNS, t)
+                    pat = pat2 or lbl2
+                cand = {
+                    "evidence_date": nd,
+                    "priority": 1,
+                    "source": src,
+                    "note_id": note_id,
+                    "pattern": pat if pat else lbl,
+                    "snippet": make_snippet(r.get("NOTE_TEXT", "")),
+                }
+                best_reop[pid] = update_best(best_reop.get(pid), cand)
 
-        # Failure: in-window + failure OR (date-missing + failure + comp)
-        if (in_window and FAIL_RX.search(t)) or ((not nd) and FAIL_RX.search(t) and has_comp):
-            lbl, pat = best_match(FAILURE_PATTERNS, t)
-            cand = {
-                "evidence_date": nd,
-                "priority": 0,
-                "source": src,
-                "note_id": note_id,
-                "pattern": pat if pat else lbl,
-                "snippet": make_snippet(r.get("NOTE_TEXT", "")),
-            }
-            best_failure[pid] = update_best(best_failure.get(pid), cand)
+        # -------------------------
+        # Failure (tightened):
+        #   - in-window
+        #   - breast recon context + performed cue
+        #   - explant/removal AND driver (infection/exposure/extrusion/necrosis/flap loss)
+        # -------------------------
+        if in_window and BREAST_CONTEXT_RX.search(t) and PERFORMED_RX.search(t):
+            explant_m = guarded_match(re.compile(r"\b(explant|implant removal|remove(d)? implant|expander removal)\b"), t)
+            driver = re.search(r"\b(infect(ion|ed)?|cellulit(is)?|abscess|purulen(t|ce)|sepsis|implant exposure|exposed implant|extrusion|necros(is|ed)?|eschar|flap loss|failed flap)\b", t)
+            if explant_m and driver:
+                lbl, pat = best_match(FAILURE_PATTERNS, t)
+                cand = {
+                    "evidence_date": nd,
+                    "priority": 0,
+                    "source": src,
+                    "note_id": note_id,
+                    "pattern": pat if pat else lbl,
+                    "snippet": make_snippet(r.get("NOTE_TEXT", "")),
+                }
+                best_failure[pid] = update_best(best_failure.get(pid), cand)
 
-        # Revision: in-window + revision terms (not necessarily a complication)
-        if in_window and REV_RX.search(t):
-            lbl, pat = best_match(REVISION_PATTERNS, t)
-            cand = {
-                "evidence_date": nd,
-                "priority": 5,
-                "source": src,
-                "note_id": note_id,
-                "pattern": pat if pat else lbl,
-                "snippet": make_snippet(r.get("NOTE_TEXT", "")),
-            }
-            best_revision[pid] = update_best(best_revision.get(pid), cand)
+        # -------------------------
+        # Revision (tightened):
+        #   - in-window
+        #   - guarded revision term
+        #   - require performed/procedure cue OR complication context
+        # -------------------------
+        if in_window:
+            rev_m = guarded_match(REV_RX, t)
+            if rev_m:
+                ok = False
+                if PERFORMED_RX.search(t):
+                    ok = True
+                elif has_comp:
+                    ok = True
+                if ok:
+                    lbl, pat = best_match(REVISION_PATTERNS, t)
+                    cand = {
+                        "evidence_date": nd,
+                        "priority": 5,
+                        "source": src,
+                        "note_id": note_id,
+                        "pattern": pat if pat else lbl,
+                        "snippet": make_snippet(r.get("NOTE_TEXT", "")),
+                    }
+                    best_revision[pid] = update_best(best_revision.get(pid), cand)
 
-        # Rehospitalization: conservative proxy (inpatient note source + complication) within window
-        if in_window and has_comp:
-            if ("inpatient notes" in src.lower()) or ("discharge" in note_type.lower()) or ("h&p" in note_type.lower()):
+        # -------------------------
+        # Rehospitalization (tightened):
+        #   - in-window
+        #   - must have explicit admission/readmission/ED language
+        #   - must have guarded complication term
+        #   - exclude first N days post stage2 to avoid index admission bleed
+        # -------------------------
+        if in_window and has_comp and ADMISSION_RX.search(t):
+            if nd and (nd < (s2 + timedelta(days=REHOSP_EXCLUDE_FIRST_N_DAYS))):
+                pass
+            else:
                 lbl, pat = best_match(COMPLICATION_PATTERNS, t)
                 cand = {
                     "evidence_date": nd,
