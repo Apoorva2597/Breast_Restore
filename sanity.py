@@ -1,1 +1,1 @@
-import pandas as pd; p='/home/apokol/my_data_Breast/HPI-11526/HPI11256/HPI11526 Clinic Encounters.csv'; df=pd.read_csv(p, dtype=str, low_memory=False, encoding='latin1'); print(df['REASON_FOR_VISIT'].fillna('').value_counts().head(20))
+import pandas as pd; p='/home/apokol/my_data_Breast/HPI-11526/HPI11256/HPI11526 Clinic Encounters.csv'; df=pd.read_csv(p, dtype=str, low_memory=False, encoding='latin1'); c=df.get('CPT_CODE','').fillna('').astype(str).str.replace(r'\D','',regex=True); print('19380 count:',int((c=='19380').sum()))
