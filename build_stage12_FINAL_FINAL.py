@@ -8,14 +8,13 @@ Input:    ./_staging_inputs/HPI11526 Operation Notes.csv (or first CSV in _stagi
 Outputs:  ./_outputs/patient_stage_summary_FINAL_FINAL.csv
           ./_outputs/stage_event_level_FINAL_FINAL.csv
 
-Stage2 logic (FN-focused tweak):
+Stage2 logic (last-ditch scheduling test):
 Stage2 = strong exchange/expander->implant signal
 AND one of:
-  A) performed/operative context (status post / underwent / postoperative / POD / op-note cues), OR
-  B) scheduled context near the exchange phrase (scheduled/schedule/scheduled for),
-     with an explicit date token in the same local window.
+  A) performed/operative context (post-op / s/p / underwent / op-note cues), OR
+  B) scheduled context near the exchange phrase (scheduled/schedule/scheduled for) EVEN WITHOUT A DATE.
 
-Planning-only w/o date stays excluded.
+This will likely increase FP; it's intentional for this experiment.
 """
 
 from __future__ import print_function
@@ -125,28 +124,16 @@ RE_OP_NOTE_CUES = re.compile(
     re.I
 )
 
-# Scheduling / planning cues
 RE_SCHEDULE = re.compile(
     r"\b(scheduled|schedule|scheduled for|will schedule|plan to|planning to|plans to|will plan|we will|to be done|set up for)\b",
-    re.I
-)
-
-# Any explicit date token in text
-RE_DATE_TOKEN = re.compile(
-    r"(\b\d{1,2}/\d{1,2}/\d{2,4}\b|\b\d{4}-\d{1,2}-\d{1,2}\b)",
     re.I
 )
 
 def has_performed_context(t):
     return True if (RE_PERFORMED.search(t) or RE_OP_NOTE_CUES.search(t)) else False
 
-def has_scheduled_with_date(t):
-    return True if (RE_SCHEDULE.search(t) and RE_DATE_TOKEN.search(t)) else False
-
-def planning_only(t):
-    if RE_SCHEDULE.search(t) and (not has_performed_context(t)) and (not has_scheduled_with_date(t)):
-        return True
-    return False
+def has_scheduled_context(t):
+    return True if RE_SCHEDULE.search(t) else False
 
 # -------------------------
 # Stage detection
@@ -176,18 +163,13 @@ RE_REMOVE_NO_IMPLANT = re.compile(
     re.I
 )
 
-# local window helpers
-def _near_window(t, span_start, span_end, window=260):
+def _near_window(t, span_start, span_end, window=320):
     a = max(0, span_start - window)
     b = min(len(t), span_end + window)
     return t[a:b]
 
 def _stage2_bucket(t):
     if RE_REMOVE_NO_IMPLANT.search(t):
-        return False, ""
-
-    # exclude weak planning-only notes globally
-    if planning_only(t):
         return False, ""
 
     signal = ""
@@ -211,16 +193,16 @@ def _stage2_bucket(t):
     if not signal:
         return False, ""
 
-    # Require performed OR scheduled-with-date, but evaluate near the matched phrase first (better for FN capture)
     local_ctx = ""
     if m is not None:
-        local_ctx = _near_window(t, m.start(), m.end(), window=320)
+        local_ctx = _near_window(t, m.start(), m.end(), window=360)
 
+    # accept if performed OR scheduled (no date required), prefer local window
     if local_ctx:
-        if has_performed_context(local_ctx) or has_scheduled_with_date(local_ctx):
+        if has_performed_context(local_ctx) or has_scheduled_context(local_ctx):
             return True, signal
 
-    if has_performed_context(t) or has_scheduled_with_date(t):
+    if has_performed_context(t) or has_scheduled_context(t):
         return True, signal
 
     return False, ""
@@ -413,6 +395,7 @@ def build(outputs_dir, input_csv):
     print("Patients with any stage signal:", len(patients))
     print("Patients with Stage 1 evidence:", sum(1 for pid in patients if (patients[pid]["stage1_hits"] > 0 or patients[pid]["stage1_note_id"])))
     print("Patients with Stage 2 evidence:", sum(1 for pid in patients if (patients[pid]["stage2_hits"] > 0 or patients[pid]["stage2_note_id"])))
+
 
 def main():
     if not os.path.isdir(STAGING_DIR):
