@@ -16,7 +16,7 @@ cd ~/Breast_Restore
 python build_s12_FINAL.py
 
 # Or explicit:
-python build_s12_FINAL.py --in "/home/apokol/my_data_Breast/HPI-11526/HPI11256/HPI11526 Operation Notes.csv"
+python build_s12_FINAL.py --in "/home/apokol/my_data_Breast/HPI-11526/HPI11256/'HPI11526 Operation Notes.csv'"
 
 Outputs:
 outputs/final_final_attempt/note_level_hits.csv
