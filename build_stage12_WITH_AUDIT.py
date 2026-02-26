@@ -1,6 +1,6 @@
 # =========================
 # Stage2 Anchor – Refined Logic + Audit
-# (FIX: auto-map NOTE_DATE/NOTEID/TEXT column name variants)
+# FIX: map EVENT_DATE from NOTE_DATE_OF_SERVICE or OPERATION_DATE
 # =========================
 
 import pandas as pd
@@ -43,11 +43,26 @@ def norm(s: str) -> str:
 notes.columns = [c.strip() for c in notes.columns]
 norm_map = {norm(c): c for c in notes.columns}
 
+# IMPORTANT: include NOTE_DATE_OF_SERVICE and OPERATION_DATE explicitly
 CANDIDATES = {
-    "ENCRYPTED_PAT_ID": ["encryptedpatid", "encpatid", "patientid", "patid", "encrypted_patient_id", "encrypted_pat_id"],
-    "EVENT_DATE":       ["eventdate", "notedate", "servicedate", "documentdate", "date", "encounterdate"],
-    "NOTE_ID":          ["noteid", "note_id", "noteidentifier", "noteidentifierid", "note_key", "notekey", "documentid", "docid"],
-    "NOTE_TEXT":        ["notetext", "note_text", "text", "note", "documenttext", "content", "notecontent", "body"],
+    "ENCRYPTED_PAT_ID": [
+        "encryptedpatid", "encrypted_pat_id", "encryptedpatientid",
+        "encpatid", "patientid", "patid"
+    ],
+    "EVENT_DATE": [
+        "eventdate", "note_date_of_service", "notedateofservice",
+        "note_date", "notedate", "service_date", "servicedate",
+        "operation_date", "operationdate", "proceduredate", "surgerydate",
+        "documentdate", "encounterdate", "date"
+    ],
+    "NOTE_ID": [
+        "noteid", "note_id", "noteidentifier", "note_key", "notekey",
+        "documentid", "docid"
+    ],
+    "NOTE_TEXT": [
+        "notetext", "note_text", "note_text_deid", "notetextdeid",
+        "text", "note", "documenttext", "content", "notecontent", "body"
+    ],
 }
 
 def pick_col(std_name):
@@ -66,8 +81,22 @@ notes = notes.rename(columns=rename_dict)
 
 missing = [c for c in ["ENCRYPTED_PAT_ID", "EVENT_DATE", "NOTE_ID", "NOTE_TEXT"] if c not in notes.columns]
 if missing:
-    cols_preview = ", ".join(list(notes.columns)[:80])
-    raise SystemExit(f"ERROR: Missing columns after mapping: {missing}\nFOUND COLUMNS (first 80): {cols_preview}")
+    cols_preview = ", ".join(list(notes.columns)[:120])
+    raise SystemExit(f"ERROR: Missing columns after mapping: {missing}\nFOUND COLUMNS (first 120): {cols_preview}")
+
+# if EVENT_DATE still null for some rows, backfill from OPERATION_DATE / NOTE_DATE_OF_SERVICE if present
+if notes["EVENT_DATE"].isna().any():
+    # use original columns if they exist (before rename) OR already present; map by normalized lookup
+    def get_raw(colname_norm):
+        return norm_map.get(colname_norm)
+
+    raw_ndos = get_raw("note_date_of_service") or get_raw("notedateofservice")
+    raw_opdt = get_raw("operation_date") or get_raw("operationdate")
+
+    if raw_ndos and raw_ndos in notes.columns:
+        notes["EVENT_DATE"] = notes["EVENT_DATE"].fillna(notes[raw_ndos])
+    if raw_opdt and raw_opdt in notes.columns:
+        notes["EVENT_DATE"] = notes["EVENT_DATE"].fillna(notes[raw_opdt])
 
 notes["NOTE_TEXT"] = notes["NOTE_TEXT"].astype(str).str.lower()
 
@@ -111,7 +140,7 @@ for _, r in notes.iterrows():
         "ENCRYPTED_PAT_ID": r["ENCRYPTED_PAT_ID"],
         "EVENT_DATE": r["EVENT_DATE"],
         "NOTE_ID": r["NOTE_ID"],
-        "NOTE_TYPE": r["NOTE_TYPE"],
+        "NOTE_TYPE": r.get("NOTE_TYPE", "UNKNOWN"),
         "DETECTION_BUCKET": bucket,
         "PATTERN_NAME": pattern,
         "IS_OPERATIVE_CONTEXT": int(operative),
