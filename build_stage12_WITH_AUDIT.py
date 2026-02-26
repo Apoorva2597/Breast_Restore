@@ -3,20 +3,24 @@
 """
 build_stage2_anchor_with_audit.py (Python 3.6.8 compatible)
 
-- Uses gold label: Stage2_Applicable
-- Produces:
-  _outputs/stage_event_level.csv
-  _outputs/patient_stage_summary.csv
-  _outputs/validation_metrics.txt
-  _outputs/validation_mismatches.csv
-  _outputs/audit_bucket_summary.csv
-  _outputs/audit_fp_by_bucket.csv
-  _outputs/audit_bucket_noteType_breakdown.csv
-  _outputs/audit_fp_events_sample.csv
+Revised logic to reduce FP based on audit:
+- EXCHANGE_TIGHT was firing heavily in PROGRESS NOTES/H&P -> now requires operative context OR strong performed cues
+- EXPANDER_TO_IMPLANT now sentence-scoped + excludes non-performed/counseling/plan language
+- OPONLY_IMPLANT_PLACEMENT_RECON_TIGHT caused direct-to-implant FP -> now requires stage2-specific cues (exchange/replace OR TE/remove OR stage2 hint)
+- Capsule+implant now requires exchange/replace OR stage2 hint OR TE/remove
 
-Defaults:
-- Notes: ./_staging_inputs/HPI11526 Operation Notes.csv and ./_staging_inputs/HPI11526 Clinic Notes.csv (if present)
-- Gold:  /home/apokol/Breast_Restore/gold_cleaned_for_cedar.csv
+Gold:
+- Stage2_Applicable in /home/apokol/Breast_Restore/gold_cleaned_for_cedar.csv
+
+Outputs:
+- _outputs/stage_event_level.csv
+- _outputs/patient_stage_summary.csv
+- _outputs/validation_metrics.txt
+- _outputs/validation_mismatches.csv
+- _outputs/audit_bucket_summary.csv
+- _outputs/audit_fp_by_bucket.csv
+- _outputs/audit_bucket_noteType_breakdown.csv
+- _outputs/audit_fp_events_sample.csv
 """
 
 from __future__ import print_function
@@ -27,16 +31,11 @@ import sys
 import random
 from datetime import datetime
 
-# -------------------------
-# Config
-# -------------------------
-
 STAGING_DIR = os.path.join(os.getcwd(), "_staging_inputs")
 OUT_DIR = os.path.join(os.getcwd(), "_outputs")
 
 DEFAULT_GOLD = "/home/apokol/Breast_Restore/gold_cleaned_for_cedar.csv"
-
-GOLD_STAGE2_COL = "Stage2_Applicable"  # <-- confirmed by you
+GOLD_STAGE2_COL = "Stage2_Applicable"
 
 # -------------------------
 # Helpers
@@ -75,7 +74,6 @@ def _parse_date_any(s):
     return ""
 
 def _best_note_date(row):
-    # Accept multiple possible column names
     for k in ["OPERATION_DATE", "NOTE_DATE_OF_SERVICE", "EVENT_DATE", "NOTE_DATE", "DATE_OF_SERVICE"]:
         d = _parse_date_any(row.get(k, ""))
         if d:
@@ -97,7 +95,6 @@ def _truthy(v):
         return 1
     if s in ("0", "n", "no", "false", "f", ""):
         return 0
-    # numeric fallback
     try:
         return 1 if float(s) != 0.0 else 0
     except Exception:
@@ -122,12 +119,10 @@ def _find_default_note_csvs():
     return files
 
 def _detect_id_col(cols, preferred):
-    # preferred: list of likely names in order
     colset = set(cols)
     for c in preferred:
         if c in colset:
             return c
-    # heuristic: any column containing these tokens
     for c in cols:
         cl = c.lower()
         if "encrypted" in cl and "pat" in cl:
@@ -138,17 +133,32 @@ def _detect_id_col(cols, preferred):
             return c
     return ""
 
+def _split_sentences(text_norm):
+    # conservative splitter
+    if not text_norm:
+        return []
+    parts = re.split(r"[.;]\s+|\n+", text_norm)
+    out = []
+    offset = 0
+    for p in parts:
+        s = p.strip()
+        if s:
+            out.append((s, offset))
+        offset += len(p) + 1
+    return out
+
 # -------------------------
-# Detection logic (keep current buckets + audit)
+# Detection logic
 # -------------------------
 
-RE_OPERATIVE_TYPE = re.compile(r"\b(operative|op note|brief op|operation|surgical|procedure|or note)\b", re.I)
+RE_OPERATIVE_TYPE = re.compile(
+    r"\b(operative|op note|brief op|operation|surgical|procedure|or note|operative report)\b", re.I
+)
 
 RE_TE = re.compile(r"\b(expander|expanders|tissue expander|te)\b", re.I)
 RE_REMOVE = re.compile(r"\b(remove(d|al)?|explant(ed|ation)?|take\s*out|takedown|retrieve)\b", re.I)
 
 RE_IMPLANT = re.compile(r"\b(implant(s)?|prosthesis|silicone|saline|gel|mentor|allergan|sientra)\b", re.I)
-
 RE_ACTION = re.compile(r"\b(place(d|ment)?|insert(ed|ion)?|exchange(d)?|exchanged|replace(d|ment)?|replacement)\b", re.I)
 RE_EXCH_WORD = re.compile(r"\b(exchange|exchanged|replace|replaced|replacement)\b", re.I)
 
@@ -157,12 +167,31 @@ RE_STAGE2_HINT = re.compile(r"\b(second stage|stage\s*2)\b", re.I)
 
 RE_CAPSULE = re.compile(r"\b(capsulectomy|capsulotomy)\b", re.I)
 
+# performed-context cues (to allow Stage2 mentions outside NOTE_TYPE, but still reduce PROGRESS NOTE FP)
+RE_PERFORMED_CUE = re.compile(
+    r"\b(underwent|was performed|performed|taken to (the )?or|in (the )?or\b|operating room|"
+    r"incision|estimated blood loss|ebl\b|drains?\b|specimens?\b|implants?\s*:|"
+    r"procedure\s*:|brief op note|operative report|post[- ]?op( course)?\b)\b",
+    re.I
+)
+
+# non-performed / counseling / planning cues (common in PROGRESS NOTES / H&P)
+RE_NONPERFORMED = re.compile(
+    r"\b(plan(ned)?|planning|scheduled|schedule(d)?|consider(ing)?|option(s)?|"
+    r"discuss(ed|ion)?|counsel(ing)?|candidate|recommend(ed|s)?|would like|"
+    r"may|might|could|would)\b",
+    re.I
+)
+RE_NEGATE = re.compile(r"\b(no|not|never|denies?)\b.{0,12}\b(plan(ned)?|scheduled|planning|exchange|replace|implant)\b", re.I)
+
+# Exchange pattern (tight) but now will be sentence-filtered
 RE_EXCHANGE_TIGHT = re.compile(
     r"\b(implant|expander)\b.{0,50}\b(exchange|exchanged|replace|replaced|replacement)\b"
     r"|\b(exchange|exchanged|replace|replaced|replacement)\b.{0,50}\b(implant|expander)\b",
     re.I
 )
 
+# Scheduled Stage2 (unchanged)
 RE_SCHEDULE = re.compile(r"\b(schedule(d)?|planned|plan)\b", re.I)
 RE_SCHEDULED_FOR = re.compile(r"\bscheduled\b.{0,12}\bfor\b", re.I)
 RE_PROC_CUE = re.compile(r"\b(surgery|procedure|operation|or|operative)\b", re.I)
@@ -198,33 +227,43 @@ STAGE1_PATTERNS = [
     r"\b(stage\s*1)\b.*\b(reconstruction|tissue expander|expander|te)\b",
 ]
 
+def _is_operative(note_type_norm):
+    return 1 if RE_OPERATIVE_TYPE.search(note_type_norm or "") else 0
+
+def _sentence_allows_performed(sent_norm, isop):
+    # If operative note -> allow unless explicit negation of procedure intent
+    if isop:
+        return False if RE_NEGATE.search(sent_norm) else True
+
+    # Non-operative notes must have a performed cue to count as performed Stage2
+    if not RE_PERFORMED_CUE.search(sent_norm):
+        return False
+
+    # Exclude clearly counseling/planning sentences in non-op notes
+    if RE_NEGATE.search(sent_norm):
+        return False
+    if RE_NONPERFORMED.search(sent_norm) and not re.search(r"\b(post[- ]?op|status post|s/p|underwent|was performed)\b", sent_norm, re.I):
+        return False
+
+    return True
+
 def _scheduled_stage2_sentence_level(text_norm, proximity=50):
     if not RE_SCHEDULE.search(text_norm):
         return (False, "", "", 0, 0)
 
-    parts = re.split(r"[.;]\s+|\n+", text_norm)
-    offset = 0
-    for sent in parts:
-        s = sent.strip()
-        if not s:
-            offset += len(sent) + 1
-            continue
+    parts = _split_sentences(text_norm)
+    for (s, offset) in parts:
         if not RE_SCHEDULE.search(s):
-            offset += len(sent) + 1
             continue
         if RE_NOT_SCHEDULED.search(s):
-            offset += len(sent) + 1
             continue
         if RE_BAD_SCHED_CONTEXT.search(s):
-            offset += len(sent) + 1
             continue
         if RE_COUNSEL_ONLY.search(s):
-            offset += len(sent) + 1
             continue
 
         m_proc = RE_STAGE2_PROC_PHRASE.search(s)
         if not m_proc:
-            offset += len(sent) + 1
             continue
 
         sched_positions = [m.start() for m in RE_SCHEDULE.finditer(s)]
@@ -237,11 +276,9 @@ def _scheduled_stage2_sentence_level(text_norm, proximity=50):
                 close = True
                 break
         if not close:
-            offset += len(sent) + 1
             continue
 
         if not (RE_SCHEDULED_FOR.search(s) or RE_PROC_CUE.search(s)):
-            offset += len(sent) + 1
             continue
 
         return (True, "SCHEDULED_STAGE2_TIGHT", "SCHEDULED_SENTENCE", offset + m_proc.start(), offset + m_proc.end())
@@ -249,31 +286,80 @@ def _scheduled_stage2_sentence_level(text_norm, proximity=50):
     return (False, "", "", 0, 0)
 
 def _stage2_bucket(text_norm, note_type_norm):
-    isop = 1 if RE_OPERATIVE_TYPE.search(note_type_norm or "") else 0
+    isop = _is_operative(note_type_norm)
 
-    m = RE_EXCHANGE_TIGHT.search(text_norm)
-    if m:
-        return (True, "EXCHANGE_TIGHT", "EXCHANGE_TIGHT", m.start(), m.end(), isop)
+    # sentence-scoped evaluation to reduce PROGRESS NOTE FP
+    sents = _split_sentences(text_norm)
+    if not sents:
+        sents = [(text_norm, 0)]
 
-    if RE_TE.search(text_norm) and RE_REMOVE.search(text_norm) and RE_IMPLANT.search(text_norm) and RE_ACTION.search(text_norm):
-        m2 = RE_REMOVE.search(text_norm) or RE_ACTION.search(text_norm)
-        st, en = (m2.start(), m2.end()) if m2 else (0, min(len(text_norm), 60))
-        return (True, "EXPANDER_TO_IMPLANT", "TE+REMOVE+IMPLANT+ACTION", st, en, isop)
+    # 1) EXCHANGE_TIGHT (revised): must be operative OR performed-cue sentence
+    for (s, off) in sents:
+        m = RE_EXCHANGE_TIGHT.search(s)
+        if not m:
+            continue
+        if not _sentence_allows_performed(s, isop):
+            continue
+        return (True, "EXCHANGE_TIGHT", "EXCHANGE_TIGHT_SENTENCE", off + m.start(), off + m.end(), isop)
 
-    if isop and RE_IMPLANT.search(text_norm) and RE_EXCH_WORD.search(text_norm):
-        m3 = RE_EXCH_WORD.search(text_norm) or RE_IMPLANT.search(text_norm)
-        st, en = (m3.start(), m3.end()) if m3 else (0, min(len(text_norm), 60))
-        return (True, "OPONLY_IMPLANT_EXCHANGE", "OPONLY_IMPLANT_EXCHANGE", st, en, isop)
+    # 2) EXPANDER_TO_IMPLANT (revised): TE + REMOVE + IMPLANT + ACTION in same sentence + performed allowed
+    for (s, off) in sents:
+        if not (RE_TE.search(s) and RE_REMOVE.search(s) and RE_IMPLANT.search(s) and RE_ACTION.search(s)):
+            continue
+        if not _sentence_allows_performed(s, isop):
+            continue
+        m2 = RE_REMOVE.search(s) or RE_ACTION.search(s)
+        st, en = (m2.start(), m2.end()) if m2 else (0, min(len(s), 60))
+        return (True, "EXPANDER_TO_IMPLANT", "TE+REMOVE+IMPLANT+ACTION_SENTENCE", off + st, off + en, isop)
 
-    if isop and RE_IMPLANT.search(text_norm) and re.search(r"\b(place(d|ment)?|insert(ed|ion)?)\b", text_norm, re.I) and (RE_RECON.search(text_norm) or RE_STAGE2_HINT.search(text_norm)):
-        m4 = re.search(r"\b(place(d|ment)?|insert(ed|ion)?)\b", text_norm, re.I) or RE_IMPLANT.search(text_norm)
-        st, en = (m4.start(), m4.end()) if m4 else (0, min(len(text_norm), 60))
-        return (True, "OPONLY_IMPLANT_PLACEMENT_RECON_TIGHT", "OPONLY_IMPLANT_PLACEMENT_RECON_TIGHT", st, en, isop)
+    # 3) OPONLY_IMPLANT_EXCHANGE (keep, but sentence-performed gating)
+    if isop:
+        for (s, off) in sents:
+            if RE_IMPLANT.search(s) and RE_EXCH_WORD.search(s):
+                if not _sentence_allows_performed(s, isop):
+                    continue
+                m3 = RE_EXCH_WORD.search(s) or RE_IMPLANT.search(s)
+                st, en = (m3.start(), m3.end()) if m3 else (0, min(len(s), 60))
+                return (True, "OPONLY_IMPLANT_EXCHANGE", "OPONLY_IMPLANT_EXCHANGE_SENTENCE", off + st, off + en, isop)
 
-    if isop and RE_CAPSULE.search(text_norm) and RE_IMPLANT.search(text_norm):
-        m5 = RE_CAPSULE.search(text_norm)
-        return (True, "OPONLY_CAPSULE_PLUS_IMPLANT", "OPONLY_CAPSULE_PLUS_IMPLANT", m5.start(), m5.end(), isop)
+    # 4) OPONLY_IMPLANT_PLACEMENT_RECON (revised to avoid direct-to-implant FP):
+    # require operative AND implant placement AND (exchange/replace OR TE/remove OR explicit stage2 hint)
+    if isop:
+        RE_PLACE = re.compile(r"\b(place(d|ment)?|insert(ed|ion)?)\b", re.I)
+        for (s, off) in sents:
+            if not (RE_IMPLANT.search(s) and RE_PLACE.search(s)):
+                continue
+            stage2_specific = False
+            if RE_EXCH_WORD.search(s):
+                stage2_specific = True
+            if RE_STAGE2_HINT.search(s):
+                stage2_specific = True
+            if RE_TE.search(s) or RE_REMOVE.search(s):
+                stage2_specific = True
+            if not stage2_specific:
+                continue
+            if not _sentence_allows_performed(s, isop):
+                continue
+            m4 = RE_EXCH_WORD.search(s) or RE_STAGE2_HINT.search(s) or RE_REMOVE.search(s) or RE_PLACE.search(s)
+            st, en = (m4.start(), m4.end()) if m4 else (0, min(len(s), 60))
+            return (True, "OPONLY_IMPLANT_PLACEMENT_RECON_TIGHT", "OPONLY_IMPLANT_PLACEMENT_RECON_TIGHT_SENTENCE", off + st, off + en, isop)
 
+    # 5) OPONLY_CAPSULE_PLUS_IMPLANT (revised): require stage2-specific cue to avoid generic capsule work
+    if isop:
+        for (s, off) in sents:
+            if not (RE_CAPSULE.search(s) and RE_IMPLANT.search(s)):
+                continue
+            stage2_specific = False
+            if RE_EXCH_WORD.search(s) or RE_STAGE2_HINT.search(s) or RE_TE.search(s) or RE_REMOVE.search(s):
+                stage2_specific = True
+            if not stage2_specific:
+                continue
+            if not _sentence_allows_performed(s, isop):
+                continue
+            m5 = RE_CAPSULE.search(s)
+            return (True, "OPONLY_CAPSULE_PLUS_IMPLANT", "OPONLY_CAPSULE_PLUS_IMPLANT_SENTENCE", off + m5.start(), off + m5.end(), isop)
+
+    # 6) Scheduled Stage2 (tight, sentence scoped)
     ok, bucket, patname, st, en = _scheduled_stage2_sentence_level(text_norm, proximity=50)
     if ok:
         return (True, bucket, patname, st, en, isop)
@@ -296,11 +382,10 @@ def detect_stage(note_text, note_type):
     return ("", "", "", 0, 0, 0)
 
 # -------------------------
-# Build + Validate
+# Build + Validate + Audit
 # -------------------------
 
 def _parse_args(argv):
-    # Minimal args to avoid argparse dependency
     args = {
         "notes": "",
         "gold": DEFAULT_GOLD,
@@ -325,7 +410,6 @@ def build_and_validate(note_paths, gold_path, out_dir, fp_sample_n=250, seed=13)
     _safe_mkdir(out_dir)
     random.seed(seed)
 
-    # Load notes
     note_rows = []
     for p in note_paths:
         note_rows.extend(_read_csv_rows(p))
@@ -337,8 +421,6 @@ def build_and_validate(note_paths, gold_path, out_dir, fp_sample_n=250, seed=13)
     if not note_id_col:
         raise ValueError("Could not detect patient id column in notes. FOUND COLS (first 40): {0}".format(note_cols[:40]))
 
-    # Column mapping for required fields in notes
-    # NOTE_TEXT is required; accept NOTE_TEXT_DEID fallback
     def get_note_text(r):
         if "NOTE_TEXT" in r and (r.get("NOTE_TEXT") is not None):
             return r.get("NOTE_TEXT", "")
@@ -346,7 +428,6 @@ def build_and_validate(note_paths, gold_path, out_dir, fp_sample_n=250, seed=13)
             return r.get("NOTE_TEXT_DEID", "")
         return ""
 
-    # Load gold
     gold_rows = _read_csv_rows(gold_path)
     if not gold_rows:
         raise ValueError("Gold file empty: {0}".format(gold_path))
@@ -354,7 +435,6 @@ def build_and_validate(note_paths, gold_path, out_dir, fp_sample_n=250, seed=13)
     gold_id_col = _detect_id_col(gold_cols, ["ENCRYPTED_PAT_ID", "PAT_ID", "PATIENT_ID", "PatientID"])
     if not gold_id_col:
         raise ValueError("Could not detect patient id column in gold. FOUND COLS (first 60): {0}".format(gold_cols[:60]))
-
     if GOLD_STAGE2_COL not in gold_cols:
         raise ValueError("ERROR: Could not find gold Stage2 flag column in gold: {0}. FOUND COLS (first 80): {1}".format(
             GOLD_STAGE2_COL, gold_cols[:80]
@@ -367,7 +447,6 @@ def build_and_validate(note_paths, gold_path, out_dir, fp_sample_n=250, seed=13)
             continue
         gold_stage2[pid] = _truthy(r.get(GOLD_STAGE2_COL))
 
-    # Run detection
     patients = {}
     events = []
 
@@ -407,7 +486,7 @@ def build_and_validate(note_paths, gold_path, out_dir, fp_sample_n=250, seed=13)
         snippet = _make_snippet(tnorm, st, en, width=160)
 
         events.append({
-            "ENCRYPTED_PAT_ID": pid if note_id_col == "ENCRYPTED_PAT_ID" else pid,
+            "ENCRYPTED_PAT_ID": pid,
             "EVENT_DATE": event_date,
             "NOTE_ID": note_id,
             "NOTE_TYPE": note_type,
@@ -418,7 +497,6 @@ def build_and_validate(note_paths, gold_path, out_dir, fp_sample_n=250, seed=13)
             "EVIDENCE_SNIPPET": snippet,
         })
 
-    # Write stage_event_level.csv
     event_out = os.path.join(out_dir, "stage_event_level.csv")
     with open(event_out, "w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=[
@@ -430,7 +508,6 @@ def build_and_validate(note_paths, gold_path, out_dir, fp_sample_n=250, seed=13)
         for e in events:
             w.writerow(e)
 
-    # Patient summary
     patient_out = os.path.join(out_dir, "patient_stage_summary.csv")
     with open(patient_out, "w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=[
@@ -451,16 +528,14 @@ def build_and_validate(note_paths, gold_path, out_dir, fp_sample_n=250, seed=13)
                 "HAS_STAGE2": 1 if p["stage2_hits"] > 0 else 0,
             })
 
-    # Validation: Stage2 Anchor = predicted HAS_STAGE2 vs gold Stage2_Applicable
     all_pids = set(gold_stage2.keys()) | set(patients.keys())
 
     TP = FP = FN = TN = 0
     mismatches = []
     fp_bucket_counts = {}
-    fp_noteType_counts = {}  # (bucket, note_type)
+    fp_noteType_counts = {}
     bucket_total_predictions = {}
 
-    # Build quick index for FP sampling: events by pid where stage2
     stage2_events_by_pid = {}
     for e in events:
         if e["STAGE"] == "STAGE2":
@@ -476,7 +551,6 @@ def build_and_validate(note_paths, gold_path, out_dir, fp_sample_n=250, seed=13)
             TP += 1
         elif pred == 1 and gold == 0:
             FP += 1
-            # count buckets + note types for FP events (use all stage2 events for this pid)
             for e in stage2_events_by_pid.get(pid, []):
                 b = e["DETECTION_BUCKET"]
                 nt = (e["NOTE_TYPE"] or "").strip()
@@ -497,7 +571,6 @@ def build_and_validate(note_paths, gold_path, out_dir, fp_sample_n=250, seed=13)
                 "PRED_STAGE2_DATE": patients.get(pid, {}).get("stage2_date", ""),
             })
 
-    # Metrics
     precision = float(TP) / float(TP + FP) if (TP + FP) else 0.0
     recall = float(TP) / float(TP + FN) if (TP + FN) else 0.0
     f1 = (2.0 * precision * recall / (precision + recall)) if (precision + recall) else 0.0
@@ -509,7 +582,6 @@ def build_and_validate(note_paths, gold_path, out_dir, fp_sample_n=250, seed=13)
         f.write("TP={0} FP={1} FN={2} TN={3}\n".format(TP, FP, FN, TN))
         f.write("Precision={0:.3f} Recall={1:.3f} F1={2:.3f}\n".format(precision, recall, f1))
 
-    # Mismatches CSV
     mismatch_out = os.path.join(out_dir, "validation_mismatches.csv")
     with open(mismatch_out, "w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=[
@@ -523,7 +595,6 @@ def build_and_validate(note_paths, gold_path, out_dir, fp_sample_n=250, seed=13)
         for r in mismatches:
             w.writerow(r)
 
-    # Audit bucket summary (total predictions per bucket)
     bucket_summary_out = os.path.join(out_dir, "audit_bucket_summary.csv")
     with open(bucket_summary_out, "w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=["DETECTION_BUCKET", "Total_predictions"])
@@ -531,7 +602,6 @@ def build_and_validate(note_paths, gold_path, out_dir, fp_sample_n=250, seed=13)
         for b in sorted(bucket_total_predictions.keys(), key=lambda x: (-bucket_total_predictions[x], x)):
             w.writerow({"DETECTION_BUCKET": b, "Total_predictions": bucket_total_predictions[b]})
 
-    # Audit FP by bucket
     fp_by_bucket_out = os.path.join(out_dir, "audit_fp_by_bucket.csv")
     with open(fp_by_bucket_out, "w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=["DETECTION_BUCKET", "FP_count"])
@@ -539,7 +609,6 @@ def build_and_validate(note_paths, gold_path, out_dir, fp_sample_n=250, seed=13)
         for b in sorted(fp_bucket_counts.keys(), key=lambda x: (-fp_bucket_counts[x], x)):
             w.writerow({"DETECTION_BUCKET": b, "FP_count": fp_bucket_counts[b]})
 
-    # Audit bucket x note_type breakdown (FP only)
     fp_noteType_out = os.path.join(out_dir, "audit_bucket_noteType_breakdown.csv")
     with open(fp_noteType_out, "w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=["DETECTION_BUCKET", "NOTE_TYPE", "Count"])
@@ -549,7 +618,6 @@ def build_and_validate(note_paths, gold_path, out_dir, fp_sample_n=250, seed=13)
         for (b, nt), c in items:
             w.writerow({"DETECTION_BUCKET": b, "NOTE_TYPE": nt, "Count": c})
 
-    # FP event samples (with snippet)
     fp_event_samples = []
     for pid in sorted(all_pids):
         gold = gold_stage2.get(pid, 0)
@@ -581,17 +649,9 @@ def build_and_validate(note_paths, gold_path, out_dir, fp_sample_n=250, seed=13)
             w.writerow(r)
 
     print("Validation complete.")
-    print("Stage2 Anchor (gold={0}):".format(GOLD_STAGE2_COL))
-    print("TP={0} FP={1} FN={2} TN={3}".format(TP, FP, FN, TN))
-    print("Precision={0:.3f} Recall={1:.3f} F1={2:.3f}".format(precision, recall, f1))
-    print("WROTE:", os.path.basename(event_out))
-    print("WROTE:", os.path.basename(patient_out))
-    print("WROTE:", os.path.basename(metrics_out))
-    print("WROTE:", os.path.basename(mismatch_out))
-    print("WROTE:", os.path.basename(bucket_summary_out))
-    print("WROTE:", os.path.basename(fp_by_bucket_out))
-    print("WROTE:", os.path.basename(fp_noteType_out))
-    print("WROTE:", os.path.basename(fp_events_out))
+    print("Stage2 Anchor:")
+    print("  TP={0} FP={1} FN={2} TN={3}".format(TP, FP, FN, TN))
+    print("  Precision={0:.3f} Recall={1:.3f} F1={2:.3f}".format(precision, recall, f1))
 
 def main():
     args = _parse_args(sys.argv)
@@ -616,15 +676,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-# -------------------------
-# RUN
-# -------------------------
-# Default (uses _staging_inputs/HPI11526 Operation Notes.csv + Clinic Notes.csv):
-#   python build_stage2_anchor_with_audit.py --gold=/home/apokol/Breast_Restore/gold_cleaned_for_cedar.csv
-#
-# If your notes are a different CSV (or multiple CSVs):
-#   python build_stage2_anchor_with_audit.py --notes=/path/notes1.csv,/path/notes2.csv --gold=/home/apokol/Breast_Restore/gold_cleaned_for_cedar.csv
-#
-# Outputs land in:
-#   ./_outputs/
