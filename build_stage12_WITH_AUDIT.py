@@ -1,22 +1,40 @@
 # =========================
-# Stage2 Anchor – Refined Logic + Audit
+# Stage2 Anchor – Refined Logic + Audit (FIX: No objects to concatenate)
 # =========================
 
 import pandas as pd
 import re
 import os
+import glob
 
 # -------- PATHS --------
 BASE_DIR = "/home/apokol/Breast_Restore"
 OUTPUT_DIR = f"{BASE_DIR}/outputs"
-
-PATIENT_FILE = f"{BASE_DIR}/HPI11526 Patient Notes.csv"
-OP_FILE = f"{BASE_DIR}/HPI11526 OP Notes.csv"
-CLINIC_FILE = f"{BASE_DIR}/HPI11526 Clinic Notes.csv"
-
 VALIDATION_FILE = f"{BASE_DIR}/stage2_gold_standard.csv"
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# -------- FILE RESOLVER --------
+def resolve_one(required_globs):
+    hits = []
+    for g in required_globs:
+        hits.extend(glob.glob(g))
+    hits = sorted(set(hits))
+    return hits[0] if hits else None
+
+PATIENT_FILE = resolve_one([
+    f"{BASE_DIR}/HPI11526 Patient Notes.csv",
+    f"{BASE_DIR}/*Patient*Notes*.csv",
+])
+OP_FILE = resolve_one([
+    f"{BASE_DIR}/HPI11526 OP Notes.csv",
+    f"{BASE_DIR}/*OP*Notes*.csv",
+    f"{BASE_DIR}/*Operative*Notes*.csv",
+])
+CLINIC_FILE = resolve_one([
+    f"{BASE_DIR}/HPI11526 Clinic Notes.csv",
+    f"{BASE_DIR}/*Clinic*Notes*.csv",
+])
 
 # -------- LOAD NOTES --------
 df_list = []
@@ -26,12 +44,21 @@ for path, note_type in [
     (OP_FILE, "OP NOTE"),
     (CLINIC_FILE, "CLINIC NOTE"),
 ]:
-    if os.path.exists(path):
+    if path and os.path.exists(path):
         tmp = pd.read_csv(path)
         tmp["NOTE_TYPE"] = note_type
         df_list.append(tmp)
 
+if not df_list:
+    raise SystemExit("ERROR: No note files found in /home/apokol/Breast_Restore (Patient/OP/Clinic).")
+
 notes = pd.concat(df_list, ignore_index=True)
+
+# -------- REQUIRED COLUMNS --------
+needed = {"ENCRYPTED_PAT_ID", "EVENT_DATE", "NOTE_ID", "NOTE_TEXT"}
+missing = [c for c in needed if c not in notes.columns]
+if missing:
+    raise SystemExit(f"ERROR: Missing columns in notes: {missing}")
 
 notes["NOTE_TEXT"] = notes["NOTE_TEXT"].astype(str).str.lower()
 
@@ -65,47 +92,44 @@ def classify(text):
     for bucket, patterns in PATTERNS.items():
         for pat in patterns:
             if re.search(pat, text):
-                # exclude clear negation
                 if re.search(NEGATION + r".{0,40}" + pat, text):
                     continue
-                # exclude future/planning unless operative context
                 if re.search(FUTURE + r".{0,40}" + pat, text) and not operative_context:
                     continue
                 return bucket, pat, operative_context
 
     return None, None, False
 
-
 # -------- APPLY --------
-results = []
-for _, row in notes.iterrows():
-    bucket, pattern, operative = classify(row["NOTE_TEXT"])
-    results.append(
-        {
-            "ENCRYPTED_PAT_ID": row["ENCRYPTED_PAT_ID"],
-            "EVENT_DATE": row["EVENT_DATE"],
-            "NOTE_ID": row["NOTE_ID"],
-            "NOTE_TYPE": row["NOTE_TYPE"],
-            "DETECTION_BUCKET": bucket,
-            "PATTERN_NAME": pattern,
-            "IS_OPERATIVE_CONTEXT": int(operative),
-            "EVIDENCE_SNIPPET": row["NOTE_TEXT"][:400],
-        }
-    )
+rows = []
+for _, r in notes.iterrows():
+    bucket, pattern, operative = classify(r["NOTE_TEXT"])
+    rows.append({
+        "ENCRYPTED_PAT_ID": r["ENCRYPTED_PAT_ID"],
+        "EVENT_DATE": r["EVENT_DATE"],
+        "NOTE_ID": r["NOTE_ID"],
+        "NOTE_TYPE": r["NOTE_TYPE"],
+        "DETECTION_BUCKET": bucket,
+        "PATTERN_NAME": pattern,
+        "IS_OPERATIVE_CONTEXT": int(operative),
+        "EVIDENCE_SNIPPET": r["NOTE_TEXT"][:400],
+    })
 
-pred_df = pd.DataFrame(results)
+pred_df = pd.DataFrame(rows)
 pred_df["PRED_STAGE2"] = pred_df["DETECTION_BUCKET"].notnull().astype(int)
 
 # -------- VALIDATION --------
 gold = pd.read_csv(VALIDATION_FILE)
+
+if "NOTE_ID" not in gold.columns or "GOLD_STAGE2" not in gold.columns:
+    raise SystemExit("ERROR: stage2_gold_standard.csv must contain NOTE_ID and GOLD_STAGE2.")
 
 merged = gold.merge(
     pred_df[["NOTE_ID", "PRED_STAGE2"]],
     on="NOTE_ID",
     how="left",
 )
-
-merged["PRED_STAGE2"] = merged["PRED_STAGE2"].fillna(0)
+merged["PRED_STAGE2"] = merged["PRED_STAGE2"].fillna(0).astype(int)
 
 TP = ((merged["GOLD_STAGE2"] == 1) & (merged["PRED_STAGE2"] == 1)).sum()
 FP = ((merged["GOLD_STAGE2"] == 0) & (merged["PRED_STAGE2"] == 1)).sum()
@@ -144,6 +168,4 @@ bucket_note_breakdown = (
     .size()
     .reset_index(name="count")
 )
-bucket_note_breakdown.to_csv(
-    f"{OUTPUT_DIR}/audit_bucket_noteType_breakdown.csv", index=False
-)
+bucket_note_breakdown.to_csv(f"{OUTPUT_DIR}/audit_bucket_noteType_breakdown.csv", index=False)
