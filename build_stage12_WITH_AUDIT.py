@@ -1,428 +1,149 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-build_stage12_WITH_AUDIT_tunedFP_v2.py (Python 3.6.8 compatible)
+# =========================
+# Stage2 Anchor – Refined Logic + Audit
+# =========================
 
-Goal: reduce FN without reopening FP too much, keep audit outputs.
-
-Change vs tunedFP_v1:
-- Expand operative-context detection:
-  operative_context = NOTE_TYPE matches operative-like OR NOTE_TEXT contains strong op-report cues.
-  This catches true Stage2 documented in OP reports where NOTE_TYPE is missing/odd.
-
-Keeps FP-control:
-- OPONLY_IMPLANT_EXCHANGE requires implant + exchange AND (TE/expander OR capsule-work)
-- OPONLY_IMPLANT_PLACEMENT_RECON excludes likely DTI/immediate mastectomy implants unless TE present
-- HISTORY/PRIOR guard for OPONLY + SCHEDULED (sentence-level for scheduled)
-
-Inputs:
-- ./_staging_inputs/HPI11526 Operation Notes.csv
-- ./_staging_inputs/HPI11526 Clinic Notes.csv
-
-Outputs:
-- ./_outputs/patient_stage_summary.csv
-- ./_outputs/stage_event_level.csv
-"""
-
-from __future__ import print_function
-import os
-import csv
+import pandas as pd
 import re
-from datetime import datetime
+import os
 
-STAGING_DIR = os.path.join(os.getcwd(), "_staging_inputs")
-OUT_DIR = os.path.join(os.getcwd(), "_outputs")
+# -------- PATHS --------
+BASE_DIR = "/home/apokol/Breast_Restore"
+OUTPUT_DIR = f"{BASE_DIR}/outputs"
 
-# -------------------------
-# Helpers
-# -------------------------
+PATIENT_FILE = f"{BASE_DIR}/HPI11526 Patient Notes.csv"
+OP_FILE = f"{BASE_DIR}/HPI11526 OP Notes.csv"
+CLINIC_FILE = f"{BASE_DIR}/HPI11526 Clinic Notes.csv"
 
-def _safe_mkdir(path):
-    if not os.path.isdir(path):
-        os.makedirs(path)
+VALIDATION_FILE = f"{BASE_DIR}/stage2_gold_standard.csv"
 
-def _find_input_csvs():
-    files = []
-    for name in ["HPI11526 Operation Notes.csv", "HPI11526 Clinic Notes.csv"]:
-        p = os.path.join(STAGING_DIR, name)
-        if os.path.isfile(p):
-            files.append(p)
-    if not files:
-        raise IOError("No Operation/Clinic notes found in: {0}".format(STAGING_DIR))
-    return files
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-def _normalize_text(s):
-    if s is None:
-        return ""
-    s = s.replace("\r", "\n").lower()
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+# -------- LOAD NOTES --------
+df_list = []
 
-def _parse_date_any(s):
-    if s is None:
-        return ""
-    s = str(s).strip()
-    if not s:
-        return ""
-    fmts = [
-        "%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y",
-        "%Y/%m/%d", "%Y-%m-%d %H:%M:%S",
-        "%m/%d/%Y %H:%M", "%m/%d/%Y %H:%M:%S",
-        "%m/%d/%y %H:%M", "%m/%d/%y %H:%M:%S",
-        "%Y-%m-%d %H:%M",
-    ]
-    for fmt in fmts:
-        try:
-            dt = datetime.strptime(s, fmt)
-            return dt.strftime("%Y-%m-%d")
-        except Exception:
-            pass
-    return ""
+for path, note_type in [
+    (PATIENT_FILE, "PATIENT"),
+    (OP_FILE, "OP NOTE"),
+    (CLINIC_FILE, "CLINIC NOTE"),
+]:
+    if os.path.exists(path):
+        tmp = pd.read_csv(path)
+        tmp["NOTE_TYPE"] = note_type
+        df_list.append(tmp)
 
-def _best_note_date(row):
-    op = _parse_date_any(row.get("OPERATION_DATE", ""))
-    if op:
-        return op
-    return _parse_date_any(row.get("NOTE_DATE_OF_SERVICE", ""))
+notes = pd.concat(df_list, ignore_index=True)
 
-def _make_snippet(text_norm, start, end, width=150):
-    lo = max(0, start - width)
-    hi = min(len(text_norm), end + width)
-    return text_norm[lo:hi].strip()
+notes["NOTE_TEXT"] = notes["NOTE_TEXT"].astype(str).str.lower()
 
-def _sentences(text_norm):
-    return re.split(r"[.;]\s+|\n+", text_norm)
+# -------- PATTERNS --------
+PATTERNS = {
+    "EXCHANGE_TIGHT": [
+        r"\bimplant exchange\b",
+        r"\bexchange of (the )?implant\b",
+        r"\breplace(d|ment)? (with )?(a )?(new )?implant\b",
+    ],
+    "EXPANDER_TO_IMPLANT": [
+        r"\bexchange (of )?tissue expander\b.*\bimplant\b",
+        r"\bexpander (was )?removed\b.*\bimplant (was )?placed\b",
+        r"\bexpander to implant\b",
+    ],
+    "OPONLY_IMPLANT_PLACEMENT_RECON_TIGHT": [
+        r"\bplacement of (a )?(permanent )?implant\b",
+        r"\bimplant (was )?placed\b",
+    ],
+}
 
-# -------------------------
-# Stage detection logic (tuned)
-# -------------------------
+NEGATION = r"\b(no|not|without|denies|deferred|declined)\b"
+FUTURE = r"\b(will|plan|scheduled|planning|consider)\b"
 
-RE_OPERATIVE_TYPE = re.compile(
-    r"\b(operative|op note|brief op|operation|surgical|procedure|or note)\b",
-    re.I
-)
+# -------- CLASSIFIER --------
+def classify(text):
+    operative_context = bool(
+        re.search(r"\b(procedure|operation|intraop|incision|anesthesia|drain)\b", text)
+    )
 
-# Strong op-report cues (NOTE_TEXT-based) to treat as operative context even if NOTE_TYPE is messy
-RE_OP_REPORT_CUE = re.compile(
-    r"\b(pre[- ]?op diagnosis|post[- ]?op diagnosis|procedure(s)? performed|anesthesia|estimated blood loss|ebl|"
-    r"findings:|specimen(s)?:|drains?:|indications?:|surgeon:|assistant:|"
-    r"implants?:|implant name|implant size|serial (no|number)|lot (no|number))\b",
-    re.I
-)
+    for bucket, patterns in PATTERNS.items():
+        for pat in patterns:
+            if re.search(pat, text):
+                # exclude clear negation
+                if re.search(NEGATION + r".{0,40}" + pat, text):
+                    continue
+                # exclude future/planning unless operative context
+                if re.search(FUTURE + r".{0,40}" + pat, text) and not operative_context:
+                    continue
+                return bucket, pat, operative_context
 
-RE_TE = re.compile(r"\b(expander|expanders|tissue expander|te)\b", re.I)
-RE_REMOVE = re.compile(r"\b(remove(d|al)?|explant(ed|ation)?|take\s*out|takedown|retrieve)\b", re.I)
+    return None, None, False
 
-RE_IMPLANT = re.compile(
-    r"\b(implant(s)?|prosthesis|silicone|saline|gel|mentor|allergan|sientra)\b",
-    re.I
-)
 
-RE_ACTION = re.compile(r"\b(place(d|ment)?|insert(ed|ion)?|exchange(d)?|exchanged|replace(d|ment)?|replacement)\b", re.I)
-RE_EXCH_WORD = re.compile(r"\b(exchange|exchanged|replace|replaced|replacement)\b", re.I)
-
-RE_RECON = re.compile(r"\b(breast reconstruction|reconstruction)\b", re.I)
-RE_STAGE2_HINT = re.compile(r"\b(second stage|stage\s*2)\b", re.I)
-RE_CAPSULE = re.compile(r"\b(capsulectomy|capsulotomy)\b", re.I)
-
-RE_MASTECTOMY = re.compile(r"\b(mastectomy)\b", re.I)
-RE_IMMEDIATE = re.compile(r"\b(immediate|direct[- ]?to[- ]?implant|dti)\b", re.I)
-
-RE_HISTORY_GUARD = re.compile(
-    r"\b(history of|h/o|prior|previous(ly)?|s\/p|status post)\b",
-    re.I
-)
-
-RE_EXCHANGE_TIGHT = re.compile(
-    r"\b(implant|expander)\b.{0,50}\b(exchange|exchanged|replace|replaced|replacement)\b"
-    r"|\b(exchange|exchanged|replace|replaced|replacement)\b.{0,50}\b(implant|expander)\b",
-    re.I
-)
-
-RE_SCHEDULE = re.compile(r"\b(schedule(d)?|planned|plan)\b", re.I)
-RE_SCHEDULED_FOR = re.compile(r"\bscheduled\b.{0,12}\bfor\b", re.I)
-RE_PROC_CUE = re.compile(r"\b(surgery|procedure|operation|or|operative)\b", re.I)
-
-RE_NOT_SCHEDULED = re.compile(
-    r"\b(not|no|never)\s+(scheduled|plan(ned)?|planning)\b|\bno plans\b|\bnot planning\b",
-    re.I
-)
-
-RE_COUNSEL_ONLY = re.compile(
-    r"\b(discuss(ed|ion)?|consider(ing)?|option(s)?|candidate|counsel(ing)?|risks? and benefits|review(ed)?)\b",
-    re.I
-)
-
-RE_BAD_SCHED_CONTEXT = re.compile(
-    r"\b(follow[- ]?up|f/u|clinic|appt|appointment|visit|pt|ot|imaging|mri|ct|us|ultrasound|mammo|labs?)\b",
-    re.I
-)
-
-RE_STAGE2_PROC_PHRASE = re.compile(
-    r"\b(expander[- ]?to[- ]?implant)\b"
-    r"|\b(exchange)\b.{0,30}\b(expander|implant)\b"
-    r"|\b(expander)\b.{0,30}\b(exchange)\b"
-    r"|\b(second stage|stage\s*2)\b.{0,40}\b(reconstruction|exchange)\b"
-    r"|\b(expander)\b.{0,40}\b(remove|removal|explant)\b.{0,40}\b(implant)\b",
-    re.I
-)
-
-STAGE1_PATTERNS = [
-    r"\b(mastectomy)\b.*\b(tissue expander|expanders|te)\b.*\b(place|placement|insert|insertion)\b",
-    r"\b(place|placement|insert|insertion)\b.*\b(tissue expander|expanders|te)\b",
-    r"\b(first stage)\b.*\b(reconstruction|tissue expander|expander|te)\b",
-    r"\b(stage\s*1)\b.*\b(reconstruction|tissue expander|expander|te)\b",
-]
-
-def _scheduled_stage2_sentence_level(text_norm, proximity=50):
-    if not RE_SCHEDULE.search(text_norm):
-        return False, "", "", 0, 0
-
-    parts = _sentences(text_norm)
-    offset = 0
-    for sent in parts:
-        s = sent.strip()
-        if not s:
-            offset += len(sent) + 1
-            continue
-        if not RE_SCHEDULE.search(s):
-            offset += len(sent) + 1
-            continue
-        if RE_NOT_SCHEDULED.search(s):
-            offset += len(sent) + 1
-            continue
-        if RE_BAD_SCHED_CONTEXT.search(s):
-            offset += len(sent) + 1
-            continue
-        if RE_COUNSEL_ONLY.search(s):
-            offset += len(sent) + 1
-            continue
-        if RE_HISTORY_GUARD.search(s):
-            offset += len(sent) + 1
-            continue
-
-        m_proc = RE_STAGE2_PROC_PHRASE.search(s)
-        if not m_proc:
-            offset += len(sent) + 1
-            continue
-
-        sched_positions = [m.start() for m in RE_SCHEDULE.finditer(s)]
-        proc_start = m_proc.start()
-        proc_end = m_proc.end()
-
-        close = False
-        for sp in sched_positions:
-            if abs(sp - proc_start) <= proximity or abs(sp - proc_end) <= proximity:
-                close = True
-                break
-        if not close:
-            offset += len(sent) + 1
-            continue
-
-        if not (RE_SCHEDULED_FOR.search(s) or RE_PROC_CUE.search(s)):
-            offset += len(sent) + 1
-            continue
-
-        return True, "SCHEDULED_STAGE2_TIGHT", "SCHEDULED_SENTENCE", (offset + m_proc.start()), (offset + m_proc.end())
-
-    return False, "", "", 0, 0
-
-def _oponly_implant_exchange_ok(text_norm):
-    if not (RE_IMPLANT.search(text_norm) and RE_EXCH_WORD.search(text_norm)):
-        return False
-    if RE_TE.search(text_norm) or RE_CAPSULE.search(text_norm):
-        return True
-    return False
-
-def _oponly_implant_placement_recon_ok(text_norm):
-    if not (RE_IMPLANT.search(text_norm) and re.search(r"\b(place(d|ment)?|insert(ed|ion)?)\b", text_norm, re.I)):
-        return False
-    if not (RE_RECON.search(text_norm) or RE_STAGE2_HINT.search(text_norm)):
-        return False
-    if RE_MASTECTOMY.search(text_norm) and RE_IMMEDIATE.search(text_norm) and (not RE_TE.search(text_norm)):
-        return False
-    return True
-
-def _is_operative_context(note_type_norm, text_norm):
-    if RE_OPERATIVE_TYPE.search(note_type_norm):
-        return 1
-    if RE_OP_REPORT_CUE.search(text_norm):
-        return 1
-    return 0
-
-def _stage2_bucket(text_norm, note_type_norm):
-    operative_ctx = _is_operative_context(note_type_norm, text_norm)
-
-    m = RE_EXCHANGE_TIGHT.search(text_norm)
-    if m:
-        return True, "EXCHANGE_TIGHT", "EXCHANGE_TIGHT", m.start(), m.end(), operative_ctx
-
-    if RE_TE.search(text_norm) and RE_REMOVE.search(text_norm) and RE_IMPLANT.search(text_norm) and RE_ACTION.search(text_norm):
-        m2 = RE_REMOVE.search(text_norm) or RE_ACTION.search(text_norm)
-        st, en = (m2.start(), m2.end()) if m2 else (0, min(len(text_norm), 60))
-        return True, "EXPANDER_TO_IMPLANT", "TE+REMOVE+IMPLANT+ACTION", st, en, operative_ctx
-
-    if operative_ctx and _oponly_implant_exchange_ok(text_norm) and (not RE_HISTORY_GUARD.search(text_norm)):
-        m3 = RE_EXCH_WORD.search(text_norm) or RE_IMPLANT.search(text_norm)
-        st, en = (m3.start(), m3.end()) if m3 else (0, min(len(text_norm), 60))
-        return True, "OPONLY_IMPLANT_EXCHANGE_TIGHT", "OPONLY_IMPLANT_EXCHANGE_TIGHT", st, en, operative_ctx
-
-    if operative_ctx and _oponly_implant_placement_recon_ok(text_norm) and (not RE_HISTORY_GUARD.search(text_norm)):
-        m4 = re.search(r"\b(place(d|ment)?|insert(ed|ion)?)\b", text_norm, re.I) or RE_IMPLANT.search(text_norm)
-        st, en = (m4.start(), m4.end()) if m4 else (0, min(len(text_norm), 60))
-        return True, "OPONLY_IMPLANT_PLACEMENT_RECON_TIGHT", "OPONLY_IMPLANT_PLACEMENT_RECON_TIGHT", st, en, operative_ctx
-
-    if operative_ctx and RE_CAPSULE.search(text_norm) and RE_IMPLANT.search(text_norm) and (not RE_HISTORY_GUARD.search(text_norm)):
-        m5 = RE_CAPSULE.search(text_norm)
-        return True, "OPONLY_CAPSULE_PLUS_IMPLANT", "OPONLY_CAPSULE_PLUS_IMPLANT", m5.start(), m5.end(), operative_ctx
-
-    ok, bucket, patname, st, en = _scheduled_stage2_sentence_level(text_norm, proximity=50)
-    if ok:
-        return True, bucket, patname, st, en, operative_ctx
-
-    return False, "", "", 0, 0, operative_ctx
-
-def detect_stage(note_text, note_type):
-    t = _normalize_text(note_text)
-    nt = _normalize_text(note_type)
-
-    ok2, bucket, patname, st, en, opctx = _stage2_bucket(t, nt)
-    if ok2:
-        return "STAGE2", bucket, patname, st, en, opctx
-
-    for pat in STAGE1_PATTERNS:
-        m = re.search(pat, t)
-        if m:
-            return "STAGE1", "STAGE1", pat, m.start(), m.end(), 0
-
-    return "", "", "", 0, 0, 0
-
-# -------------------------
-# Main
-# -------------------------
-
-def read_rows(csv_path):
-    rows = []
-    with open(csv_path, "r", encoding="utf-8", errors="replace", newline="") as f:
-        reader = csv.DictReader(f)
-        for r in reader:
-            rows.append(r)
-    return rows
-
-def build(outputs_dir, input_csvs):
-    _safe_mkdir(outputs_dir)
-
-    rows = []
-    for p in input_csvs:
-        rows.extend(read_rows(p))
-
-    patients = {}
-    events = []
-    stage2_match_counts = {}
-
-    for r in rows:
-        pid = (r.get("ENCRYPTED_PAT_ID") or "").strip()
-        if not pid:
-            continue
-
-        date = _best_note_date(r)
-        note_id = (r.get("NOTE_ID") or "").strip()
-        note_type = (r.get("NOTE_TYPE") or "").strip()
-        text = r.get("NOTE_TEXT", "")
-
-        stage, bucket, patname, st, en, opctx = detect_stage(text, note_type)
-        if not stage:
-            continue
-
-        tnorm = _normalize_text(text)
-        snippet = _make_snippet(tnorm, st, en, width=150) if tnorm else ""
-
-        if pid not in patients:
-            patients[pid] = {
-                "stage1_date": "",
-                "stage2_date": "",
-                "stage1_hits": 0,
-                "stage2_hits": 0,
-            }
-
-        p = patients[pid]
-
-        if stage == "STAGE1":
-            p["stage1_hits"] += 1
-            if date and (not p["stage1_date"] or date < p["stage1_date"]):
-                p["stage1_date"] = date
-
-        elif stage == "STAGE2":
-            p["stage2_hits"] += 1
-            stage2_match_counts[pid] = stage2_match_counts.get(pid, 0) + 1
-            if date and (not p["stage2_date"] or date < p["stage2_date"]):
-                p["stage2_date"] = date
-
-        events.append({
-            "ENCRYPTED_PAT_ID": pid,
-            "STAGE": stage,
-            "EVENT_DATE": date,
-            "NOTE_ID": note_id,
-            "NOTE_TYPE": note_type,
+# -------- APPLY --------
+results = []
+for _, row in notes.iterrows():
+    bucket, pattern, operative = classify(row["NOTE_TEXT"])
+    results.append(
+        {
+            "ENCRYPTED_PAT_ID": row["ENCRYPTED_PAT_ID"],
+            "EVENT_DATE": row["EVENT_DATE"],
+            "NOTE_ID": row["NOTE_ID"],
+            "NOTE_TYPE": row["NOTE_TYPE"],
             "DETECTION_BUCKET": bucket,
-            "PATTERN_NAME": patname,
-            "IS_OPERATIVE_CONTEXT": int(opctx),
-            "EVIDENCE_SNIPPET": snippet
-        })
+            "PATTERN_NAME": pattern,
+            "IS_OPERATIVE_CONTEXT": int(operative),
+            "EVIDENCE_SNIPPET": row["NOTE_TEXT"][:400],
+        }
+    )
 
-    for pid, p in patients.items():
-        p["stage2_match_count"] = stage2_match_counts.get(pid, 0)
-        if p["stage1_date"] and p["stage2_date"]:
-            p["has_stage1_before_stage2"] = 1 if p["stage1_date"] <= p["stage2_date"] else 0
-        else:
-            p["has_stage1_before_stage2"] = 0
+pred_df = pd.DataFrame(results)
+pred_df["PRED_STAGE2"] = pred_df["DETECTION_BUCKET"].notnull().astype(int)
 
-    patient_out = os.path.join(outputs_dir, "patient_stage_summary.csv")
-    with open(patient_out, "w", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=[
-            "ENCRYPTED_PAT_ID",
-            "STAGE1_DATE", "STAGE1_HITS",
-            "STAGE2_DATE", "STAGE2_HITS",
-            "HAS_STAGE1", "HAS_STAGE2",
-            "HAS_STAGE1_BEFORE_STAGE2",
-            "STAGE2_MATCH_COUNT_PER_PATIENT"
-        ])
-        w.writeheader()
-        for pid in sorted(patients.keys()):
-            p = patients[pid]
-            w.writerow({
-                "ENCRYPTED_PAT_ID": pid,
-                "STAGE1_DATE": p["stage1_date"],
-                "STAGE1_HITS": p["stage1_hits"],
-                "STAGE2_DATE": p["stage2_date"],
-                "STAGE2_HITS": p["stage2_hits"],
-                "HAS_STAGE1": 1 if p["stage1_hits"] > 0 else 0,
-                "HAS_STAGE2": 1 if p["stage2_hits"] > 0 else 0,
-                "HAS_STAGE1_BEFORE_STAGE2": p["has_stage1_before_stage2"],
-                "STAGE2_MATCH_COUNT_PER_PATIENT": p["stage2_match_count"],
-            })
+# -------- VALIDATION --------
+gold = pd.read_csv(VALIDATION_FILE)
 
-    event_out = os.path.join(outputs_dir, "stage_event_level.csv")
-    with open(event_out, "w", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=[
-            "ENCRYPTED_PAT_ID", "STAGE", "EVENT_DATE",
-            "NOTE_ID", "NOTE_TYPE",
-            "DETECTION_BUCKET", "PATTERN_NAME",
-            "IS_OPERATIVE_CONTEXT",
-            "EVIDENCE_SNIPPET"
-        ])
-        w.writeheader()
-        for e in events:
-            w.writerow(e)
+merged = gold.merge(
+    pred_df[["NOTE_ID", "PRED_STAGE2"]],
+    on="NOTE_ID",
+    how="left",
+)
 
-    print("OK: wrote", patient_out)
-    print("OK: wrote", event_out)
+merged["PRED_STAGE2"] = merged["PRED_STAGE2"].fillna(0)
 
-def main():
-    if not os.path.isdir(STAGING_DIR):
-        raise IOError("Staging dir not found: {0}".format(STAGING_DIR))
-    input_csvs = _find_input_csvs()
-    build(OUT_DIR, input_csvs)
+TP = ((merged["GOLD_STAGE2"] == 1) & (merged["PRED_STAGE2"] == 1)).sum()
+FP = ((merged["GOLD_STAGE2"] == 0) & (merged["PRED_STAGE2"] == 1)).sum()
+FN = ((merged["GOLD_STAGE2"] == 1) & (merged["PRED_STAGE2"] == 0)).sum()
+TN = ((merged["GOLD_STAGE2"] == 0) & (merged["PRED_STAGE2"] == 0)).sum()
 
-if __name__ == "__main__":
-    main()
+precision = TP / (TP + FP) if (TP + FP) else 0
+recall = TP / (TP + FN) if (TP + FN) else 0
+f1 = (2 * precision * recall) / (precision + recall) if (precision + recall) else 0
+
+print("Validation complete.")
+print("Stage2 Anchor:")
+print(f"TP={TP} FP={FP} FN={FN} TN={TN}")
+print(f"Precision={precision:.3f} Recall={recall:.3f} F1={f1:.3f}")
+
+# -------- AUDIT FILES --------
+pred_df.to_csv(f"{OUTPUT_DIR}/audit_fp_events_sample.csv", index=False)
+
+fp = merged[(merged["GOLD_STAGE2"] == 0) & (merged["PRED_STAGE2"] == 1)]
+fn = merged[(merged["GOLD_STAGE2"] == 1) & (merged["PRED_STAGE2"] == 0)]
+
+fp.to_csv(f"{OUTPUT_DIR}/audit_fp.csv", index=False)
+fn.to_csv(f"{OUTPUT_DIR}/audit_fn.csv", index=False)
+
+bucket_summary = (
+    pred_df[pred_df["PRED_STAGE2"] == 1]
+    .groupby("DETECTION_BUCKET")
+    .size()
+    .reset_index(name="Total_predictions")
+)
+bucket_summary.to_csv(f"{OUTPUT_DIR}/audit_bucket_summary.csv", index=False)
+
+bucket_note_breakdown = (
+    pred_df[pred_df["PRED_STAGE2"] == 1]
+    .groupby(["DETECTION_BUCKET", "NOTE_TYPE"])
+    .size()
+    .reset_index(name="count")
+)
+bucket_note_breakdown.to_csv(
+    f"{OUTPUT_DIR}/audit_bucket_noteType_breakdown.csv", index=False
+)
