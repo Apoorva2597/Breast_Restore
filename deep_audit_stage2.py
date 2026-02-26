@@ -1,28 +1,37 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-deep_audit_stage2.py  (REVISED v3 - FIX LINKING)
+deep_audit_stage2.py  (REVISED v4 - FIX EMPTY FP BUCKETS)
 
-Fix:
-- Your validation outputs are MRN-based and do NOT carry ENCRYPTED_PAT_ID.
-- stage_event_level.csv is ENCRYPTED_PAT_ID-based and does NOT carry MRN.
-=> Need an MRN <-> ENCRYPTED_PAT_ID bridge.
+Why your FP bucket files are empty:
+- FP/FN live in validation_mismatches (usually MRN-based)
+- stage_event_level is ENCRYPTED_PAT_ID-based
+- Your MRN->ENCRYPTED_PAT_ID mapping is failing (format mismatch, leading zeros, non-digit chars, etc.)
 
-This script builds the bridge from staging files (they contain BOTH MRN + ENCRYPTED_PAT_ID),
-then maps mismatches (MRN) -> ENCRYPTED_PAT_ID -> stage_event_level to populate FP bucket files.
+This version:
+- Builds TWO MRN keys everywhere:
+  (1) MRN_RAW (trimmed)
+  (2) MRN_DIGITS (digits-only)
+- Tries ALL linking paths (in this order):
+  A) mismatches already has ENCRYPTED_PAT_ID
+  B) mismatches -> merged (MRN_RAW then MRN_DIGITS) to get ENCRYPTED_PAT_ID
+  C) mismatches -> staging map (MRN_RAW then MRN_DIGITS) to get ENCRYPTED_PAT_ID
+- Normalizes STAGE values in stage_event_level before filtering.
 
 Inputs:
 - ./_outputs/validation_mismatches_STAGE2_ANCHOR_FIXED.csv
+- ./_outputs/validation_merged_STAGE2_ANCHOR_FIXED.csv   (used if present)
 - ./_outputs/stage_event_level.csv
 - ./_staging_inputs/HPI11526 Operation Notes.csv
-- ./_staging_inputs/HPI11526 Clinic Notes.csv   (optional; used if present)
+- ./_staging_inputs/HPI11526 Clinic Notes.csv (optional)
 
 Outputs (always written):
 - ./_outputs/audit_bucket_summary.csv
 - ./_outputs/audit_fp_by_bucket.csv
 - ./_outputs/audit_bucket_noteType_breakdown.csv
 - ./_outputs/audit_fn_patients.csv
-- ./_outputs/audit_fp_events_sample.csv   (top evidence rows for quick QA)
+- ./_outputs/audit_fp_events_sample.csv
+- ./_outputs/audit_link_debug.csv   (counts + how many FP rows mapped)
 """
 
 import os
@@ -41,26 +50,40 @@ def read_csv_robust(path):
     raise IOError("Failed to read CSV: {}".format(path))
 
 def pick_col(df, options):
-    cols = set(df.columns)
+    cols = list(df.columns)
+    colset = set(cols)
     for c in options:
-        if c in cols:
+        if c in colset:
             return c
-    # try case-insensitive
-    lower_map = {str(c).strip().lower(): c for c in df.columns}
+    low = {str(c).strip().lower(): c for c in cols}
     for c in options:
         k = str(c).strip().lower()
-        if k in lower_map:
-            return lower_map[k]
+        if k in low:
+            return low[k]
     return None
 
 def norm(x):
     s = "" if x is None else str(x).strip()
     if s.lower() == "nan":
         return ""
-    # excel float artifact
     if s.endswith(".0") and s[:-2].isdigit():
         return s[:-2]
     return s
+
+def digits_only(x):
+    s = norm(x)
+    if not s:
+        return ""
+    return "".join([ch for ch in s if ch.isdigit()])
+
+def ensure_mrn_keys(df, mrn_col, out_raw="MRN_RAW", out_digits="MRN_DIGITS"):
+    df[out_raw] = df[mrn_col].map(norm) if mrn_col in df.columns else ""
+    df[out_digits] = df[mrn_col].map(digits_only) if mrn_col in df.columns else ""
+    return df
+
+def ensure_pid(df, pid_col, out_pid="ENCRYPTED_PAT_ID"):
+    df[out_pid] = df[pid_col].map(norm) if pid_col and pid_col in df.columns else ""
+    return df
 
 def build_mrn_pid_map():
     paths = []
@@ -82,68 +105,138 @@ def build_mrn_pid_map():
         if not mrn_col or not pid_col:
             continue
         tmp = df[[mrn_col, pid_col]].copy()
-        tmp.columns = ["MRN", "ENCRYPTED_PAT_ID"]
-        tmp["MRN"] = tmp["MRN"].map(norm)
-        tmp["ENCRYPTED_PAT_ID"] = tmp["ENCRYPTED_PAT_ID"].map(norm)
-        tmp = tmp[(tmp["MRN"] != "") & (tmp["ENCRYPTED_PAT_ID"] != "")]
-        frames.append(tmp)
+        tmp.columns = ["MRN_SRC", "PID_SRC"]
+        tmp["MRN_RAW"] = tmp["MRN_SRC"].map(norm)
+        tmp["MRN_DIGITS"] = tmp["MRN_SRC"].map(digits_only)
+        tmp["ENCRYPTED_PAT_ID"] = tmp["PID_SRC"].map(norm)
+        tmp = tmp[(tmp["ENCRYPTED_PAT_ID"] != "") & ((tmp["MRN_RAW"] != "") | (tmp["MRN_DIGITS"] != ""))]
+        frames.append(tmp[["MRN_RAW", "MRN_DIGITS", "ENCRYPTED_PAT_ID"]])
 
     if not frames:
         raise ValueError("Could not find MRN + ENCRYPTED_PAT_ID columns in staging inputs.")
 
     m = pd.concat(frames, ignore_index=True).drop_duplicates()
-    # In rare cases MRN maps to multiple IDs; keep the most frequent mapping.
+
+    # resolve duplicates by frequency for each MRN key
     m["n"] = 1
-    m = (
-        m.groupby(["MRN", "ENCRYPTED_PAT_ID"])["n"]
-        .sum()
+
+    m_raw = (
+        m[m["MRN_RAW"] != ""]
+        .groupby(["MRN_RAW", "ENCRYPTED_PAT_ID"])["n"].sum()
         .reset_index()
-        .sort_values(["MRN", "n"], ascending=[True, False])
+        .sort_values(["MRN_RAW", "n"], ascending=[True, False])
+        .drop_duplicates(subset=["MRN_RAW"], keep="first")[["MRN_RAW", "ENCRYPTED_PAT_ID"]]
     )
-    m = m.drop_duplicates(subset=["MRN"], keep="first")[["MRN", "ENCRYPTED_PAT_ID"]]
-    return m
+
+    m_dig = (
+        m[m["MRN_DIGITS"] != ""]
+        .groupby(["MRN_DIGITS", "ENCRYPTED_PAT_ID"])["n"].sum()
+        .reset_index()
+        .sort_values(["MRN_DIGITS", "n"], ascending=[True, False])
+        .drop_duplicates(subset=["MRN_DIGITS"], keep="first")[["MRN_DIGITS", "ENCRYPTED_PAT_ID"]]
+    )
+
+    return m_raw, m_dig
+
+def map_pid_for_mismatches(mism, merged, mrn_raw_map, mrn_dig_map):
+    mism = mism.copy()
+
+    # if mism already has pid
+    mism_pid_col = pick_col(mism, ["ENCRYPTED_PAT_ID", "ENCRYPTED_PATID", "ENCRYPTED_PATIENT_ID"])
+    if mism_pid_col:
+        mism = ensure_pid(mism, mism_pid_col, out_pid="ENCRYPTED_PAT_ID")
+        return mism
+
+    # need MRN
+    mism_mrn_col = pick_col(mism, ["MRN", "mrn"])
+    if not mism_mrn_col:
+        raise ValueError("Mismatches file missing MRN column AND missing ENCRYPTED_PAT_ID.")
+
+    mism = ensure_mrn_keys(mism, mism_mrn_col)
+
+    # B) try mism -> merged if merged has pid + mrn
+    if merged is not None and not merged.empty:
+        merged_pid_col = pick_col(merged, ["ENCRYPTED_PAT_ID", "ENCRYPTED_PATID", "ENCRYPTED_PATIENT_ID"])
+        merged_mrn_col = pick_col(merged, ["MRN", "mrn"])
+        if merged_pid_col and merged_mrn_col:
+            m2 = merged[[merged_mrn_col, merged_pid_col]].copy()
+            m2 = ensure_mrn_keys(m2, merged_mrn_col)
+            m2 = ensure_pid(m2, merged_pid_col)
+            # raw join
+            j = m2[m2["MRN_RAW"] != ""][["MRN_RAW", "ENCRYPTED_PAT_ID"]].drop_duplicates(subset=["MRN_RAW"])
+            mism = mism.merge(j, on="MRN_RAW", how="left", suffixes=("", "_m"))
+            mism["ENCRYPTED_PAT_ID"] = mism["ENCRYPTED_PAT_ID"].fillna("")
+            # digits join for still-unmapped
+            need = (mism["ENCRYPTED_PAT_ID"] == "") & (mism["MRN_DIGITS"] != "")
+            if need.any():
+                j2 = m2[m2["MRN_DIGITS"] != ""][["MRN_DIGITS", "ENCRYPTED_PAT_ID"]].drop_duplicates(subset=["MRN_DIGITS"])
+                mism2 = mism[need].merge(j2, on="MRN_DIGITS", how="left", suffixes=("", "_d"))
+                mism.loc[need, "ENCRYPTED_PAT_ID"] = mism2["ENCRYPTED_PAT_ID"].fillna("").values
+
+            return mism
+
+    # C) fall back to staging map
+    mism = mism.merge(mrn_raw_map, on="MRN_RAW", how="left", suffixes=("", "_rawmap"))
+    mism["ENCRYPTED_PAT_ID"] = mism["ENCRYPTED_PAT_ID"].fillna("")
+
+    need = (mism["ENCRYPTED_PAT_ID"] == "") & (mism["MRN_DIGITS"] != "")
+    if need.any():
+        mism2 = mism[need].merge(mrn_dig_map, on="MRN_DIGITS", how="left", suffixes=("", "_digmap"))
+        mism.loc[need, "ENCRYPTED_PAT_ID"] = mism2["ENCRYPTED_PAT_ID"].fillna("").values
+
+    mism["ENCRYPTED_PAT_ID"] = mism["ENCRYPTED_PAT_ID"].fillna("")
+    return mism
 
 def main():
     mism_path = os.path.join(OUT, "validation_mismatches_STAGE2_ANCHOR_FIXED.csv")
+    merged_path = os.path.join(OUT, "validation_merged_STAGE2_ANCHOR_FIXED.csv")
     events_path = os.path.join(OUT, "stage_event_level.csv")
 
     mism = read_csv_robust(mism_path)
+
+    merged = None
+    if os.path.isfile(merged_path):
+        merged = read_csv_robust(merged_path)
+    else:
+        merged = pd.DataFrame()
+
     events = read_csv_robust(events_path)
 
-    # Required mismatch columns
+    # normalize events pid and stage
+    events_pid_col = pick_col(events, ["ENCRYPTED_PAT_ID", "ENCRYPTED_PATID", "ENCRYPTED_PATIENT_ID"])
+    if not events_pid_col:
+        raise ValueError("stage_event_level.csv missing ENCRYPTED_PAT_ID")
+    events = ensure_pid(events, events_pid_col, out_pid="ENCRYPTED_PAT_ID")
+    if "STAGE" in events.columns:
+        events["STAGE_N"] = events["STAGE"].map(lambda x: norm(x).upper())
+    else:
+        events["STAGE_N"] = ""
+
+    # required columns
     for c in ["GOLD_HAS_STAGE2", "PRED_HAS_STAGE2"]:
         if c not in mism.columns:
             raise ValueError("Mismatches missing required column: {}".format(c))
 
-    mism_mrn_col = pick_col(mism, ["MRN", "mrn"])
-    if not mism_mrn_col:
-        raise ValueError("Mismatches file missing MRN column.")
+    # maps from staging
+    mrn_raw_map, mrn_dig_map = build_mrn_pid_map()
 
-    events_pid_col = pick_col(events, ["ENCRYPTED_PAT_ID", "ENCRYPTED_PATID", "ENCRYPTED_PATIENT_ID"])
-    if not events_pid_col:
-        raise ValueError("stage_event_level missing ENCRYPTED_PAT_ID column.")
+    # attach pid to mismatches robustly
+    mism2 = map_pid_for_mismatches(mism, merged, mrn_raw_map, mrn_dig_map)
 
-    events = events.copy()
-    events["ENCRYPTED_PAT_ID"] = events[events_pid_col].map(norm)
+    # split FP / FN
+    fp = mism2[(mism2["GOLD_HAS_STAGE2"].astype(str).str.strip() == "0") &
+               (mism2["PRED_HAS_STAGE2"].astype(str).str.strip() == "1")].copy()
 
-    # --- build MRN<->PID map from staging files
-    mrn_pid = build_mrn_pid_map()
+    fn = mism2[(mism2["GOLD_HAS_STAGE2"].astype(str).str.strip() == "1") &
+               (mism2["PRED_HAS_STAGE2"].astype(str).str.strip() == "0")].copy()
 
-    # --- split FP / FN
-    fp = mism[(mism["GOLD_HAS_STAGE2"].astype(str).str.strip() == "0") &
-              (mism["PRED_HAS_STAGE2"].astype(str).str.strip() == "1")].copy()
-
-    fn = mism[(mism["GOLD_HAS_STAGE2"].astype(str).str.strip() == "1") &
-              (mism["PRED_HAS_STAGE2"].astype(str).str.strip() == "0")].copy()
-
-    # Always write FN list
     fn_out = os.path.join(OUT, "audit_fn_patients.csv")
     fn.to_csv(fn_out, index=False)
 
-    # --- global bucket distribution (all predicted stage2)
+    # global bucket summary
     bucket_all = pd.DataFrame(columns=["DETECTION_BUCKET", "Total_predictions"])
-    if "STAGE" in events.columns and "DETECTION_BUCKET" in events.columns:
-        all_stage2 = events[events["STAGE"] == "STAGE2"].copy()
+    if "DETECTION_BUCKET" in events.columns:
+        all_stage2 = events[events["STAGE_N"] == "STAGE2"].copy()
         if not all_stage2.empty:
             bucket_all = (
                 all_stage2.groupby("DETECTION_BUCKET")
@@ -154,18 +247,15 @@ def main():
     bucket_all_out = os.path.join(OUT, "audit_bucket_summary.csv")
     bucket_all.to_csv(bucket_all_out, index=False)
 
-    # --- FP join: MRN -> PID -> stage_event_level
-    fp_work = fp.copy()
-    fp_work["MRN"] = fp_work[mism_mrn_col].map(norm)
-    fp_work = fp_work.merge(mrn_pid, on="MRN", how="left")
-
-    fp_ids = set([x for x in fp_work["ENCRYPTED_PAT_ID"].map(norm).tolist() if x])
+    # FP events
+    fp["ENCRYPTED_PAT_ID"] = fp["ENCRYPTED_PAT_ID"].map(norm)
+    fp_ids = set([x for x in fp["ENCRYPTED_PAT_ID"].tolist() if x])
 
     fp_events = pd.DataFrame()
-    if fp_ids and ("STAGE" in events.columns):
-        fp_events = events[(events["ENCRYPTED_PAT_ID"].isin(fp_ids)) & (events["STAGE"] == "STAGE2")].copy()
+    if fp_ids:
+        fp_events = events[(events["ENCRYPTED_PAT_ID"].isin(fp_ids)) & (events["STAGE_N"] == "STAGE2")].copy()
 
-    # --- FP by bucket
+    # FP by bucket
     fp_by_bucket = pd.DataFrame(columns=["DETECTION_BUCKET", "FP_count"])
     if not fp_events.empty and "DETECTION_BUCKET" in fp_events.columns:
         fp_by_bucket = (
@@ -177,9 +267,9 @@ def main():
     fp_bucket_out = os.path.join(OUT, "audit_fp_by_bucket.csv")
     fp_by_bucket.to_csv(fp_bucket_out, index=False)
 
-    # --- Bucket x NOTE_TYPE breakdown
+    # bucket x note type
     bucket_note = pd.DataFrame(columns=["DETECTION_BUCKET", "NOTE_TYPE", "count"])
-    if not fp_events.empty and "DETECTION_BUCKET" in fp_events.columns and "NOTE_TYPE" in fp_events.columns:
+    if not fp_events.empty and ("DETECTION_BUCKET" in fp_events.columns) and ("NOTE_TYPE" in fp_events.columns):
         bucket_note = (
             fp_events.groupby(["DETECTION_BUCKET", "NOTE_TYPE"])
             .size()
@@ -189,7 +279,7 @@ def main():
     bucket_note_out = os.path.join(OUT, "audit_bucket_noteType_breakdown.csv")
     bucket_note.to_csv(bucket_note_out, index=False)
 
-    # --- quick sample for human review (top 200 rows)
+    # sample evidence rows
     sample_cols = [c for c in [
         "ENCRYPTED_PAT_ID", "EVENT_DATE", "NOTE_ID", "NOTE_TYPE",
         "DETECTION_BUCKET", "PATTERN_NAME", "IS_OPERATIVE_CONTEXT", "EVIDENCE_SNIPPET"
@@ -198,12 +288,27 @@ def main():
     fp_sample_out = os.path.join(OUT, "audit_fp_events_sample.csv")
     fp_sample.to_csv(fp_sample_out, index=False)
 
+    # debug counts
+    debug = pd.DataFrame([{
+        "mism_rows": len(mism),
+        "mism_rows_with_pid_after_mapping": int((mism2["ENCRYPTED_PAT_ID"].map(norm) != "").sum()),
+        "fp_rows": len(fp),
+        "fp_rows_with_pid": int((fp["ENCRYPTED_PAT_ID"].map(norm) != "").sum()),
+        "unique_fp_pids": len(fp_ids),
+        "fp_events_rows_joined": len(fp_events),
+        "events_total": len(events),
+        "events_stage2_rows": int((events["STAGE_N"] == "STAGE2").sum())
+    }])
+    debug_out = os.path.join(OUT, "audit_link_debug.csv")
+    debug.to_csv(debug_out, index=False)
+
     print("Wrote:")
     print(" ", bucket_all_out)
     print(" ", fp_bucket_out)
     print(" ", bucket_note_out)
     print(" ", fp_sample_out)
     print(" ", fn_out)
+    print(" ", debug_out)
 
 if __name__ == "__main__":
     main()
