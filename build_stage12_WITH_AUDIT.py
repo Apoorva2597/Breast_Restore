@@ -1,5 +1,6 @@
 # =========================
-# Stage2 Anchor – Refined Logic + Audit (FIX: No objects to concatenate)
+# Stage2 Anchor – Refined Logic + Audit
+# (FIX: auto-map NOTE_DATE/NOTEID/TEXT column name variants)
 # =========================
 
 import pandas as pd
@@ -7,58 +8,66 @@ import re
 import os
 import glob
 
-# -------- PATHS --------
 BASE_DIR = "/home/apokol/Breast_Restore"
 OUTPUT_DIR = f"{BASE_DIR}/outputs"
 VALIDATION_FILE = f"{BASE_DIR}/stage2_gold_standard.csv"
-
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# -------- FILE RESOLVER --------
-def resolve_one(required_globs):
+def resolve_one(globs_list):
     hits = []
-    for g in required_globs:
+    for g in globs_list:
         hits.extend(glob.glob(g))
     hits = sorted(set(hits))
     return hits[0] if hits else None
 
-PATIENT_FILE = resolve_one([
-    f"{BASE_DIR}/HPI11526 Patient Notes.csv",
-    f"{BASE_DIR}/*Patient*Notes*.csv",
-])
-OP_FILE = resolve_one([
-    f"{BASE_DIR}/HPI11526 OP Notes.csv",
-    f"{BASE_DIR}/*OP*Notes*.csv",
-    f"{BASE_DIR}/*Operative*Notes*.csv",
-])
-CLINIC_FILE = resolve_one([
-    f"{BASE_DIR}/HPI11526 Clinic Notes.csv",
-    f"{BASE_DIR}/*Clinic*Notes*.csv",
-])
+PATIENT_FILE = resolve_one([f"{BASE_DIR}/*Patient*Notes*.csv", f"{BASE_DIR}/*patient*notes*.csv"])
+OP_FILE      = resolve_one([f"{BASE_DIR}/*OP*Notes*.csv", f"{BASE_DIR}/*Operative*Notes*.csv", f"{BASE_DIR}/*op*notes*.csv"])
+CLINIC_FILE  = resolve_one([f"{BASE_DIR}/*Clinic*Notes*.csv", f"{BASE_DIR}/*clinic*notes*.csv"])
 
-# -------- LOAD NOTES --------
 df_list = []
-
-for path, note_type in [
-    (PATIENT_FILE, "PATIENT"),
-    (OP_FILE, "OP NOTE"),
-    (CLINIC_FILE, "CLINIC NOTE"),
-]:
+for path, note_type in [(PATIENT_FILE, "PATIENT"), (OP_FILE, "OP NOTE"), (CLINIC_FILE, "CLINIC NOTE")]:
     if path and os.path.exists(path):
         tmp = pd.read_csv(path)
         tmp["NOTE_TYPE"] = note_type
         df_list.append(tmp)
 
 if not df_list:
-    raise SystemExit("ERROR: No note files found in /home/apokol/Breast_Restore (Patient/OP/Clinic).")
+    raise SystemExit("ERROR: No note files found in /home/apokol/Breast_Restore")
 
 notes = pd.concat(df_list, ignore_index=True)
 
-# -------- REQUIRED COLUMNS --------
-needed = {"ENCRYPTED_PAT_ID", "EVENT_DATE", "NOTE_ID", "NOTE_TEXT"}
-missing = [c for c in needed if c not in notes.columns]
+# -------- COLUMN NORMALIZATION / MAPPING --------
+def norm(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(s).strip().lower())
+
+notes.columns = [c.strip() for c in notes.columns]
+norm_map = {norm(c): c for c in notes.columns}
+
+CANDIDATES = {
+    "ENCRYPTED_PAT_ID": ["encryptedpatid", "encpatid", "patientid", "patid", "encrypted_patient_id", "encrypted_pat_id"],
+    "EVENT_DATE":       ["eventdate", "notedate", "servicedate", "documentdate", "date", "encounterdate"],
+    "NOTE_ID":          ["noteid", "note_id", "noteidentifier", "noteidentifierid", "note_key", "notekey", "documentid", "docid"],
+    "NOTE_TEXT":        ["notetext", "note_text", "text", "note", "documenttext", "content", "notecontent", "body"],
+}
+
+def pick_col(std_name):
+    for cand in CANDIDATES[std_name]:
+        if cand in norm_map:
+            return norm_map[cand]
+    return None
+
+rename_dict = {}
+for std in ["ENCRYPTED_PAT_ID", "EVENT_DATE", "NOTE_ID", "NOTE_TEXT"]:
+    src = pick_col(std)
+    if src is not None and src != std:
+        rename_dict[src] = std
+
+notes = notes.rename(columns=rename_dict)
+
+missing = [c for c in ["ENCRYPTED_PAT_ID", "EVENT_DATE", "NOTE_ID", "NOTE_TEXT"] if c not in notes.columns]
 if missing:
-    raise SystemExit(f"ERROR: Missing columns in notes: {missing}")
+    cols_preview = ", ".join(list(notes.columns)[:80])
+    raise SystemExit(f"ERROR: Missing columns after mapping: {missing}\nFOUND COLUMNS (first 80): {cols_preview}")
 
 notes["NOTE_TEXT"] = notes["NOTE_TEXT"].astype(str).str.lower()
 
@@ -81,14 +90,10 @@ PATTERNS = {
 }
 
 NEGATION = r"\b(no|not|without|denies|deferred|declined)\b"
-FUTURE = r"\b(will|plan|scheduled|planning|consider)\b"
+FUTURE   = r"\b(will|plan|scheduled|planning|consider)\b"
 
-# -------- CLASSIFIER --------
 def classify(text):
-    operative_context = bool(
-        re.search(r"\b(procedure|operation|intraop|incision|anesthesia|drain)\b", text)
-    )
-
+    operative_context = bool(re.search(r"\b(procedure|operation|intraop|incision|anesthesia|drain)\b", text))
     for bucket, patterns in PATTERNS.items():
         for pat in patterns:
             if re.search(pat, text):
@@ -97,10 +102,8 @@ def classify(text):
                 if re.search(FUTURE + r".{0,40}" + pat, text) and not operative_context:
                     continue
                 return bucket, pat, operative_context
-
     return None, None, False
 
-# -------- APPLY --------
 rows = []
 for _, r in notes.iterrows():
     bucket, pattern, operative = classify(r["NOTE_TEXT"])
@@ -120,15 +123,10 @@ pred_df["PRED_STAGE2"] = pred_df["DETECTION_BUCKET"].notnull().astype(int)
 
 # -------- VALIDATION --------
 gold = pd.read_csv(VALIDATION_FILE)
-
 if "NOTE_ID" not in gold.columns or "GOLD_STAGE2" not in gold.columns:
     raise SystemExit("ERROR: stage2_gold_standard.csv must contain NOTE_ID and GOLD_STAGE2.")
 
-merged = gold.merge(
-    pred_df[["NOTE_ID", "PRED_STAGE2"]],
-    on="NOTE_ID",
-    how="left",
-)
+merged = gold.merge(pred_df[["NOTE_ID", "PRED_STAGE2"]], on="NOTE_ID", how="left")
 merged["PRED_STAGE2"] = merged["PRED_STAGE2"].fillna(0).astype(int)
 
 TP = ((merged["GOLD_STAGE2"] == 1) & (merged["PRED_STAGE2"] == 1)).sum()
@@ -137,20 +135,19 @@ FN = ((merged["GOLD_STAGE2"] == 1) & (merged["PRED_STAGE2"] == 0)).sum()
 TN = ((merged["GOLD_STAGE2"] == 0) & (merged["PRED_STAGE2"] == 0)).sum()
 
 precision = TP / (TP + FP) if (TP + FP) else 0
-recall = TP / (TP + FN) if (TP + FN) else 0
-f1 = (2 * precision * recall) / (precision + recall) if (precision + recall) else 0
+recall    = TP / (TP + FN) if (TP + FN) else 0
+f1        = (2 * precision * recall) / (precision + recall) if (precision + recall) else 0
 
 print("Validation complete.")
 print("Stage2 Anchor:")
 print(f"TP={TP} FP={FP} FN={FN} TN={TN}")
 print(f"Precision={precision:.3f} Recall={recall:.3f} F1={f1:.3f}")
 
-# -------- AUDIT FILES --------
+# -------- AUDIT OUTPUTS --------
 pred_df.to_csv(f"{OUTPUT_DIR}/audit_fp_events_sample.csv", index=False)
 
 fp = merged[(merged["GOLD_STAGE2"] == 0) & (merged["PRED_STAGE2"] == 1)]
 fn = merged[(merged["GOLD_STAGE2"] == 1) & (merged["PRED_STAGE2"] == 0)]
-
 fp.to_csv(f"{OUTPUT_DIR}/audit_fp.csv", index=False)
 fn.to_csv(f"{OUTPUT_DIR}/audit_fn.csv", index=False)
 
