@@ -4,15 +4,17 @@
 """
 make_fp_deid_bundles_from_mrn.py
 
-FP definition (for your frozen summary file):
-    GOLD  = HAS_STAGE2
-    PRED  = HIT_COUNT > 0
+FP definition:
+  GOLD = Stage2_Applicable  (from gold_cleaned_for_cedar.csv)   [you confirmed this]
+  PRED = HIT_COUNT > 0      (from latest frozen stage2 summary)
 
-We export ENCRYPTED_PAT_IDs for FP cases only.
+FP mask:
+  (GOLD == 0) & (PRED == 1)
 
-This version auto-selects the latest:
-  _outputs/stage2_rules_*_patient_stage_summary.csv
-  _outputs/stage2_rules_*__patient_stage_summary.csv
+Exports:
+  _outputs/FP_deid_patient_ids.csv  (NO MRN column; only patient_id=ENCRYPTED_PAT_ID)
+Then runs:
+  batch_export_deid_note_bundles.py <that csv>
 """
 
 from __future__ import print_function
@@ -25,18 +27,20 @@ import pandas as pd
 
 
 ROOT = os.path.abspath(".")
-
 OUTPUTS_DIR = os.path.join(ROOT, "_outputs")
 
-# Auto-find the latest frozen summary (handles _patient_... and __patient_...)
+# ---- inputs
+GOLD_PATH = os.path.join(ROOT, "gold_cleaned_for_cedar.csv")
+OP_PATH   = os.path.join(ROOT, "_staging_inputs", "HPI11526 Operation Notes.csv")
+
+# auto-find latest frozen summary (handles _patient_... and __patient_...)
 SUMMARY_GLOBS = [
     os.path.join(OUTPUTS_DIR, "stage2_rules_*_patient_stage_summary.csv"),
     os.path.join(OUTPUTS_DIR, "stage2_rules_*__patient_stage_summary.csv"),
 ]
 
-OP_PATH = os.path.join(ROOT, "_staging_inputs", "HPI11526 Operation Notes.csv")
-
-OUT_IDS = os.path.join(ROOT, "_outputs", "FP_deid_patient_ids.csv")
+# ---- outputs
+OUT_IDS = os.path.join(OUTPUTS_DIR, "FP_deid_patient_ids.csv")  # NO MRN column
 BATCH_EXPORTER = os.path.join(ROOT, "batch_export_deid_note_bundles.py")
 
 
@@ -47,7 +51,6 @@ def find_latest_summary():
     candidates = sorted(set(candidates))
     if not candidates:
         return None
-    # pick most recently modified
     candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
     return candidates[0]
 
@@ -104,41 +107,89 @@ def pick_first_existing(df, options):
     return None
 
 
-def main():
+def pick_gold_stage2_applicable_col(gold_df):
+    """
+    You said GOLD should be Stage2_Applicable.
+    This tries common variants so it won't break if the exact casing differs.
+    """
+    options = [
+        "Stage2_Applicable", "STAGE2_APPLICABLE", "stage2_applicable",
+        "Stage2Applicable", "STAGE2APPLICABLE"
+    ]
+    c = pick_first_existing(gold_df, options)
+    if c:
+        return c
 
-    merged_path = find_latest_summary()
-    if not merged_path:
+    # last resort: fuzzy contains both 'stage2' and 'app'
+    for col in gold_df.columns:
+        u = col.upper()
+        if "STAGE2" in u and ("APPLIC" in u or "APPL" in u):
+            return col
+
+    return None
+
+
+def main():
+    summary_path = find_latest_summary()
+    if not summary_path:
         raise IOError("No frozen stage2 summary found in _outputs. Looked for: {}".format(SUMMARY_GLOBS))
 
-    if not os.path.isfile(OP_PATH):
-        raise IOError("Missing op-notes bridge file: {}".format(OP_PATH))
-    if not os.path.isfile(BATCH_EXPORTER):
-        raise IOError("Missing batch exporter script: {}".format(BATCH_EXPORTER))
+    for req in [GOLD_PATH, OP_PATH, BATCH_EXPORTER]:
+        if not os.path.isfile(req):
+            raise IOError("Missing required file: {}".format(req))
 
-    merged = normalize_cols(read_csv_robust(merged_path, dtype=str, low_memory=False))
-    op = normalize_cols(read_csv_robust(OP_PATH, dtype=str, low_memory=False))
+    # ---- load
+    summary = normalize_cols(read_csv_robust(summary_path, dtype=str, low_memory=False))
+    gold    = normalize_cols(read_csv_robust(GOLD_PATH,    dtype=str, low_memory=False))
+    op      = normalize_cols(read_csv_robust(OP_PATH,      dtype=str, low_memory=False))
 
-    # Required columns
-    required = ["MRN", "HAS_STAGE2", "HIT_COUNT"]
-    for r in required:
-        if r not in merged.columns:
-            raise ValueError("Summary file missing required column {}. Found: {}".format(r, list(merged.columns)))
+    # ---- summary must have MRN, HIT_COUNT
+    for col in ["MRN", "HIT_COUNT"]:
+        if col not in summary.columns:
+            raise ValueError("Summary missing required column {}. Found: {}".format(col, list(summary.columns)))
 
-    merged["MRN"] = merged["MRN"].map(normalize_mrn)
+    summary["MRN"] = summary["MRN"].map(normalize_mrn)
+    summary["HIT_COUNT"] = summary["HIT_COUNT"].fillna("").map(normalize_id)
 
-    # GOLD = HAS_STAGE2
-    gold = merged["HAS_STAGE2"].map(to01)
+    # ---- gold must have MRN + Stage2_Applicable
+    gold_mrn_col = pick_first_existing(gold, ["MRN", "mrn", "Patient_MRN", "PAT_MRN", "PATIENT_MRN"])
+    if not gold_mrn_col:
+        raise ValueError("Gold file missing MRN column. Found: {}".format(list(gold.columns)))
 
-    # PRED = HIT_COUNT > 0
-    pred = merged["HIT_COUNT"].apply(lambda x: 1 if to01(x) > 0 else 0)
+    gold_stage2_col = pick_gold_stage2_applicable_col(gold)
+    if not gold_stage2_col:
+        raise ValueError("Gold file missing Stage2_Applicable (or variant). Found: {}".format(list(gold.columns)))
 
-    # FP mask
-    fp_mask = (gold == 0) & (pred == 1)
+    gold["MRN"] = gold[gold_mrn_col].map(normalize_mrn)
+    gold["GOLD_STAGE2_APPLICABLE"] = gold[gold_stage2_col].map(to01)
 
-    fp_mrns = merged.loc[fp_mask, ["MRN"]].copy()
+    gold_small = gold[["MRN", "GOLD_STAGE2_APPLICABLE"]].drop_duplicates()
+
+    # ---- merge gold + prediction summary on MRN
+    m = summary.merge(gold_small, on="MRN", how="left")
+
+    # keep only rows where we have a gold label (optional; but safer)
+    m = m[m["GOLD_STAGE2_APPLICABLE"].notnull()].copy()
+    m["GOLD_STAGE2_APPLICABLE"] = m["GOLD_STAGE2_APPLICABLE"].fillna(0).astype(int)
+
+    # ---- PRED = HIT_COUNT > 0
+    def hitcount_to_pred(x):
+        s = str(x).strip()
+        if s == "" or s.lower() == "nan":
+            return 0
+        try:
+            return 1 if int(float(s)) > 0 else 0
+        except Exception:
+            return 0
+
+    m["PRED_HAS_STAGE2"] = m["HIT_COUNT"].map(hitcount_to_pred)
+
+    # ---- FP mask (GOLD==0 & PRED==1)
+    fp_mask = (m["GOLD_STAGE2_APPLICABLE"] == 0) & (m["PRED_HAS_STAGE2"] == 1)
+    fp_mrns = m.loc[fp_mask, ["MRN"]].copy()
     fp_mrns = fp_mrns[fp_mrns["MRN"] != ""].drop_duplicates()
 
-    # Build MRN <-> ENCRYPTED_PAT_ID map from op notes
+    # ---- build MRN -> ENCRYPTED_PAT_ID map from op-notes bridge
     op_mrn_col = pick_first_existing(op, ["MRN", "mrn"])
     op_enc_col = pick_first_existing(op, ["ENCRYPTED_PAT_ID", "ENCRYPTED_PATID", "ENCRYPTED_PATIENT_ID"])
     if not op_mrn_col or not op_enc_col:
@@ -146,28 +197,30 @@ def main():
 
     op["MRN"] = op[op_mrn_col].map(normalize_mrn)
     op["ENCRYPTED_PAT_ID"] = op[op_enc_col].map(normalize_id)
-
     id_map = op[["MRN", "ENCRYPTED_PAT_ID"]].drop_duplicates()
-    id_map = id_map[(id_map["MRN"] != "") & (id_map["ENCRYPTED_PAT_ID"] != "")]
+    id_map = id_map[(id_map["MRN"] != "") & (id_map["ENCRYPTED_PAT_ID"] != "")].copy()
 
-    # Map FP MRNs -> ENCRYPTED_PAT_ID
     fp_ids = fp_mrns.merge(id_map, on="MRN", how="left")
     fp_ids["ENCRYPTED_PAT_ID"] = fp_ids["ENCRYPTED_PAT_ID"].fillna("").map(normalize_id)
     fp_ids = fp_ids[fp_ids["ENCRYPTED_PAT_ID"] != ""].drop_duplicates(subset=["ENCRYPTED_PAT_ID"])
 
-    # Write export list WITHOUT MRN column
+    # ---- write export list WITHOUT MRN column
+    os.makedirs(OUTPUTS_DIR, exist_ok=True)
     out_df = pd.DataFrame({"patient_id": fp_ids["ENCRYPTED_PAT_ID"].tolist()})
     out_df.to_csv(OUT_IDS, index=False)
 
-    print("Using summary:", merged_path)
-    print("FP MRNs:", len(fp_mrns))
-    print("Mapped ENCRYPTED_PAT_IDs:", len(out_df))
-    print("Wrote (NO MRN column):", OUT_IDS)
+    # ---- print quick audit
+    print("Using summary: {}".format(summary_path))
+    print("Using gold:    {}".format(GOLD_PATH))
+    print("Gold col:      {}".format(gold_stage2_col))
+    print("FP MRNs:       {}".format(len(fp_mrns)))
+    print("Mapped IDs:    {}".format(len(out_df)))
+    print("Wrote (NO MRN): {}".format(OUT_IDS))
     print("")
 
-    # Run exporter
+    # ---- run exporter
     cmd = [sys.executable, BATCH_EXPORTER, OUT_IDS]
-    print("Running:", " ".join(cmd))
+    print("Running: {}".format(" ".join(cmd)))
     rc = subprocess.call(cmd)
     sys.exit(rc)
 
