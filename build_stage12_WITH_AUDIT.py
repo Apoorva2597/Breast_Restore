@@ -1,6 +1,7 @@
 # build_stage12_WITH_AUDIT.py
+# Python 3.6.8 compatible
 # STAGING ONLY — NO VALIDATION
-# Outputs remain unchanged:
+# Outputs (unchanged):
 #   _outputs/patient_stage_summary.csv
 #   _outputs/stage2_fn_raw_note_snippets.csv
 
@@ -14,7 +15,7 @@ OUTPUT_SUMMARY = "_outputs/patient_stage_summary.csv"
 OUTPUT_AUDIT = "_outputs/stage2_fn_raw_note_snippets.csv"
 
 # ----------------------------
-# STRICT INTRAOPERATIVE SIGNALS
+# REGEX DEFINITIONS
 # ----------------------------
 
 EXCHANGE_STRICT = re.compile(
@@ -40,7 +41,6 @@ EXCHANGE_STRICT = re.compile(
     re.IGNORECASE | re.VERBOSE | re.DOTALL,
 )
 
-# Intraoperative reinforcement signals
 INTRAOP_SIGNALS = re.compile(
     r"""
     (estimated\s+blood\s+loss|EBL|
@@ -52,12 +52,11 @@ INTRAOP_SIGNALS = re.compile(
      implant\s+placed|
      expander\s+removed|
      capsulotomy|capsulectomy|
-     ml\s+(removed|placed|instilled))
+     \bml\b\s+(removed|placed|instilled))
     """,
     re.IGNORECASE | re.VERBOSE,
 )
 
-# Negative context filters (exclude planning/history)
 NEGATIVE_CONTEXT = re.compile(
     r"""
     (scheduled\s+for|
@@ -66,7 +65,7 @@ NEGATIVE_CONTEXT = re.compile(
      considering|
      history\s+of|
      status\s+post|
-     s/p|
+     \bs/p\b|
      discussed|
      interested\s+in|
      plan:|
@@ -77,17 +76,16 @@ NEGATIVE_CONTEXT = re.compile(
 )
 
 # ----------------------------
-# HELPERS
+# LOGIC
 # ----------------------------
 
-def is_true_exchange(note_text: str) -> bool:
+def is_true_exchange(note_text):
     if not EXCHANGE_STRICT.search(note_text):
         return False
 
     if NEGATIVE_CONTEXT.search(note_text):
         return False
 
-    # Require intraoperative reinforcement
     if not INTRAOP_SIGNALS.search(note_text):
         return False
 
@@ -105,11 +103,17 @@ def get_snippet(text, match_obj, window=200):
 # ----------------------------
 
 def main():
-    df = pd.read_csv(INPUT_NOTES)
 
-    required_cols = {"ENCRYPTED_PAT_ID", "NOTE_ID", "NOTE_TEXT"}
+    # Fix UnicodeDecodeError (Python 3.6 safe handling)
+    df = pd.read_csv(
+        INPUT_NOTES,
+        encoding="latin1",
+        engine="python"
+    )
+
+    required_cols = set(["ENCRYPTED_PAT_ID", "NOTE_ID", "NOTE_TEXT"])
     if not required_cols.issubset(set(df.columns)):
-        raise ValueError(f"Input must contain columns: {required_cols}")
+        raise ValueError("Input must contain columns: ENCRYPTED_PAT_ID, NOTE_ID, NOTE_TEXT")
 
     stage2_patients = set()
     audit_rows = []
@@ -117,6 +121,7 @@ def main():
     total_events = 0
 
     for _, row in df.iterrows():
+
         pat_id = row["ENCRYPTED_PAT_ID"]
         note_id = row["NOTE_ID"]
         text = str(row["NOTE_TEXT"])
@@ -124,10 +129,12 @@ def main():
         total_events += 1
 
         if is_true_exchange(text):
+
             stage2_patients.add(pat_id)
 
             for match in EXCHANGE_STRICT.finditer(text):
                 snippet = get_snippet(text, match)
+
                 audit_rows.append({
                     "ENCRYPTED_PAT_ID": pat_id,
                     "NOTE_ID": note_id,
@@ -137,22 +144,24 @@ def main():
                 })
 
     # Patient-level summary
-    summary_df = pd.DataFrame({
-        "ENCRYPTED_PAT_ID": df["ENCRYPTED_PAT_ID"].unique()
-    })
+    unique_patients = df["ENCRYPTED_PAT_ID"].dropna().unique()
 
-    summary_df["STAGE2_ANCHOR"] = summary_df["ENCRYPTED_PAT_ID"].apply(
-        lambda x: 1 if x in stage2_patients else 0
-    )
+    summary_rows = []
+    for pid in unique_patients:
+        summary_rows.append({
+            "ENCRYPTED_PAT_ID": pid,
+            "STAGE2_ANCHOR": 1 if pid in stage2_patients else 0
+        })
 
+    summary_df = pd.DataFrame(summary_rows)
     summary_df.to_csv(OUTPUT_SUMMARY, index=False)
 
     audit_df = pd.DataFrame(audit_rows)
     audit_df.to_csv(OUTPUT_AUDIT, index=False)
 
     print("Staging complete.")
-    print(f"Patients: {summary_df.shape[0]}")
-    print(f"Events: {total_events}")
+    print("Patients:", len(unique_patients))
+    print("Events:", total_events)
 
 
 if __name__ == "__main__":
