@@ -1,13 +1,17 @@
-# build_stage12_WITH_AUDIT.py
-# Python 3.6.8 compatible
-# STAGING ONLY — NO VALIDATION
-# Outputs (unchanged):
-#   _outputs/patient_stage_summary.csv
-#   _outputs/stage2_fn_raw_note_snippets.csv
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+build_stage12_WITH_AUDIT.py
+Python 3.6.8 compatible
 
+STAGING ONLY — produces:
+  ./_outputs/patient_stage_summary.csv   (must contain HAS_STAGE2)
+  ./_outputs/stage2_fn_raw_note_snippets.csv
+"""
+
+from __future__ import print_function
 import os
 import re
-import csv
 import pandas as pd
 
 INPUT_NOTES = "_staging_inputs/HPI11526 Operation Notes.csv"
@@ -15,7 +19,19 @@ OUTPUT_SUMMARY = "_outputs/patient_stage_summary.csv"
 OUTPUT_AUDIT = "_outputs/stage2_fn_raw_note_snippets.csv"
 
 # ----------------------------
-# REGEX DEFINITIONS
+# Robust CSV reader (match validator style)
+# ----------------------------
+
+def read_csv_robust(path, **kwargs):
+    for enc in ["utf-8", "utf-8-sig", "cp1252", "latin1"]:
+        try:
+            return pd.read_csv(path, encoding=enc, **kwargs)
+        except UnicodeDecodeError:
+            continue
+    raise IOError("Failed to read CSV with common encodings: {}".format(path))
+
+# ----------------------------
+# Regex Logic
 # ----------------------------
 
 EXCHANGE_STRICT = re.compile(
@@ -75,58 +91,54 @@ NEGATIVE_CONTEXT = re.compile(
     re.IGNORECASE | re.VERBOSE,
 )
 
-# ----------------------------
-# LOGIC
-# ----------------------------
-
-def is_true_exchange(note_text):
-    if not EXCHANGE_STRICT.search(note_text):
+def is_true_exchange(text):
+    if not EXCHANGE_STRICT.search(text):
         return False
-
-    if NEGATIVE_CONTEXT.search(note_text):
+    if NEGATIVE_CONTEXT.search(text):
         return False
-
-    if not INTRAOP_SIGNALS.search(note_text):
+    if not INTRAOP_SIGNALS.search(text):
         return False
-
     return True
-
 
 def get_snippet(text, match_obj, window=200):
     start = max(match_obj.start() - window, 0)
     end = min(match_obj.end() + window, len(text))
     return text[start:end].replace("\n", " ").strip()
 
-
 # ----------------------------
-# MAIN
+# Main
 # ----------------------------
 
 def main():
 
-    # Fix UnicodeDecodeError (Python 3.6 safe handling)
-    df = pd.read_csv(
-        INPUT_NOTES,
-        encoding="latin1",
-        engine="python"
-    )
+    root = os.path.abspath(".")
+    out_dir = os.path.join(root, "_outputs")
+    if not os.path.isdir(out_dir):
+        os.makedirs(out_dir)
 
-    required_cols = set(["ENCRYPTED_PAT_ID", "NOTE_ID", "NOTE_TEXT"])
-    if not required_cols.issubset(set(df.columns)):
-        raise ValueError("Input must contain columns: ENCRYPTED_PAT_ID, NOTE_ID, NOTE_TEXT")
+    if not os.path.isfile(INPUT_NOTES):
+        raise IOError("Operation Notes CSV not found: {}".format(INPUT_NOTES))
+
+    df = read_csv_robust(INPUT_NOTES, dtype=str, low_memory=False)
+
+    required_cols = ["ENCRYPTED_PAT_ID", "NOTE_ID", "NOTE_TEXT"]
+    for c in required_cols:
+        if c not in df.columns:
+            raise ValueError("Missing required column: {}. Found: {}".format(c, list(df.columns)))
+
+    df["ENCRYPTED_PAT_ID"] = df["ENCRYPTED_PAT_ID"].fillna("").astype(str)
 
     stage2_patients = set()
     audit_rows = []
 
-    total_events = 0
-
     for _, row in df.iterrows():
 
-        pat_id = row["ENCRYPTED_PAT_ID"]
-        note_id = row["NOTE_ID"]
+        pat_id = str(row["ENCRYPTED_PAT_ID"]).strip()
+        note_id = str(row["NOTE_ID"])
         text = str(row["NOTE_TEXT"])
 
-        total_events += 1
+        if not pat_id:
+            continue
 
         if is_true_exchange(text):
 
@@ -134,7 +146,6 @@ def main():
 
             for match in EXCHANGE_STRICT.finditer(text):
                 snippet = get_snippet(text, match)
-
                 audit_rows.append({
                     "ENCRYPTED_PAT_ID": pat_id,
                     "NOTE_ID": note_id,
@@ -143,14 +154,18 @@ def main():
                     "SOURCE_FILE": os.path.basename(INPUT_NOTES),
                 })
 
-    # Patient-level summary
+    # ----------------------------
+    # Build patient_stage_summary.csv
+    # MUST contain: ENCRYPTED_PAT_ID + HAS_STAGE2
+    # ----------------------------
+
     unique_patients = df["ENCRYPTED_PAT_ID"].dropna().unique()
 
     summary_rows = []
     for pid in unique_patients:
         summary_rows.append({
             "ENCRYPTED_PAT_ID": pid,
-            "STAGE2_ANCHOR": 1 if pid in stage2_patients else 0
+            "HAS_STAGE2": 1 if pid in stage2_patients else 0
         })
 
     summary_df = pd.DataFrame(summary_rows)
@@ -161,8 +176,7 @@ def main():
 
     print("Staging complete.")
     print("Patients:", len(unique_patients))
-    print("Events:", total_events)
-
+    print("Stage2 positive patients:", len(stage2_patients))
 
 if __name__ == "__main__":
     main()
