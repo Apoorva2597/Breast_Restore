@@ -3,13 +3,10 @@
 
 """
 build_stage12_WITH_AUDIT.py
-Python 3.6.8 compatible
+Revised strict Stage2 logic (captures definitive implant state
+even in progress notes).
 
-Outputs:
-  ./_outputs/patient_stage_summary.csv
-  ./_outputs/stage2_audit_event_hits.csv
-  ./_outputs/stage2_audit_bucket_counts.csv
-  ./_outputs/stage2_candidate_planning_hits.csv
+Python 3.6.8 compatible
 """
 
 from __future__ import print_function
@@ -75,41 +72,44 @@ def pick_first_existing(df, options):
 # REGEX PATTERNS
 # ==============================
 
-OPERATIVE_TYPES = ["OPERATIVE", "OP NOTE", "BRIEF OP", "SURGICAL"]
-
-PATTERN_EXCHANGE = re.compile(r"(exchange|exchanged|removal).*?(expander).*?(implant)", re.I)
-PATTERN_IMPLANT_IN = re.compile(r"(silicone|permanent)?\s*implants?\s+(are|were)\s+in", re.I)
+# High confidence procedural patterns
+PATTERN_EXCHANGE = re.compile(r"(exchange|exchanged).*?(expander).*?(implant)", re.I)
 PATTERN_EXPANDER_REMOVED = re.compile(r"(expander).*?(removed|removal)", re.I)
 PATTERN_SECOND_STAGE = re.compile(r"(second stage reconstruction|stage\s*2 reconstruction)", re.I)
 PATTERN_IMPLANT_PLACEMENT = re.compile(r"(implant).*?(placement|inserted|insertion)", re.I)
 PATTERN_SP_EXPANDER = re.compile(r"s/p.*expander.*implant", re.I)
 
+# Definitive implant-state language (allowed in progress notes)
+PATTERN_IMPLANTS_IN = re.compile(
+    r"(silicone implants? (are|were) in|"
+    r"implants? (are|were) in|"
+    r"now with silicone implants|"
+    r"status post exchange.*implant)",
+    re.I
+)
+
+# Planning exclusion
 PATTERN_PLANNING = re.compile(
-    r"(planning|considering|candidate).*?(implant|reconstruction)",
+    r"(planning|considering|candidate for).*?(implant|reconstruction)",
     re.I
 )
 
 
-def is_operative(note_type):
-    if not note_type:
-        return False
-    nt = str(note_type).upper()
-    return any(x in nt for x in OPERATIVE_TYPES)
+# ==============================
+# STAGE 2 DETECTION
+# ==============================
 
-
-def detect_stage2_strict(text, note_type):
+def detect_stage2_strict(text):
     if not text:
-        return 0
-    if not is_operative(note_type):
         return 0
 
     if (
         PATTERN_EXCHANGE.search(text)
-        or PATTERN_IMPLANT_IN.search(text)
         or PATTERN_EXPANDER_REMOVED.search(text)
         or PATTERN_SECOND_STAGE.search(text)
         or PATTERN_IMPLANT_PLACEMENT.search(text)
         or PATTERN_SP_EXPANDER.search(text)
+        or PATTERN_IMPLANTS_IN.search(text)
     ):
         return 1
 
@@ -139,7 +139,7 @@ def main():
     type_col = pick_first_existing(df, ["NOTE_TYPE", "NOTE TYPE"])
 
     if not enc_col or not mrn_col or not text_col:
-        raise ValueError("Missing required columns in notes file.")
+        raise ValueError("Missing required columns.")
 
     df["ENCRYPTED_PAT_ID"] = df[enc_col].map(normalize_id)
     df["MRN"] = df[mrn_col].map(normalize_id)
@@ -154,10 +154,13 @@ def main():
         pid = row["ENCRYPTED_PAT_ID"]
         mrn = row["MRN"]
         text = row["NOTE_TEXT"]
-        ntype = row["NOTE_TYPE"]
 
-        strict = detect_stage2_strict(text, ntype)
+        strict = detect_stage2_strict(text)
         planning = detect_candidate_planning(text)
+
+        # Exclude pure planning if no definitive implant state
+        if planning == 1 and strict == 0:
+            strict = 0
 
         strict_flags.append(strict)
         planning_flags.append(planning)
@@ -166,26 +169,17 @@ def main():
             audit_rows.append({
                 "ENCRYPTED_PAT_ID": pid,
                 "MRN": mrn,
-                "NOTE_TYPE": ntype,
-                "SNIPPET": text[:500]
+                "NOTE_TYPE": row["NOTE_TYPE"],
+                "SNIPPET": text[:600]
             })
 
-    df["HAS_STAGE2_STRICT"] = strict_flags
+    df["HAS_STAGE2"] = strict_flags
     df["CANDIDATE_PLANNING"] = planning_flags
 
-    # Collapse to patient level
     summary = df.groupby(["ENCRYPTED_PAT_ID", "MRN"], as_index=False).agg({
-        "HAS_STAGE2_STRICT": "max",
+        "HAS_STAGE2": "max",
         "CANDIDATE_PLANNING": "max"
     })
-
-    summary = summary.rename(columns={
-        "HAS_STAGE2_STRICT": "HAS_STAGE2"
-    })
-
-    # ======================
-    # OUTPUTS
-    # ======================
 
     summary.to_csv(OUT_SUMMARY, index=False)
 
@@ -195,7 +189,7 @@ def main():
     bucket_counts = pd.DataFrame({
         "Metric": [
             "Patients",
-            "HAS_STAGE2=1 (strict)",
+            "HAS_STAGE2=1",
             "CANDIDATE_PLANNING=1"
         ],
         "Count": [
