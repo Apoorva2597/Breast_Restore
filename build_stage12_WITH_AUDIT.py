@@ -1,221 +1,140 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
-"""
-build_stage12_WITH_AUDIT.py
-Revised strict Stage2 logic (captures definitive implant state
-even in progress notes).
-
-Python 3.6.8 compatible
-"""
-
-from __future__ import print_function
-import os
-import re
 import pandas as pd
-
+import re
+from pathlib import Path
 
 # ==============================
-# PATHS
+# CONFIG
 # ==============================
 
-ROOT = os.path.abspath(".")
-INPUT_NOTES = os.path.join(ROOT, "_staging_inputs", "HPI11526 Operation Notes.csv")
+GOLD_PATH = "/home/apokol/Breast_Restore/gold_cleaned_for_cedar.csv"
+NOTES_V3_PATH = "/home/apokol/Breast_Restore/_staging_inputs/DEID_FULLTEXT_HPI11526_Clinic_Notes_CTXWIPE_v3.csv"
+NOTES_V4_PATH = "/home/apokol/Breast_Restore/_staging_inputs/DEID_FULLTEXT_HPI11526_NOTES_CTXWIPE_v4.csv"
 
-OUT_DIR = os.path.join(ROOT, "_outputs")
-if not os.path.isdir(OUT_DIR):
-    os.makedirs(OUT_DIR)
+OUTPUT_SUMMARY = "/home/apokol/Breast_Restore/_outputs/patient_stage_summary.csv"
+OUTPUT_HITS = "/home/apokol/Breast_Restore/_outputs/stage2_event_hits.csv"
 
-OUT_SUMMARY = os.path.join(OUT_DIR, "patient_stage_summary.csv")
-OUT_AUDIT = os.path.join(OUT_DIR, "stage2_audit_event_hits.csv")
-OUT_BUCKET = os.path.join(OUT_DIR, "stage2_audit_bucket_counts.csv")
-OUT_PLANNING = os.path.join(OUT_DIR, "stage2_candidate_planning_hits.csv")
+# ==============================
+# STAGE 2 DEFINITIONS
+# ==============================
 
+STAGE2_IMPLANT_PATTERNS = [
+    r"exchange.*tissue expander.*implant",
+    r"expander.*exchange.*implant",
+    r"exchange to (silicone|implant)",
+    r"silicone implants? (are )?in",
+    r"s/p.*exchange.*implant",
+    r"tissue expander.*removed.*implant",
+]
+
+NEGATION_PATTERNS = [
+    r"no implants in log",
+    r"no implant",
+    r"implant not placed",
+]
+
+CONTEXT_WINDOW = 250  # characters before/after match
 
 # ==============================
 # HELPERS
 # ==============================
 
-def read_csv_robust(path, **kwargs):
-    for enc in ["utf-8", "utf-8-sig", "cp1252", "latin1"]:
-        try:
-            return pd.read_csv(path, encoding=enc, **kwargs)
-        except UnicodeDecodeError:
-            continue
-    raise IOError("Could not read CSV: {}".format(path))
+def compile_patterns(pattern_list):
+    return [re.compile(p, re.IGNORECASE | re.DOTALL) for p in pattern_list]
 
+IMPLANT_REGEX = compile_patterns(STAGE2_IMPLANT_PATTERNS)
+NEGATION_REGEX = compile_patterns(NEGATION_PATTERNS)
 
-def normalize_cols(df):
-    df.columns = [str(c).replace(u"\xa0", " ").strip() for c in df.columns]
-    return df
+def contains_negation(text):
+    for rx in NEGATION_REGEX:
+        if rx.search(text):
+            return True
+    return False
 
-
-def normalize_id(x):
-    if x is None:
-        return ""
-    s = str(x).strip()
-    if not s or s.lower() == "nan":
-        return ""
-    if s.endswith(".0") and s[:-2].isdigit():
-        return s[:-2]
-    return s
-
-
-def pick_first_existing(df, options):
-    for c in options:
-        if c in df.columns:
-            return c
-    return None
-
+def find_stage2_hits(text):
+    hits = []
+    for rx in IMPLANT_REGEX:
+        for m in rx.finditer(text):
+            start = max(0, m.start() - CONTEXT_WINDOW)
+            end = min(len(text), m.end() + CONTEXT_WINDOW)
+            snippet = text[start:end].replace("\n", " ")
+            if not contains_negation(snippet):
+                hits.append(snippet)
+    return hits
 
 # ==============================
-# REGEX PATTERNS
+# LOAD DATA
 # ==============================
 
-# High confidence procedural patterns
-PATTERN_EXCHANGE = re.compile(r"(exchange|exchanged).*?(expander).*?(implant)", re.I)
-PATTERN_EXPANDER_REMOVED = re.compile(r"(expander).*?(removed|removal)", re.I)
-PATTERN_SECOND_STAGE = re.compile(r"(second stage reconstruction|stage\s*2 reconstruction)", re.I)
-PATTERN_IMPLANT_PLACEMENT = re.compile(r"(implant).*?(placement|inserted|insertion)", re.I)
-PATTERN_SP_EXPANDER = re.compile(r"s/p.*expander.*implant", re.I)
+print("Loading gold...")
+gold = pd.read_csv(GOLD_PATH)
 
-# Definitive implant-state language (allowed in progress notes)
-PATTERN_IMPLANTS_IN = re.compile(
-    r"(silicone implants? (are|were) in|"
-    r"implants? (are|were) in|"
-    r"now with silicone implants|"
-    r"status post exchange.*implant)",
-    re.I
-)
+print("Loading notes...")
+notes_v3 = pd.read_csv(NOTES_V3_PATH)
+notes_v4 = pd.read_csv(NOTES_V4_PATH)
 
-# Planning exclusion
-PATTERN_PLANNING = re.compile(
-    r"(planning|considering|candidate for).*?(implant|reconstruction)",
-    re.I
-)
+notes = pd.concat([notes_v3, notes_v4], ignore_index=True)
 
+# Ensure required columns exist
+required_cols = {"ENCRYPTED_PAT_ID", "NOTE_TEXT_DEID"}
+if not required_cols.issubset(notes.columns):
+    raise RuntimeError("Missing required columns in notes file.")
 
 # ==============================
-# STAGE 2 DETECTION
+# AGGREGATE NOTES BY PATIENT
 # ==============================
 
-def detect_stage2_strict(text):
-    if not text:
-        return 0
-
-    if (
-        PATTERN_EXCHANGE.search(text)
-        or PATTERN_EXPANDER_REMOVED.search(text)
-        or PATTERN_SECOND_STAGE.search(text)
-        or PATTERN_IMPLANT_PLACEMENT.search(text)
-        or PATTERN_SP_EXPANDER.search(text)
-        or PATTERN_IMPLANTS_IN.search(text)
-    ):
-        return 1
-
-    return 0
-
-
-def detect_candidate_planning(text):
-    if not text:
-        return 0
-    return 1 if PATTERN_PLANNING.search(text) else 0
-
+print("Aggregating notes by patient...")
+notes_grouped = notes.groupby("ENCRYPTED_PAT_ID")["NOTE_TEXT_DEID"].apply(
+    lambda x: " ".join(x.astype(str))
+).reset_index()
 
 # ==============================
-# MAIN
+# DETECT STAGE 2
 # ==============================
 
-def main():
+print("Detecting Stage 2 events...")
+summary_rows = []
+hit_rows = []
 
-    if not os.path.isfile(INPUT_NOTES):
-        raise IOError("Missing input notes file: {}".format(INPUT_NOTES))
+for _, row in notes_grouped.iterrows():
+    pid = row["ENCRYPTED_PAT_ID"]
+    text = row["NOTE_TEXT_DEID"]
 
-    df = normalize_cols(read_csv_robust(INPUT_NOTES, dtype=str, low_memory=False))
+    hits = find_stage2_hits(text)
 
-    enc_col = pick_first_existing(df, ["ENCRYPTED_PAT_ID", "ENCRYPTED_PATID"])
-    mrn_col = pick_first_existing(df, ["MRN", "mrn"])
-    text_col = pick_first_existing(df, ["NOTE_TEXT", "NOTE_TEXT_DEID", "TEXT"])
-    type_col = pick_first_existing(df, ["NOTE_TYPE", "NOTE TYPE"])
+    has_stage2 = 1 if len(hits) > 0 else 0
 
-    if not enc_col or not mrn_col or not text_col:
-        raise ValueError("Missing required columns.")
-
-    df["ENCRYPTED_PAT_ID"] = df[enc_col].map(normalize_id)
-    df["MRN"] = df[mrn_col].map(normalize_id)
-    df["NOTE_TEXT"] = df[text_col].fillna("")
-    df["NOTE_TYPE"] = df[type_col] if type_col else ""
-
-    strict_flags = []
-    planning_flags = []
-    audit_rows = []
-
-    for _, row in df.iterrows():
-        pid = row["ENCRYPTED_PAT_ID"]
-        mrn = row["MRN"]
-        text = row["NOTE_TEXT"]
-
-        strict = detect_stage2_strict(text)
-        planning = detect_candidate_planning(text)
-
-        # Exclude pure planning if no definitive implant state
-        if planning == 1 and strict == 0:
-            strict = 0
-
-        strict_flags.append(strict)
-        planning_flags.append(planning)
-
-        if strict == 1:
-            audit_rows.append({
-                "ENCRYPTED_PAT_ID": pid,
-                "MRN": mrn,
-                "NOTE_TYPE": row["NOTE_TYPE"],
-                "SNIPPET": text[:600]
-            })
-
-    df["HAS_STAGE2"] = strict_flags
-    df["CANDIDATE_PLANNING"] = planning_flags
-
-    summary = df.groupby(["ENCRYPTED_PAT_ID", "MRN"], as_index=False).agg({
-        "HAS_STAGE2": "max",
-        "CANDIDATE_PLANNING": "max"
+    summary_rows.append({
+        "ENCRYPTED_PAT_ID": pid,
+        "HAS_STAGE2": has_stage2,
+        "HIT_COUNT": len(hits)
     })
 
-    summary.to_csv(OUT_SUMMARY, index=False)
+    for h in hits:
+        hit_rows.append({
+            "ENCRYPTED_PAT_ID": pid,
+            "SNIPPET": h
+        })
 
-    audit_df = pd.DataFrame(audit_rows)
-    audit_df.to_csv(OUT_AUDIT, index=False)
+summary_df = pd.DataFrame(summary_rows)
+hits_df = pd.DataFrame(hit_rows)
 
-    bucket_counts = pd.DataFrame({
-        "Metric": [
-            "Patients",
-            "HAS_STAGE2=1",
-            "CANDIDATE_PLANNING=1"
-        ],
-        "Count": [
-            len(summary),
-            int(summary["HAS_STAGE2"].sum()),
-            int(summary["CANDIDATE_PLANNING"].sum())
-        ]
-    })
+# ==============================
+# MERGE WITH GOLD
+# ==============================
 
-    bucket_counts.to_csv(OUT_BUCKET, index=False)
+print("Merging with gold...")
+merged = gold.merge(summary_df, on="ENCRYPTED_PAT_ID", how="left")
+merged["HAS_STAGE2"] = merged["HAS_STAGE2"].fillna(0).astype(int)
 
-    planning_hits = df[df["CANDIDATE_PLANNING"] == 1][
-        ["ENCRYPTED_PAT_ID", "MRN", "NOTE_TYPE"]
-    ]
-    planning_hits.to_csv(OUT_PLANNING, index=False)
+# ==============================
+# SAVE OUTPUTS
+# ==============================
 
-    print("Staging complete.")
-    print("Patients:", len(summary))
-    print("HAS_STAGE2=1:", int(summary["HAS_STAGE2"].sum()))
-    print("CANDIDATE_PLANNING=1:", int(summary["CANDIDATE_PLANNING"].sum()))
-    print("Wrote:")
-    print(" ", OUT_SUMMARY)
-    print(" ", OUT_AUDIT)
-    print(" ", OUT_BUCKET)
-    print(" ", OUT_PLANNING)
+print("Writing outputs...")
+merged.to_csv(OUTPUT_SUMMARY, index=False)
+hits_df.to_csv(OUTPUT_HITS, index=False)
 
-
-if __name__ == "__main__":
-    main()
+print("Done.")
