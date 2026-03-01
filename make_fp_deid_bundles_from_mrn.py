@@ -31,7 +31,7 @@ ROOT = os.path.abspath(".")
 MERGED_PATH = os.path.join(
     ROOT,
     "_outputs",
-    "stage2_rules_20260301_135501_validation_merged.csv")  
+    "stage2_rules_20260301_135501__patient_stage_summary.csv")  
   
 OP_PATH = os.path.join(ROOT, "_staging_inputs", "HPI11526 Operation Notes.csv")
 
