@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-# build_stage12_WITH_AUDIT.py  (pandas compatible w/ older versions: no on_bad_lines, no encoding_errors)
+# build_stage12_WITH_AUDIT.py
+# Uses MRN as the merge key
 
 import os
 import re
@@ -7,7 +8,7 @@ import pandas as pd
 from glob import glob
 
 # ==============================
-# CONFIG (ORIGINAL source files)
+# CONFIG
 # ==============================
 
 GOLD_PATH = "/home/apokol/Breast_Restore/gold_cleaned_for_cedar.csv"
@@ -23,8 +24,10 @@ FALLBACK_GLOBS = [
 OUTPUT_SUMMARY = "/home/apokol/Breast_Restore/_outputs/patient_stage_summary.csv"
 OUTPUT_HITS    = "/home/apokol/Breast_Restore/_outputs/stage2_event_hits.csv"
 
+MERGE_KEY = "MRN"
+
 # ==============================
-# STAGE 2 DEFINITIONS
+# STAGE 2 PATTERNS
 # ==============================
 
 STAGE2_IMPLANT_PATTERNS = [
@@ -42,7 +45,7 @@ NEGATION_PATTERNS = [
     r"\bimplant not placed\b",
 ]
 
-CONTEXT_WINDOW = 250  # chars before/after match
+CONTEXT_WINDOW = 250
 
 IMPLANT_REGEX  = [re.compile(p, re.IGNORECASE | re.DOTALL) for p in STAGE2_IMPLANT_PATTERNS]
 NEGATION_REGEX = [re.compile(p, re.IGNORECASE | re.DOTALL) for p in NEGATION_PATTERNS]
@@ -57,30 +60,27 @@ def resolve_existing_path(primary_path, fallback_glob):
     matches = glob(fallback_glob, recursive=True)
     return sorted(matches)[0] if matches else None
 
-def read_notes_csv(path):
-    """
-    pandas<1.3 compatibility:
-      - use error_bad_lines/warn_bad_lines instead of on_bad_lines
-      - avoid encoding_errors
-    """
+def read_csv_robust(path):
     try:
-        return pd.read_csv(
-            path,
-            dtype=str,
-            engine="python",
-            error_bad_lines=False,   # deprecated in newer pandas, but works in older
-            warn_bad_lines=True      # deprecated in newer pandas, but works in older
-        )
+        df = pd.read_csv(path, dtype=str, engine="python",
+                         error_bad_lines=False, warn_bad_lines=True)
     except UnicodeDecodeError:
-        # fallback if file contains non-utf8 bytes
-        return pd.read_csv(
-            path,
-            dtype=str,
-            engine="python",
-            encoding="latin-1",
-            error_bad_lines=False,
-            warn_bad_lines=True
-        )
+        df = pd.read_csv(path, dtype=str, engine="python",
+                         encoding="latin-1",
+                         error_bad_lines=False, warn_bad_lines=True)
+    df.columns = [str(c).strip().replace("\ufeff", "") for c in df.columns]
+    return df
+
+def normalize_key(df):
+    key_variants = ["MRN", "mrn", "Patient_MRN", "PAT_MRN"]
+    for k in key_variants:
+        if k in df.columns:
+            df = df.rename(columns={k: MERGE_KEY})
+            break
+    if MERGE_KEY not in df.columns:
+        raise RuntimeError("MRN column not found in file.")
+    df[MERGE_KEY] = df[MERGE_KEY].astype(str).str.strip()
+    return df
 
 def contains_negation(text):
     for rx in NEGATION_REGEX:
@@ -99,66 +99,50 @@ def find_stage2_hits(text):
                 hits.append(snippet)
     return hits
 
-def normalize_columns(df, want_map):
-    """
-    want_map: {CANONICAL: [possible_alts]}
-    """
-    cols = set(df.columns)
-    rename = {}
-    for canon, alts in want_map.items():
-        if canon in cols:
-            continue
-        for a in alts:
-            if a in cols:
-                rename[a] = canon
-                break
-    return df.rename(columns=rename)
-
 # ==============================
-# RESOLVE INPUTS
+# RESOLVE FILES
 # ==============================
 
 notes_v3_path = resolve_existing_path(NOTES_V3_ORIG, FALLBACK_GLOBS[0])
 notes_v4_path = resolve_existing_path(NOTES_V4_ORIG, FALLBACK_GLOBS[1])
 
 if not notes_v3_path or not notes_v4_path:
-    raise FileNotFoundError(
-        "Could not find originals.\n"
-        f"Checked:\n  {NOTES_V3_ORIG}\n  {NOTES_V4_ORIG}\n"
-        f"Fallbacks:\n  {FALLBACK_GLOBS[0]}\n  {FALLBACK_GLOBS[1]}"
-    )
+    raise FileNotFoundError("Original notes files not found.")
 
 # ==============================
 # LOAD DATA
 # ==============================
 
 print("Loading gold...")
-gold = pd.read_csv(GOLD_PATH, dtype=str)
+gold = read_csv_robust(GOLD_PATH)
+gold = normalize_key(gold)
 
 print("Loading notes...")
-notes_v3 = read_notes_csv(notes_v3_path)
-notes_v4 = read_notes_csv(notes_v4_path)
+notes_v3 = read_csv_robust(notes_v3_path)
+notes_v4 = read_csv_robust(notes_v4_path)
 notes = pd.concat([notes_v3, notes_v4], ignore_index=True)
 
-notes = normalize_columns(notes, {
-    "ENCRYPTED_PAT_ID": ["encrypted_pat_id", "PAT_ID", "PATID", "ENCRYPTED_ID"],
-    "NOTE_TEXT_DEID":   ["note_text_deid", "NOTE_TEXT", "NOTE_TEXT_CLEAN", "TEXT"],
-})
+notes = normalize_key(notes)
 
-req = {"ENCRYPTED_PAT_ID", "NOTE_TEXT_DEID"}
-missing = req.difference(set(notes.columns))
-if missing:
-    raise RuntimeError("Missing required columns in notes: %s" % sorted(missing))
+# Find note text column
+note_text_col = None
+for c in ["NOTE_TEXT_DEID", "NOTE_TEXT", "TEXT"]:
+    if c in notes.columns:
+        note_text_col = c
+        break
 
-notes["NOTE_TEXT_DEID"] = notes["NOTE_TEXT_DEID"].fillna("").astype(str)
+if not note_text_col:
+    raise RuntimeError("No note text column found.")
+
+notes[note_text_col] = notes[note_text_col].fillna("").astype(str)
 
 # ==============================
-# AGGREGATE NOTES BY PATIENT
+# AGGREGATE NOTES BY MRN
 # ==============================
 
-print("Aggregating notes by patient...")
+print("Aggregating notes by MRN...")
 patient_text = (
-    notes.groupby("ENCRYPTED_PAT_ID", dropna=False)["NOTE_TEXT_DEID"]
+    notes.groupby(MERGE_KEY)[note_text_col]
     .apply(lambda x: " ".join(x))
     .reset_index()
 )
@@ -172,21 +156,21 @@ summary_rows = []
 hit_rows = []
 
 for _, r in patient_text.iterrows():
-    pid = r["ENCRYPTED_PAT_ID"]
-    text = r["NOTE_TEXT_DEID"]
+    mrn = r[MERGE_KEY]
+    text = r[note_text_col]
 
     hits = find_stage2_hits(text)
     has_stage2 = 1 if hits else 0
 
     summary_rows.append({
-        "ENCRYPTED_PAT_ID": pid,
+        MERGE_KEY: mrn,
         "HAS_STAGE2": has_stage2,
         "HIT_COUNT": len(hits),
     })
 
     for h in hits:
         hit_rows.append({
-            "ENCRYPTED_PAT_ID": pid,
+            MERGE_KEY: mrn,
             "SNIPPET": h,
         })
 
@@ -194,20 +178,13 @@ summary_df = pd.DataFrame(summary_rows)
 hits_df = pd.DataFrame(hit_rows)
 
 # ==============================
-# MERGE WITH GOLD + SAVE
+# MERGE + SAVE
 # ==============================
 
-gold = normalize_columns(gold, {
-    "ENCRYPTED_PAT_ID": ["encrypted_pat_id", "PAT_ID", "PATID", "ENCRYPTED_ID"],
-})
-
-if "ENCRYPTED_PAT_ID" not in gold.columns:
-    raise RuntimeError("Gold file missing ENCRYPTED_PAT_ID (or known alternate).")
-
-print("Merging with gold...")
-merged = gold.merge(summary_df, on="ENCRYPTED_PAT_ID", how="left")
+print("Merging with gold on MRN...")
+merged = gold.merge(summary_df, on=MERGE_KEY, how="left")
 merged["HAS_STAGE2"] = merged["HAS_STAGE2"].fillna(0).astype(int)
-merged["HIT_COUNT"] = merged["HIT_COUNT"].fillna(0).astype(int)
+merged["HIT_COUNT"]  = merged["HIT_COUNT"].fillna(0).astype(int)
 
 print("Writing outputs...")
 os.makedirs(os.path.dirname(OUTPUT_SUMMARY), exist_ok=True)
