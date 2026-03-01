@@ -2,23 +2,20 @@
 # -*- coding: utf-8 -*-
 
 """
-make_fn_deid_bundles.py (Python 3.6.8 compatible)
+make_fn_deid_bundles_from_mrn.py (Python 3.6.8 compatible)
 
-1) Read validation merged file:
-   ./_outputs/validation_merged_STAGE2_ANCHOR_FIXED.csv
+Goal:
+- Use MRN (from validation_merged_STAGE2_ANCHOR_FIXED.csv) to export de-id bundles,
+  WITHOUT requiring the exporter to accept MRN directly.
+- We build an MRN -> ENCRYPTED_PAT_ID map from:
+    ./_staging_inputs/HPI11526 Operation Notes.csv
+  (same bridge your validation uses)
+- Then we feed ENCRYPTED_PAT_IDs into your existing batch exporter
+  as the "patient_id" column.
 
-2) Extract FN patients:
-   GOLD_HAS_STAGE2 == 1 AND PRED_HAS_STAGE2 == 0
-
-3) Write:
-   ./_outputs/FN_patient_ids.csv   (single column: patient_id)
-
-4) Run your existing batch exporter:
-   ./batch_export_deid_note_bundles.py ./_outputs/FN_patient_ids.csv
-
-IMPORTANT:
-- This fixes the common failure where you accidentally pass MRN/excel_row instead of patient_id.
-- We deliberately prefer columns that are likely to be true patient identifiers used by the exporter.
+Privacy:
+- The only CSV we write for exporting contains *no MRN column*.
+  It contains just: patient_id (which will be ENCRYPTED_PAT_ID values).
 """
 
 from __future__ import print_function
@@ -31,8 +28,9 @@ import pandas as pd
 
 ROOT = os.path.abspath(".")
 MERGED_PATH = os.path.join(ROOT, "_outputs", "validation_merged_STAGE2_ANCHOR_FIXED.csv")
-OUT_IDS = os.path.join(ROOT, "_outputs", "FN_patient_ids.csv")
+OP_PATH = os.path.join(ROOT, "_staging_inputs", "HPI11526 Operation Notes.csv")
 
+OUT_IDS = os.path.join(ROOT, "_outputs", "FN_deid_patient_ids.csv")  # NO MRN column
 BATCH_EXPORTER = os.path.join(ROOT, "batch_export_deid_note_bundles.py")
 
 
@@ -50,11 +48,21 @@ def normalize_cols(df):
     return df
 
 
-def pick_first_existing(df, options):
-    for c in options:
-        if c in df.columns:
-            return c
-    return None
+def normalize_id(x):
+    if x is None:
+        return ""
+    s = str(x).strip()
+    if not s or s.lower() == "nan":
+        return ""
+    if s.endswith(".0"):
+        head = s[:-2]
+        if head.isdigit():
+            return head
+    return s
+
+
+def normalize_mrn(x):
+    return normalize_id(x)
 
 
 def to01(v):
@@ -71,57 +79,79 @@ def to01(v):
         return 0
 
 
-def clean_id(x):
-    if x is None:
-        return ""
-    s = str(x).strip()
-    if not s or s.lower() == "nan":
-        return ""
-    return s
+def pick_first_existing(df, options):
+    for c in options:
+        if c in df.columns:
+            return c
+    return None
 
 
 def main():
     if not os.path.isfile(MERGED_PATH):
         raise IOError("Missing merged validation file: {}".format(MERGED_PATH))
+    if not os.path.isfile(OP_PATH):
+        raise IOError("Missing op-notes bridge file: {}".format(OP_PATH))
     if not os.path.isfile(BATCH_EXPORTER):
         raise IOError("Missing batch exporter script: {}".format(BATCH_EXPORTER))
 
-    df = normalize_cols(read_csv_robust(MERGED_PATH, dtype=str, low_memory=False))
+    merged = normalize_cols(read_csv_robust(MERGED_PATH, dtype=str, low_memory=False))
+    op = normalize_cols(read_csv_robust(OP_PATH, dtype=str, low_memory=False))
 
-    # Required cols for FN logic
-    if "GOLD_HAS_STAGE2" not in df.columns or "PRED_HAS_STAGE2" not in df.columns:
+    # --- Required cols for FN logic
+    if "GOLD_HAS_STAGE2" not in merged.columns or "PRED_HAS_STAGE2" not in merged.columns:
         raise ValueError(
-            "Merged file missing GOLD_HAS_STAGE2 or PRED_HAS_STAGE2. Found: {}".format(list(df.columns))
+            "Merged file missing GOLD_HAS_STAGE2 or PRED_HAS_STAGE2. Found: {}".format(list(merged.columns))
         )
 
-    # Pick the *right* patient identifier column for the exporter
-    pid_col = pick_first_existing(df, ["patient_id", "PatientID", "PATIENT_ID", "ENCRYPTED_PAT_ID"])
-    if not pid_col:
+    # --- MRN column in merged
+    merged_mrn_col = pick_first_existing(merged, ["MRN", "mrn"])
+    if not merged_mrn_col:
+        raise ValueError("Merged file missing MRN column. Found: {}".format(list(merged.columns)))
+
+    merged["MRN"] = merged[merged_mrn_col].map(normalize_mrn)
+
+    # --- Build MRN <-> ENCRYPTED_PAT_ID map from op notes (bridge)
+    op_mrn_col = pick_first_existing(op, ["MRN", "mrn"])
+    op_enc_col = pick_first_existing(op, ["ENCRYPTED_PAT_ID", "ENCRYPTED_PATID", "ENCRYPTED_PATIENT_ID"])
+    if not op_mrn_col or not op_enc_col:
         raise ValueError(
-            "Could not find a patient identifier column. Need one of: "
-            "patient_id, PatientID, PATIENT_ID, ENCRYPTED_PAT_ID. Found: {}".format(list(df.columns))
+            "Op notes must contain MRN and ENCRYPTED_PAT_ID. Found: {}".format(list(op.columns))
         )
 
-    # Compute FN mask
-    gold = df["GOLD_HAS_STAGE2"].map(to01)
-    pred = df["PRED_HAS_STAGE2"].map(to01)
+    op["MRN"] = op[op_mrn_col].map(normalize_mrn)
+    op["ENCRYPTED_PAT_ID"] = op[op_enc_col].map(normalize_id)
+    id_map = op[["MRN", "ENCRYPTED_PAT_ID"]].drop_duplicates()
+    id_map = id_map[(id_map["MRN"] != "") & (id_map["ENCRYPTED_PAT_ID"] != "")].copy()
+
+    # --- FN mask
+    gold = merged["GOLD_HAS_STAGE2"].map(to01)
+    pred = merged["PRED_HAS_STAGE2"].map(to01)
     fn_mask = (gold == 1) & (pred == 0)
 
-    fn = df.loc[fn_mask, [pid_col]].copy()
-    fn[pid_col] = fn[pid_col].map(clean_id)
-    fn = fn[fn[pid_col] != ""].drop_duplicates()
+    fn_mrns = merged.loc[fn_mask, ["MRN"]].copy()
+    fn_mrns = fn_mrns[fn_mrns["MRN"] != ""].drop_duplicates()
 
-    # Write output CSV in the exact schema the batch exporter expects
-    out_df = pd.DataFrame({"patient_id": fn[pid_col].tolist()})
+    # --- Map FN MRNs -> ENCRYPTED_PAT_IDs
+    fn_ids = fn_mrns.merge(id_map, on="MRN", how="left")
+    fn_ids["ENCRYPTED_PAT_ID"] = fn_ids["ENCRYPTED_PAT_ID"].fillna("").map(normalize_id)
+
+    # Keep only mapped IDs
+    fn_ids = fn_ids[fn_ids["ENCRYPTED_PAT_ID"] != ""].drop_duplicates(subset=["ENCRYPTED_PAT_ID"])
+
+    # Write export list WITHOUT MRN column
+    out_df = pd.DataFrame({"patient_id": fn_ids["ENCRYPTED_PAT_ID"].tolist()})
     out_df.to_csv(OUT_IDS, index=False)
 
+    missing_ct = int((fn_ids["ENCRYPTED_PAT_ID"] == "").sum())  # should be 0 after filter, kept for clarity
+
     print("Using merged: {}".format(MERGED_PATH))
-    print("Patient id col: {}".format(pid_col))
-    print("FN patients: {}".format(len(out_df)))
-    print("Wrote: {}".format(OUT_IDS))
+    print("Using op bridge: {}".format(OP_PATH))
+    print("FN MRNs: {}".format(len(fn_mrns)))
+    print("Mapped ENCRYPTED_PAT_IDs for export: {}".format(len(out_df)))
+    print("Wrote (NO MRN column): {}".format(OUT_IDS))
     print("")
 
-    # Run the batch exporter
+    # Run your existing batch exporter
     cmd = [sys.executable, BATCH_EXPORTER, OUT_IDS]
     print("Running: {}".format(" ".join(cmd)))
     rc = subprocess.call(cmd)
