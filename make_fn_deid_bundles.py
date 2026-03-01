@@ -2,42 +2,38 @@
 # -*- coding: utf-8 -*-
 
 """
-make_fn_deid_bundles.py  (Python 3.6.8 friendly)
+make_fn_deid_bundles.py (Python 3.6.8 compatible)
 
-Fixes:
-1) Avoids hanging/traceback on Ctrl+C (KeyboardInterrupt) while running batch exporter.
-2) Lets you force WHICH ID column to use (your run tried exporting 4,5,6... which is almost certainly the wrong id).
-3) Defaults to using ENCRYPTED_PAT_ID (or PatientID) before patient_id/MRN.
+1) Read validation merged file:
+   ./_outputs/validation_merged_STAGE2_ANCHOR_FIXED.csv
 
-Run from: /home/apokol/Breast_Restore
+2) Extract FN patients:
+   GOLD_HAS_STAGE2 == 1 AND PRED_HAS_STAGE2 == 0
 
-Default:
-  IN  : ./_outputs/validation_merged_STAGE2_ANCHOR_FIXED.csv
-  OUT : ./_outputs/FN_patient_ids.csv
-  RUN : ./batch_export_deid_note_bundles.py  (your existing batch script)
+3) Write:
+   ./_outputs/FN_patient_ids.csv   (single column: patient_id)
 
-Usage:
-  python make_fn_deid_bundles.py
-  python make_fn_deid_bundles.py --pid_col ENCRYPTED_PAT_ID
-  python make_fn_deid_bundles.py --no_run
-  python make_fn_deid_bundles.py --merged /path/to/merged.csv --pid_col PatientID
+4) Run your existing batch exporter:
+   ./batch_export_deid_note_bundles.py ./_outputs/FN_patient_ids.csv
+
+IMPORTANT:
+- This fixes the common failure where you accidentally pass MRN/excel_row instead of patient_id.
+- We deliberately prefer columns that are likely to be true patient identifiers used by the exporter.
 """
 
 from __future__ import print_function
+
 import os
 import sys
 import subprocess
 import pandas as pd
 
 
-# --------- HARD-CODED (edit if needed) ----------
-BREAST_RESTORE_DIR = "/home/apokol/Breast_Restore"
-DEFAULT_MERGED = os.path.join(BREAST_RESTORE_DIR, "_outputs", "validation_merged_STAGE2_ANCHOR_FIXED.csv")
-OUT_CSV = os.path.join(BREAST_RESTORE_DIR, "_outputs", "FN_patient_ids.csv")
+ROOT = os.path.abspath(".")
+MERGED_PATH = os.path.join(ROOT, "_outputs", "validation_merged_STAGE2_ANCHOR_FIXED.csv")
+OUT_IDS = os.path.join(ROOT, "_outputs", "FN_patient_ids.csv")
 
-# Your batch exporter script filename (adjust to match your actual file):
-BATCH_EXPORT_SCRIPT = os.path.join(BREAST_RESTORE_DIR, "batch_export_deid_note_bundles.py")
-# -----------------------------------------------
+BATCH_EXPORTER = os.path.join(ROOT, "batch_export_deid_note_bundles.py")
 
 
 def read_csv_robust(path, **kwargs):
@@ -54,6 +50,13 @@ def normalize_cols(df):
     return df
 
 
+def pick_first_existing(df, options):
+    for c in options:
+        if c in df.columns:
+            return c
+    return None
+
+
 def to01(v):
     if v is None:
         return 0
@@ -68,130 +71,61 @@ def to01(v):
         return 0
 
 
-def unique_preserve_order(items):
-    seen = set()
-    out = []
-    for x in items:
-        if x not in seen:
-            seen.add(x)
-            out.append(x)
-    return out
-
-
-def pick_default_pid_col(df_cols):
-    """
-    Choose the most likely ID column that matches your PATIENT_BUNDLES / de-id exporter.
-    Prefer ENCRYPTED_PAT_ID or PatientID (seen in your screenshots) over MRN/patient_id.
-    """
-    priority = [
-        "ENCRYPTED_PAT_ID", "ENCRYPTED_PATID", "ENCRYPTED_PATIENT_ID",
-        "PatientID", "PATIENTID",
-        "patient_id", "PATIENT_ID",
-        "MRN", "mrn",
-    ]
-    for c in priority:
-        if c in df_cols:
-            return c
-    return None
-
-
-def parse_args(argv):
-    args = {
-        "merged": DEFAULT_MERGED,
-        "pid_col": None,
-        "no_run": False
-    }
-
-    i = 1
-    while i < len(argv):
-        a = argv[i]
-        if a in ["--merged", "-m"]:
-            i += 1
-            if i >= len(argv):
-                raise ValueError("Missing value for --merged")
-            args["merged"] = argv[i]
-        elif a in ["--pid_col", "-c"]:
-            i += 1
-            if i >= len(argv):
-                raise ValueError("Missing value for --pid_col")
-            args["pid_col"] = argv[i]
-        elif a == "--no_run":
-            args["no_run"] = True
-        else:
-            raise ValueError("Unknown argument: {}".format(a))
-        i += 1
-
-    return args
+def clean_id(x):
+    if x is None:
+        return ""
+    s = str(x).strip()
+    if not s or s.lower() == "nan":
+        return ""
+    return s
 
 
 def main():
-    args = parse_args(sys.argv)
+    if not os.path.isfile(MERGED_PATH):
+        raise IOError("Missing merged validation file: {}".format(MERGED_PATH))
+    if not os.path.isfile(BATCH_EXPORTER):
+        raise IOError("Missing batch exporter script: {}".format(BATCH_EXPORTER))
 
-    merged_path = args["merged"]
-    if not os.path.isfile(merged_path):
-        raise IOError("Merged validation file not found: {}".format(merged_path))
+    df = normalize_cols(read_csv_robust(MERGED_PATH, dtype=str, low_memory=False))
 
-    print("Using merged:", merged_path)
-    df = normalize_cols(read_csv_robust(merged_path, dtype=str, low_memory=False))
-
-    # Required columns from validation merge
+    # Required cols for FN logic
     if "GOLD_HAS_STAGE2" not in df.columns or "PRED_HAS_STAGE2" not in df.columns:
         raise ValueError(
-            "Merged file must contain GOLD_HAS_STAGE2 and PRED_HAS_STAGE2. Found: {}".format(list(df.columns))
+            "Merged file missing GOLD_HAS_STAGE2 or PRED_HAS_STAGE2. Found: {}".format(list(df.columns))
         )
 
-    # Pick patient id column
-    pid_col = args["pid_col"]
-    if pid_col is None:
-        pid_col = pick_default_pid_col(list(df.columns))
-
-    if not pid_col or pid_col not in df.columns:
+    # Pick the *right* patient identifier column for the exporter
+    pid_col = pick_first_existing(df, ["patient_id", "PatientID", "PATIENT_ID", "ENCRYPTED_PAT_ID"])
+    if not pid_col:
         raise ValueError(
-            "Could not find pid_col='{}'. Available columns: {}".format(pid_col, list(df.columns))
+            "Could not find a patient identifier column. Need one of: "
+            "patient_id, PatientID, PATIENT_ID, ENCRYPTED_PAT_ID. Found: {}".format(list(df.columns))
         )
 
-    print("Using pid_col:", pid_col)
+    # Compute FN mask
+    gold = df["GOLD_HAS_STAGE2"].map(to01)
+    pred = df["PRED_HAS_STAGE2"].map(to01)
+    fn_mask = (gold == 1) & (pred == 0)
 
-    # Compute FN: gold=1, pred=0
-    gold01 = df["GOLD_HAS_STAGE2"].map(to01).astype(int)
-    pred01 = df["PRED_HAS_STAGE2"].map(to01).astype(int)
-    fn = df[(gold01 == 1) & (pred01 == 0)].copy()
+    fn = df.loc[fn_mask, [pid_col]].copy()
+    fn[pid_col] = fn[pid_col].map(clean_id)
+    fn = fn[fn[pid_col] != ""].drop_duplicates()
 
-    pids = fn[pid_col].fillna("").astype(str).str.strip().tolist()
-    pids = [p for p in pids if p]
-    pids = unique_preserve_order(pids)
+    # Write output CSV in the exact schema the batch exporter expects
+    out_df = pd.DataFrame({"patient_id": fn[pid_col].tolist()})
+    out_df.to_csv(OUT_IDS, index=False)
 
-    out_df = pd.DataFrame({"patient_id": pids})
-    out_dir = os.path.dirname(OUT_CSV)
-    if out_dir and not os.path.isdir(out_dir):
-        os.makedirs(out_dir)
+    print("Using merged: {}".format(MERGED_PATH))
+    print("Patient id col: {}".format(pid_col))
+    print("FN patients: {}".format(len(out_df)))
+    print("Wrote: {}".format(OUT_IDS))
+    print("")
 
-    out_df.to_csv(OUT_CSV, index=False)
-    print("FN patients:", len(pids))
-    print("Wrote:", OUT_CSV)
-
-    if args["no_run"]:
-        print("Not running batch exporter (--no_run).")
-        return
-
-    if not os.path.isfile(BATCH_EXPORT_SCRIPT):
-        raise IOError("Batch export script not found: {}".format(BATCH_EXPORT_SCRIPT))
-
-    cmd = [sys.executable, BATCH_EXPORT_SCRIPT, OUT_CSV]
-    print("\nRunning:", " ".join(cmd))
-    try:
-        rc = subprocess.call(cmd)
-    except KeyboardInterrupt:
-        print("\nStopped by user (Ctrl+C).")
-        print("You can resume anytime by running:")
-        print("  {} {}".format(sys.executable, " ".join(cmd[1:])))
-        return
-
-    if rc != 0:
-        print("\nBatch exporter exited with code:", rc)
-        print("Check logs in: {}/QA_DEID_BUNDLES/logs/".format(BREAST_RESTORE_DIR))
-    else:
-        print("\nDone.")
+    # Run the batch exporter
+    cmd = [sys.executable, BATCH_EXPORTER, OUT_IDS]
+    print("Running: {}".format(" ".join(cmd)))
+    rc = subprocess.call(cmd)
+    sys.exit(rc)
 
 
 if __name__ == "__main__":
