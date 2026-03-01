@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # build_stage12_WITH_AUDIT.py
-# Uses MRN as the merge key
+# Uses ORIGINAL full-note source files: "HPI11526 * Notes.csv" (not DEID_*).
+# Merge key: MRN
 
 import os
 import re
@@ -13,12 +14,16 @@ from glob import glob
 
 GOLD_PATH = "/home/apokol/Breast_Restore/gold_cleaned_for_cedar.csv"
 
-NOTES_V3_ORIG = "/home/apokol/Breast_Restore/_staging_inputs/DEID_FULLTEXT_HPI11526_Clinic_Notes_CTXWIPE_v3.csv"
-NOTES_V4_ORIG = "/home/apokol/Breast_Restore/_staging_inputs/DEID_FULLTEXT_HPI11526_NOTES_CTXWIPE_v4.csv"
+# Prefer explicit originals if you know them (add more if needed)
+ORIG_NOTE_PATHS = [
+    "/home/apokol/Breast_Restore/_staging_inputs/HPI11526 Clinic Notes.csv",
+    "/home/apokol/Breast_Restore/_staging_inputs/HPI11526 Operation Notes.csv",
+]
 
-FALLBACK_GLOBS = [
-    "/home/apokol/Breast_Restore/**/DEID_FULLTEXT_HPI11526_Clinic_Notes_CTXWIPE_v3.csv",
-    "/home/apokol/Breast_Restore/**/DEID_FULLTEXT_HPI11526_NOTES_CTXWIPE_v4.csv",
+# Fallback search (broad) for any original "HPI11526 * Notes.csv" files
+ORIG_NOTE_GLOBS = [
+    "/home/apokol/Breast_Restore/**/HPI11526*Notes.csv",
+    "/home/apokol/Breast_Restore/**/HPI11526*notes.csv",
 ]
 
 OUTPUT_SUMMARY = "/home/apokol/Breast_Restore/_outputs/patient_stage_summary.csv"
@@ -38,11 +43,13 @@ STAGE2_IMPLANT_PATTERNS = [
     r"\bimplant(s)? (are )?in\b",
     r"now with silicone implants?",
     r"\bs/p\b.*exchange.*(silicone|implant)",
+    r"\bimplant exchange\b",
 ]
 
 NEGATION_PATTERNS = [
     r"\bno implants in log\b",
     r"\bimplant not placed\b",
+    r"\bno implant\b",
 ]
 
 CONTEXT_WINDOW = 250
@@ -54,41 +61,63 @@ NEGATION_REGEX = [re.compile(p, re.IGNORECASE | re.DOTALL) for p in NEGATION_PAT
 # HELPERS
 # ==============================
 
-def resolve_existing_path(primary_path, fallback_glob):
-    if primary_path and os.path.exists(primary_path):
-        return primary_path
-    matches = glob(fallback_glob, recursive=True)
-    return sorted(matches)[0] if matches else None
-
-def read_csv_robust(path):
+def read_csv_robust(path: str) -> pd.DataFrame:
+    """
+    Robust CSV read across older/newer pandas:
+      - pandas>=1.3 supports on_bad_lines
+      - older pandas uses error_bad_lines / warn_bad_lines
+    """
+    common_kwargs = dict(dtype=str, engine="python")
     try:
-        df = pd.read_csv(path, dtype=str, engine="python",
-                         error_bad_lines=False, warn_bad_lines=True)
+        return pd.read_csv(path, **common_kwargs, on_bad_lines="skip")
+    except TypeError:
+        # older pandas
+        try:
+            return pd.read_csv(path, **common_kwargs, error_bad_lines=False, warn_bad_lines=True)
+        except UnicodeDecodeError:
+            return pd.read_csv(path, **common_kwargs, encoding="latin-1",
+                               error_bad_lines=False, warn_bad_lines=True)
     except UnicodeDecodeError:
-        df = pd.read_csv(path, dtype=str, engine="python",
-                         encoding="latin-1",
-                         error_bad_lines=False, warn_bad_lines=True)
+        try:
+            return pd.read_csv(path, **common_kwargs, encoding="latin-1", on_bad_lines="skip")
+        except TypeError:
+            return pd.read_csv(path, **common_kwargs, encoding="latin-1",
+                               error_bad_lines=False, warn_bad_lines=True)
+
+def clean_cols(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = [str(c).strip().replace("\ufeff", "") for c in df.columns]
     return df
 
-def normalize_key(df):
-    key_variants = ["MRN", "mrn", "Patient_MRN", "PAT_MRN"]
+def normalize_mrn(df: pd.DataFrame) -> pd.DataFrame:
+    key_variants = ["MRN", "mrn", "Patient_MRN", "PAT_MRN", "PATIENT_MRN"]
     for k in key_variants:
         if k in df.columns:
-            df = df.rename(columns={k: MERGE_KEY})
+            if k != MERGE_KEY:
+                df = df.rename(columns={k: MERGE_KEY})
             break
     if MERGE_KEY not in df.columns:
-        raise RuntimeError("MRN column not found in file.")
+        raise RuntimeError(f"MRN column not found. Columns seen: {list(df.columns)[:40]}")
     df[MERGE_KEY] = df[MERGE_KEY].astype(str).str.strip()
     return df
 
-def contains_negation(text):
-    for rx in NEGATION_REGEX:
-        if rx.search(text):
-            return True
-    return False
+def pick_note_text_col(df: pd.DataFrame) -> str:
+    candidates = [
+        "NOTE_TEXT", "NOTE_TEXT_FULL", "NOTE_TEXT_RAW", "NOTE", "TEXT",
+        "NOTE_BODY", "NOTE_CONTENT", "FullText", "FULL_TEXT"
+    ]
+    for c in candidates:
+        if c in df.columns:
+            return c
+    # fallback: pick the widest-looking text column
+    text_like = [c for c in df.columns if "TEXT" in c.upper() or "NOTE" in c.upper()]
+    if text_like:
+        return text_like[0]
+    raise RuntimeError(f"No obvious note text column found. Columns seen: {list(df.columns)[:40]}")
 
-def find_stage2_hits(text):
+def contains_negation(snippet: str) -> bool:
+    return any(rx.search(snippet) for rx in NEGATION_REGEX)
+
+def find_stage2_hits(text: str):
     hits = []
     for rx in IMPLANT_REGEX:
         for m in rx.finditer(text):
@@ -99,57 +128,52 @@ def find_stage2_hits(text):
                 hits.append(snippet)
     return hits
 
-# ==============================
-# RESOLVE FILES
-# ==============================
+def existing_files(paths, globs_list):
+    found = []
+    for p in paths:
+        if p and os.path.exists(p):
+            found.append(p)
+    if found:
+        return sorted(set(found))
 
-notes_v3_path = resolve_existing_path(NOTES_V3_ORIG, FALLBACK_GLOBS[0])
-notes_v4_path = resolve_existing_path(NOTES_V4_ORIG, FALLBACK_GLOBS[1])
-
-if not notes_v3_path or not notes_v4_path:
-    raise FileNotFoundError("Original notes files not found.")
+    # fallback glob search
+    globbed = []
+    for g in globs_list:
+        globbed.extend(glob(g, recursive=True))
+    globbed = sorted(set(globbed))
+    return globbed
 
 # ==============================
-# LOAD DATA
+# MAIN
 # ==============================
 
 print("Loading gold...")
-gold = read_csv_robust(GOLD_PATH)
-gold = normalize_key(gold)
+gold = clean_cols(read_csv_robust(GOLD_PATH))
+gold = normalize_mrn(gold)
 
-print("Loading notes...")
-notes_v3 = read_csv_robust(notes_v3_path)
-notes_v4 = read_csv_robust(notes_v4_path)
-notes = pd.concat([notes_v3, notes_v4], ignore_index=True)
+note_files = existing_files(ORIG_NOTE_PATHS, ORIG_NOTE_GLOBS)
+if not note_files:
+    raise FileNotFoundError("No original HPI11526 * Notes.csv files found (checked explicit paths + globs).")
 
-notes = normalize_key(notes)
+print("Loading ORIGINAL note files...")
+note_dfs = []
+for fp in note_files:
+    df = clean_cols(read_csv_robust(fp))
+    df = normalize_mrn(df)
+    text_col = pick_note_text_col(df)
+    df[text_col] = df[text_col].fillna("").astype(str)
+    df["_NOTE_TEXT_COL_"] = text_col
+    df["_SOURCE_FILE_"] = os.path.basename(fp)
+    note_dfs.append(df[[MERGE_KEY, text_col, "_SOURCE_FILE_"]].rename(columns={text_col: "NOTE_TEXT"}))
 
-# Find note text column
-note_text_col = None
-for c in ["NOTE_TEXT_DEID", "NOTE_TEXT", "TEXT"]:
-    if c in notes.columns:
-        note_text_col = c
-        break
-
-if not note_text_col:
-    raise RuntimeError("No note text column found.")
-
-notes[note_text_col] = notes[note_text_col].fillna("").astype(str)
-
-# ==============================
-# AGGREGATE NOTES BY MRN
-# ==============================
+notes = pd.concat(note_dfs, ignore_index=True)
 
 print("Aggregating notes by MRN...")
 patient_text = (
-    notes.groupby(MERGE_KEY)[note_text_col]
+    notes.groupby(MERGE_KEY)["NOTE_TEXT"]
     .apply(lambda x: " ".join(x))
     .reset_index()
 )
-
-# ==============================
-# DETECT STAGE 2
-# ==============================
 
 print("Detecting Stage 2 events...")
 summary_rows = []
@@ -157,29 +181,17 @@ hit_rows = []
 
 for _, r in patient_text.iterrows():
     mrn = r[MERGE_KEY]
-    text = r[note_text_col]
+    text = r["NOTE_TEXT"]
 
     hits = find_stage2_hits(text)
     has_stage2 = 1 if hits else 0
 
-    summary_rows.append({
-        MERGE_KEY: mrn,
-        "HAS_STAGE2": has_stage2,
-        "HIT_COUNT": len(hits),
-    })
-
+    summary_rows.append({MERGE_KEY: mrn, "HAS_STAGE2": has_stage2, "HIT_COUNT": len(hits)})
     for h in hits:
-        hit_rows.append({
-            MERGE_KEY: mrn,
-            "SNIPPET": h,
-        })
+        hit_rows.append({MERGE_KEY: mrn, "SNIPPET": h})
 
 summary_df = pd.DataFrame(summary_rows)
 hits_df = pd.DataFrame(hit_rows)
-
-# ==============================
-# MERGE + SAVE
-# ==============================
 
 print("Merging with gold on MRN...")
 merged = gold.merge(summary_df, on=MERGE_KEY, how="left")
