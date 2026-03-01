@@ -32,7 +32,7 @@ DEFAULT_MERGED = os.path.join(BREAST_RESTORE_DIR, "_outputs", "validation_merged
 OUT_CSV = os.path.join(BREAST_RESTORE_DIR, "_outputs", "FN_patient_ids.csv")
 
 # This is the batch exporter script you already have (paste/save it to this path):
-BATCH_EXPORT_SCRIPT = os.path.join(BREAST_RESTORE_DIR, "batch_export_deid_bundles.py")
+BATCH_EXPORT_SCRIPT = os.path.join(BREAST_RESTORE_DIR, "batch_export_deid_note_bundles.py")
 # -----------------------------------------------
 
 
