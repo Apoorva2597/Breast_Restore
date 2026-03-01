@@ -3,11 +3,8 @@
 # Uses ORIGINAL full-note source files: "HPI11526 * Notes.csv" (not DEID_*).
 # Merge key: MRN
 #
-# Revision goals (TP-preserving, reduce FP):
-# 1) Detect Stage2 per-NOTE (not on concatenated patient text), so we can require op/operative context.
-# 2) Add "op-context gate": accept hits only if the note looks like an OP/operative note OR contains operative sections.
-# 3) Add "history/plan gate": reject matches that are clearly historical ("s/p", "status post", "history of", "plan to", etc.)
-# 4) Keep your paths/structure the same.
+# Revision (balanced): preserve TP/recall by allowing STRONG Stage2 phrases anywhere,
+# while OP-gating only WEAK/ambiguous implant mentions to reduce FP.
 
 import os
 import re
@@ -20,13 +17,11 @@ from glob import glob
 
 GOLD_PATH = "/home/apokol/Breast_Restore/gold_cleaned_for_cedar.csv"
 
-# Prefer explicit originals if you know them (add more if needed)
 ORIG_NOTE_PATHS = [
     "/home/apokol/Breast_Restore/_staging_inputs/HPI11526 Clinic Notes.csv",
     "/home/apokol/Breast_Restore/_staging_inputs/HPI11526 Operation Notes.csv",
 ]
 
-# Fallback search (broad) for any original "HPI11526 * Notes.csv" files
 ORIG_NOTE_GLOBS = [
     "/home/apokol/Breast_Restore/**/HPI11526*Notes.csv",
     "/home/apokol/Breast_Restore/**/HPI11526*notes.csv",
@@ -41,14 +36,18 @@ MERGE_KEY = "MRN"
 # STAGE 2 PATTERNS
 # ==============================
 
-# Keep your original patterns, but we will (a) score hits per note, and (b) gate by OP context.
-STAGE2_IMPLANT_PATTERNS = [
+# STRONG = usually true Stage2 when present (keep recall)
+STRONG_STAGE2_PATTERNS = [
     r"exchange of tissue expanders? to (permanent )?implants?",
     r"exchange.*tissue expanders?.*implants?",
     r"expander.*exchange.*implants?",
     r"tissue expanders?.*removed.*implants?",
     r"\bimplant exchange\b",
-    # The next two are common FP sources in clinic notes; we keep them but only allow in OP context
+    r"\b(expander|tissue expander).{0,40}\b(remov(ed|al)|exchang(e|ed))\b.{0,80}\bimplant",
+]
+
+# WEAK = easy FP in clinic/H&P (reduce FP without killing TP by OP-gating)
+WEAK_STAGE2_PATTERNS = [
     r"\bimplant(s)? (are )?in\b",
     r"now with silicone implants?",
     r"\bs/p\b.*exchange.*(silicone|implant)",
@@ -60,7 +59,7 @@ NEGATION_PATTERNS = [
     r"\bno implant\b",
 ]
 
-# New: "history/plan" cues that often drive FPs (especially in clinic notes / H&P)
+# History/plan cues (we apply mainly to WEAK hits, or STRONG hits only if no procedure verbs nearby)
 HISTORY_PLAN_CUES = [
     r"\bhistory of\b",
     r"\bstatus post\b",
@@ -71,10 +70,9 @@ HISTORY_PLAN_CUES = [
     r"\bwill (undergo|consider|proceed)\b",
     r"\brecommended\b",
     r"\bdiscussed\b",
-    r"\bhere for (follow[- ]?up|post[- ]?op)\b",
 ]
 
-# New: OP/operative note context signals
+# OP/operative note context signals (used only to “unlock” WEAK hits)
 OP_NOTE_TYPE_CUES = [
     r"\bop note\b",
     r"\boperative\b",
@@ -82,7 +80,6 @@ OP_NOTE_TYPE_CUES = [
     r"\boperative report\b",
     r"\bbrief op\b",
     r"\bprocedure note\b",
-    r"\bsurgery\b",
 ]
 
 OP_SECTION_CUES = [
@@ -94,30 +91,36 @@ OP_SECTION_CUES = [
     r"\bhospital\s+course\s*:",
 ]
 
-CONTEXT_WINDOW = 250
-HISTORY_LEFT_WINDOW = 120  # look back this many chars before a match for history/plan cues
+# procedure verbs that indicate an actual event (helps rescue recall)
+PROCEDURE_VERB_CUES = [
+    r"\bexchang(e|ed|ing)\b",
+    r"\bremov(ed|al|ing)\b",
+    r"\bplaced\b",
+    r"\binsertion\b",
+    r"\bimplantation\b",
+]
 
-IMPLANT_REGEX  = [re.compile(p, re.IGNORECASE | re.DOTALL) for p in STAGE2_IMPLANT_PATTERNS]
+CONTEXT_WINDOW = 250
+LEFT_WINDOW = 120
+AROUND_WINDOW = 180
+
+STRONG_REGEX   = [re.compile(p, re.IGNORECASE | re.DOTALL) for p in STRONG_STAGE2_PATTERNS]
+WEAK_REGEX     = [re.compile(p, re.IGNORECASE | re.DOTALL) for p in WEAK_STAGE2_PATTERNS]
 NEGATION_REGEX = [re.compile(p, re.IGNORECASE | re.DOTALL) for p in NEGATION_PATTERNS]
 HISTORY_REGEX  = [re.compile(p, re.IGNORECASE) for p in HISTORY_PLAN_CUES]
 OPTYPE_REGEX   = [re.compile(p, re.IGNORECASE) for p in OP_NOTE_TYPE_CUES]
 OPSEC_REGEX    = [re.compile(p, re.IGNORECASE) for p in OP_SECTION_CUES]
+PROCVERB_REGEX = [re.compile(p, re.IGNORECASE) for p in PROCEDURE_VERB_CUES]
 
 # ==============================
 # HELPERS
 # ==============================
 
 def read_csv_robust(path: str) -> pd.DataFrame:
-    """
-    Robust CSV read across older/newer pandas:
-      - pandas>=1.3 supports on_bad_lines
-      - older pandas uses error_bad_lines / warn_bad_lines
-    """
     common_kwargs = dict(dtype=str, engine="python")
     try:
         return pd.read_csv(path, **common_kwargs, on_bad_lines="skip")
     except TypeError:
-        # older pandas
         try:
             return pd.read_csv(path, **common_kwargs, error_bad_lines=False, warn_bad_lines=True)
         except UnicodeDecodeError:
@@ -160,15 +163,13 @@ def pick_note_text_col(df: pd.DataFrame) -> str:
     raise RuntimeError(f"No obvious note text column found. Columns seen: {list(df.columns)[:40]}")
 
 def pick_note_type_col(df: pd.DataFrame):
-    candidates = ["NOTE_TYPE", "NOTE_TYPE_NAME", "TYPE", "NOTE_CATEGORY", "DOCUMENT_TYPE"]
-    for c in candidates:
+    for c in ["NOTE_TYPE", "NOTE_TYPE_NAME", "TYPE", "NOTE_CATEGORY", "DOCUMENT_TYPE"]:
         if c in df.columns:
             return c
     return None
 
 def pick_note_date_col(df: pd.DataFrame):
-    candidates = ["NOTE_DATETIME", "NOTE_DATE", "NOTE_DATE_RAW", "NOTE_DATETIME_RAW", "SERVICE_DATE", "DATE"]
-    for c in candidates:
+    for c in ["NOTE_DATETIME", "NOTE_DATE", "NOTE_DATE_RAW", "NOTE_DATETIME_RAW", "SERVICE_DATE", "DATE"]:
         if c in df.columns:
             return c
     return None
@@ -176,67 +177,71 @@ def pick_note_date_col(df: pd.DataFrame):
 def contains_negation(snippet: str) -> bool:
     return any(rx.search(snippet) for rx in NEGATION_REGEX)
 
+def left_has_history_cue(text: str, match_start: int) -> bool:
+    left = text[max(0, match_start - LEFT_WINDOW):match_start]
+    return any(rx.search(left) for rx in HISTORY_REGEX)
+
+def around_has_procedure_verb(text: str, match_start: int, match_end: int) -> bool:
+    around = text[max(0, match_start - AROUND_WINDOW):min(len(text), match_end + AROUND_WINDOW)]
+    return any(rx.search(around) for rx in PROCVERB_REGEX)
+
 def has_op_context(note_type: str, source_file: str, text: str) -> bool:
-    """
-    Conservative gate to preserve TP:
-      - If it's from "Operation Notes" file => OP context
-      - OR note_type has operative cues
-      - OR note has operative section headers
-    """
     sf = (source_file or "").lower()
     nt = (note_type or "")
-    if "operation" in sf or "operative" in sf or "op" in sf:
-        # "Clinic Notes" will fail this, "Operation Notes" will pass
-        if "clinic" not in sf:
-            return True
 
+    # operation file name is a strong signal
+    if "operation" in sf or "operative" in sf:
+        return True
+
+    # note type cue
     if any(rx.search(nt) for rx in OPTYPE_REGEX):
         return True
 
+    # section header cue
     if any(rx.search(text) for rx in OPSEC_REGEX):
         return True
 
     return False
 
-def looks_like_history_or_plan(text: str, match_start: int) -> bool:
+def extract_hits(text: str, regex_list, label: str, note_type: str, source_file: str, gate_weak: bool):
     """
-    If the LEFT context (before the match) contains history/plan cues, treat as likely FP.
-    """
-    if not text:
-        return False
-    left = text[max(0, match_start - HISTORY_LEFT_WINDOW):match_start]
-    return any(rx.search(left) for rx in HISTORY_REGEX)
-
-def find_stage2_hits_in_note(text: str, note_type: str, source_file: str):
-    """
-    Returns list of snippets for Stage2 hits IN THIS NOTE that pass:
-      - pattern match
-      - no negation nearby
-      - op-context gate
-      - not clearly historical/plan mention (left-window cue)
+    gate_weak=True means:
+      - require OP-context for WEAK patterns
+      - apply history/plan filter strongly
+    gate_weak=False means:
+      - allow STRONG patterns without OP-context
+      - history/plan filter only blocks if NO procedure verb nearby
     """
     hits = []
     if not text:
         return hits
 
     op_ok = has_op_context(note_type, source_file, text)
-    if not op_ok:
-        # key FP reducer: do not allow any Stage2 hits from non-op-context notes
-        return hits
 
-    for rx in IMPLANT_REGEX:
+    for rx in regex_list:
         for m in rx.finditer(text):
-            # history/plan check
-            if looks_like_history_or_plan(text, m.start()):
-                continue
-
+            # build snippet
             start = max(0, m.start() - CONTEXT_WINDOW)
             end   = min(len(text), m.end() + CONTEXT_WINDOW)
             snippet = text[start:end].replace("\n", " ")
+
+            # negation always blocks
             if contains_negation(snippet):
                 continue
 
-            hits.append(snippet)
+            # gating rules
+            if gate_weak:
+                if not op_ok:
+                    continue
+                # if it's WEAK and has history cues, drop it
+                if left_has_history_cue(text, m.start()):
+                    continue
+            else:
+                # STRONG: only drop on history cue if it looks like background (no procedure verbs nearby)
+                if left_has_history_cue(text, m.start()) and not around_has_procedure_verb(text, m.start(), m.end()) and not op_ok:
+                    continue
+
+            hits.append((label, snippet))
 
     return hits
 
@@ -292,11 +297,10 @@ for fp in note_files:
 
 notes = pd.concat(note_dfs, ignore_index=True)
 
-print("Detecting Stage 2 events (per-note, OP-context gated)...")
+print("Detecting Stage 2 events (balanced STRONG+WEAK logic)...")
 summary_rows = []
 hit_rows = []
 
-# Per-patient accumulators
 hit_count_by_mrn = {}
 has_stage2_by_mrn = {}
 
@@ -307,28 +311,30 @@ for _, r in notes.iterrows():
     note_type = r["_NOTE_TYPE_"]
     note_date = r["_NOTE_DATE_"]
 
-    hits = find_stage2_hits_in_note(text, note_type, source_file)
+    strong_hits = extract_hits(text, STRONG_REGEX, "STRONG", note_type, source_file, gate_weak=False)
+    weak_hits   = extract_hits(text, WEAK_REGEX,   "WEAK",   note_type, source_file, gate_weak=True)
+
+    hits = strong_hits + weak_hits
 
     if hits:
         has_stage2_by_mrn[mrn] = 1
         hit_count_by_mrn[mrn] = hit_count_by_mrn.get(mrn, 0) + len(hits)
 
-        for h in hits:
+        for label, snippet in hits:
             hit_rows.append({
                 MERGE_KEY: mrn,
                 "NOTE_DATE": note_date,
                 "NOTE_TYPE": note_type,
                 "SOURCE_FILE": source_file,
-                "SNIPPET": h
+                "HIT_STRENGTH": label,
+                "SNIPPET": snippet
             })
     else:
-        # ensure patient appears even if no hits
         if mrn not in has_stage2_by_mrn:
             has_stage2_by_mrn[mrn] = 0
         if mrn not in hit_count_by_mrn:
             hit_count_by_mrn[mrn] = 0
 
-# Build summary_df from per-note pass
 for mrn, y in has_stage2_by_mrn.items():
     summary_rows.append({
         MERGE_KEY: mrn,
