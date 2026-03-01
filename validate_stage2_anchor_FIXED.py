@@ -16,6 +16,10 @@ Outputs:
 - ./_outputs/validation_merged_STAGE2_ANCHOR_FIXED.csv
 - ./_outputs/validation_mismatches_STAGE2_ANCHOR_FIXED.csv
 - ./_outputs/validation_metrics_STAGE2_ANCHOR_FIXED.txt
+
+CHANGE (minimal, preserves validation intent):
+- If stage_pred lacks MRN, we DO NOT crash. We build MRN via op-notes id_map (same as original logic).
+- If MRN exists, we use it; then still merge id_map to fill blanks.
 """
 
 from __future__ import print_function
@@ -146,7 +150,7 @@ def main():
         raise ValueError("Gold missing Stage2_Applicable (or STAGE2_APPLICABLE).")
     gold["GOLD_HAS_STAGE2"] = gold[gold_stage2_app_col].map(to01).astype(int)
 
-    # --- Stage Pred: must have ENCRYPTED_PAT_ID and HAS_STAGE2 (or STAGE2_DATE)
+    # --- Stage Pred: ENCRYPTED_PAT_ID required
     pred_enc_col = pick_first_existing(stage_pred, ["ENCRYPTED_PAT_ID", "ENCRYPTED_PATID", "ENCRYPTED_PATIENT_ID"])
     if not pred_enc_col:
         raise ValueError("Stage prediction file missing ENCRYPTED_PAT_ID. Found: {}".format(list(stage_pred.columns)))
@@ -155,15 +159,24 @@ def main():
         stage_pred = stage_pred.rename(columns={pred_enc_col: "ENCRYPTED_PAT_ID"})
     stage_pred["ENCRYPTED_PAT_ID"] = stage_pred["ENCRYPTED_PAT_ID"].map(normalize_id)
 
-    # Map to MRN via op-notes id_map
-    stage_pred = stage_pred.merge(id_map, on="ENCRYPTED_PAT_ID", how="left")
+    # --- Ensure MRN exists (do not crash if missing)
+    if "MRN" not in stage_pred.columns:
+        stage_pred["MRN"] = ""
     stage_pred["MRN"] = stage_pred["MRN"].fillna("").map(normalize_mrn)
 
-    # Pred stage2 signal
+    # --- Fill MRN via id_map (same bridge as original logic)
+    stage_pred = stage_pred.merge(id_map, on="ENCRYPTED_PAT_ID", how="left", suffixes=("", "_bridge"))
+    stage_pred["MRN_bridge"] = stage_pred["MRN_bridge"].fillna("").map(normalize_mrn)
+    stage_pred["MRN"] = stage_pred["MRN"].where(stage_pred["MRN"] != "", stage_pred["MRN_bridge"])
+    stage_pred = stage_pred.drop(["MRN_bridge"], axis=1)
+
+    # --- Pred stage2 signal (unchanged intent)
     if "HAS_STAGE2" in stage_pred.columns:
         stage_pred["PRED_HAS_STAGE2"] = stage_pred["HAS_STAGE2"].map(to01).astype(int)
     elif "STAGE2_DATE" in stage_pred.columns:
-        stage_pred["PRED_HAS_STAGE2"] = stage_pred["STAGE2_DATE"].fillna("").map(lambda x: 1 if str(x).strip() else 0).astype(int)
+        stage_pred["PRED_HAS_STAGE2"] = stage_pred["STAGE2_DATE"].fillna("").map(
+            lambda x: 1 if str(x).strip() else 0
+        ).astype(int)
     else:
         raise ValueError("Stage prediction file missing HAS_STAGE2 or STAGE2_DATE. Found: {}".format(list(stage_pred.columns)))
 
