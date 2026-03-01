@@ -1,186 +1,159 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-STAGE2 STAGING ONLY
-- No validation
-- Produces:
-    1) stage_event_level.csv
-    2) patient_stage_summary.csv
-    3) audit_bucket_counts.csv
-"""
+# build_stage12_WITH_AUDIT.py
+# STAGING ONLY — NO VALIDATION
+# Outputs remain unchanged:
+#   _outputs/patient_stage_summary.csv
+#   _outputs/stage2_fn_raw_note_snippets.csv
 
 import os
-import csv
 import re
+import csv
+import pandas as pd
 
-# -------------------------
-# Config
-# -------------------------
+INPUT_NOTES = "_staging_inputs/HPI11526 Operation Notes.csv"
+OUTPUT_SUMMARY = "_outputs/patient_stage_summary.csv"
+OUTPUT_AUDIT = "_outputs/stage2_fn_raw_note_snippets.csv"
 
-STAGING_DIR = os.path.join(os.getcwd(), "_staging_inputs")
-OUT_DIR = os.path.join(os.getcwd(), "_outputs")
+# ----------------------------
+# STRICT INTRAOPERATIVE SIGNALS
+# ----------------------------
 
-# -------------------------
-# Regex
-# -------------------------
+EXCHANGE_STRICT = re.compile(
+    r"""
+    (
+        (underwent|performed|taken\s+to\s+the\s+OR|returned\s+to\s+the\s+operating\s+room)
+        .{0,120}?
+        (exchange|removal|removed|replacement)
+        .{0,120}?
+        (tissue\s+expander|implant)
+    )
+    |
+    (
+        (exchange|removal|removed|replacement)
+        .{0,80}?
+        (tissue\s+expander|implant)
+        .{0,80}?
+        (for|with)
+        .{0,80}?
+        (permanent\s+)?(silicone|saline)?\s*(implant)
+    )
+    """,
+    re.IGNORECASE | re.VERBOSE | re.DOTALL,
+)
 
-RE_OPERATIVE_TYPE = re.compile(r"\b(operative|op note|brief op|operation|surgical)\b", re.I)
-
+# Intraoperative reinforcement signals
 INTRAOP_SIGNALS = re.compile(
-    r"\b(estimated blood loss|ebl|drains? placed|specimens? removed|anesthesia|operating room|intraoperative|incision was made|pre-op|post-op)\b",
-    re.I,
+    r"""
+    (estimated\s+blood\s+loss|EBL|
+     specimen(s)?\s+sent|
+     drains?\s+(placed|inserted)|
+     anesthesia|
+     incision\s+made|
+     pocket\s+created|
+     implant\s+placed|
+     expander\s+removed|
+     capsulotomy|capsulectomy|
+     ml\s+(removed|placed|instilled))
+    """,
+    re.IGNORECASE | re.VERBOSE,
 )
 
-RE_TE = re.compile(r"\b(expander|tissue expander|te)\b", re.I)
-RE_IMPLANT = re.compile(r"\b(implant|prosthesis|silicone|saline|gel|mentor|allergan|sientra)\b", re.I)
-
-RE_EXCHANGE_TIGHT = re.compile(
-    r"\b(implant|expander)\b.{0,50}\b(exchange|exchanged|replace|replaced|replacement)\b"
-    r"|\b(exchange|exchanged|replace|replaced|replacement)\b.{0,50}\b(implant|expander)\b",
-    re.I,
+# Negative context filters (exclude planning/history)
+NEGATIVE_CONTEXT = re.compile(
+    r"""
+    (scheduled\s+for|
+     will\s+undergo|
+     planning\s+to|
+     considering|
+     history\s+of|
+     status\s+post|
+     s/p|
+     discussed|
+     interested\s+in|
+     plan:|
+     follow[-\s]?up|
+     here\s+for\s+follow)
+    """,
+    re.IGNORECASE | re.VERBOSE,
 )
 
-RE_ACTION_OBJECT = re.compile(
-    r"\b(remove(d)?|explant(ed)?|exchange(d)?|replace(d)?|revision)\b.{0,80}?\b(implant|expander)\b",
-    re.I,
-)
+# ----------------------------
+# HELPERS
+# ----------------------------
 
-RE_STAGE1 = [
-    r"\b(mastectomy)\b.*\b(expander|te)\b.*\b(place|insert)\b",
-    r"\b(place|insert)\b.*\b(expander|te)\b",
-]
+def is_true_exchange(note_text: str) -> bool:
+    if not EXCHANGE_STRICT.search(note_text):
+        return False
 
-# -------------------------
-# Helpers
-# -------------------------
+    if NEGATIVE_CONTEXT.search(note_text):
+        return False
 
-def _safe_mkdir(path):
-    if not os.path.isdir(path):
-        os.makedirs(path)
+    # Require intraoperative reinforcement
+    if not INTRAOP_SIGNALS.search(note_text):
+        return False
 
-def _normalize_text(s):
-    if not s:
-        return ""
-    return re.sub(r"\s+", " ", str(s).lower()).strip()
+    return True
 
-def _read_csv_rows(path):
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        return list(csv.DictReader(f))
 
-# -------------------------
-# Detection
-# -------------------------
+def get_snippet(text, match_obj, window=200):
+    start = max(match_obj.start() - window, 0)
+    end = min(match_obj.end() + window, len(text))
+    return text[start:end].replace("\n", " ").strip()
 
-def detect_stage(note_text, note_type):
 
-    text = _normalize_text(note_text)
-    note_type_norm = _normalize_text(note_type)
-
-    is_op = 1 if RE_OPERATIVE_TYPE.search(note_type_norm) else 0
-
-    if is_op and RE_EXCHANGE_TIGHT.search(text) and INTRAOP_SIGNALS.search(text):
-        return ("STAGE2", "EXCHANGE_TIGHT")
-
-    if is_op and RE_TE.search(text) and RE_IMPLANT.search(text):
-        if RE_ACTION_OBJECT.search(text) and INTRAOP_SIGNALS.search(text):
-            return ("STAGE2", "EXPANDER_TO_IMPLANT")
-
-    for pat in RE_STAGE1:
-        if re.search(pat, text):
-            return ("STAGE1", "STAGE1")
-
-    return ("", "")
-
-# -------------------------
-# Main
-# -------------------------
+# ----------------------------
+# MAIN
+# ----------------------------
 
 def main():
+    df = pd.read_csv(INPUT_NOTES)
 
-    _safe_mkdir(OUT_DIR)
+    required_cols = {"ENCRYPTED_PAT_ID", "NOTE_ID", "NOTE_TEXT"}
+    if not required_cols.issubset(set(df.columns)):
+        raise ValueError(f"Input must contain columns: {required_cols}")
 
-    note_paths = [
-        os.path.join(STAGING_DIR, "HPI11526 Operation Notes.csv"),
-        os.path.join(STAGING_DIR, "HPI11526 Clinic Notes.csv"),
-    ]
+    stage2_patients = set()
+    audit_rows = []
 
-    note_paths = [p for p in note_paths if os.path.isfile(p)]
-    if not note_paths:
-        raise IOError("No note files found.")
+    total_events = 0
 
-    note_rows = []
-    for p in note_paths:
-        note_rows.extend(_read_csv_rows(p))
+    for _, row in df.iterrows():
+        pat_id = row["ENCRYPTED_PAT_ID"]
+        note_id = row["NOTE_ID"]
+        text = str(row["NOTE_TEXT"])
 
-    patients = {}
-    events = []
-    bucket_counts = {}
+        total_events += 1
 
-    for r in note_rows:
+        if is_true_exchange(text):
+            stage2_patients.add(pat_id)
 
-        pid = str(r.get("ENCRYPTED_PAT_ID","")).strip()
-        if not pid:
-            continue
+            for match in EXCHANGE_STRICT.finditer(text):
+                snippet = get_snippet(text, match)
+                audit_rows.append({
+                    "ENCRYPTED_PAT_ID": pat_id,
+                    "NOTE_ID": note_id,
+                    "MATCH_TERM": "exchange_strict",
+                    "SNIPPET": snippet,
+                    "SOURCE_FILE": os.path.basename(INPUT_NOTES),
+                })
 
-        stage, bucket = detect_stage(
-            r.get("NOTE_TEXT",""),
-            r.get("NOTE_TYPE",""),
-        )
+    # Patient-level summary
+    summary_df = pd.DataFrame({
+        "ENCRYPTED_PAT_ID": df["ENCRYPTED_PAT_ID"].unique()
+    })
 
-        if not stage:
-            continue
+    summary_df["STAGE2_ANCHOR"] = summary_df["ENCRYPTED_PAT_ID"].apply(
+        lambda x: 1 if x in stage2_patients else 0
+    )
 
-        if pid not in patients:
-            patients[pid] = {"stage1":0,"stage2":0}
+    summary_df.to_csv(OUTPUT_SUMMARY, index=False)
 
-        if stage == "STAGE1":
-            patients[pid]["stage1"] += 1
-        elif stage == "STAGE2":
-            patients[pid]["stage2"] += 1
-
-        events.append({
-            "ENCRYPTED_PAT_ID": pid,
-            "NOTE_ID": r.get("NOTE_ID",""),
-            "NOTE_TYPE": r.get("NOTE_TYPE",""),
-            "STAGE": stage,
-            "DETECTION_BUCKET": bucket,
-        })
-
-        bucket_counts[bucket] = bucket_counts.get(bucket,0) + 1
-
-    # -------------------------
-    # Write Outputs
-    # -------------------------
-
-    event_out = os.path.join(OUT_DIR, "stage_event_level.csv")
-    with open(event_out,"w",newline="",encoding="utf-8") as f:
-        w = csv.DictWriter(f,fieldnames=["ENCRYPTED_PAT_ID","NOTE_ID","NOTE_TYPE","STAGE","DETECTION_BUCKET"])
-        w.writeheader()
-        for e in events:
-            w.writerow(e)
-
-    patient_out = os.path.join(OUT_DIR,"patient_stage_summary.csv")
-    with open(patient_out,"w",newline="",encoding="utf-8") as f:
-        w = csv.DictWriter(f,fieldnames=["ENCRYPTED_PAT_ID","HAS_STAGE1","HAS_STAGE2"])
-        w.writeheader()
-        for pid in patients:
-            w.writerow({
-                "ENCRYPTED_PAT_ID": pid,
-                "HAS_STAGE1": 1 if patients[pid]["stage1"]>0 else 0,
-                "HAS_STAGE2": 1 if patients[pid]["stage2"]>0 else 0,
-            })
-
-    audit_out = os.path.join(OUT_DIR,"audit_bucket_counts.csv")
-    with open(audit_out,"w",newline="",encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["DETECTION_BUCKET","count"])
-        for k,v in sorted(bucket_counts.items()):
-            w.writerow([k,v])
+    audit_df = pd.DataFrame(audit_rows)
+    audit_df.to_csv(OUTPUT_AUDIT, index=False)
 
     print("Staging complete.")
-    print("Patients:", len(patients))
-    print("Events:", len(events))
+    print(f"Patients: {summary_df.shape[0]}")
+    print(f"Events: {total_events}")
+
 
 if __name__ == "__main__":
     main()
