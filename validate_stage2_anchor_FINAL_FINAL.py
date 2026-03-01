@@ -1,30 +1,26 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-validate_stage2_anchor_FIXED.py (Python 3.6.8 compatible)
+build_stage12_WITH_AUDIT.py
+Python 3.6.8 compatible
 
-Stage2 Anchor validation ONLY.
-
-Run from: /home/apokol/Breast_Restore
-
-Inputs (NO AUTO-DETECTION):
-- ./gold_cleaned_for_cedar.csv
-- ./_outputs/patient_stage_summary.csv
-- ./_staging_inputs/HPI11526 Operation Notes.csv   (MRN<->ENCRYPTED_PAT_ID bridge)
-
-Outputs:
-- ./_outputs/validation_merged_STAGE2_ANCHOR_FIXED.csv
-- ./_outputs/validation_mismatches_STAGE2_ANCHOR_FIXED.csv
-- ./_outputs/validation_metrics_STAGE2_ANCHOR_FIXED.txt
+STAGING ONLY — produces:
+  ./_outputs/patient_stage_summary.csv   (must contain HAS_STAGE2)
+  ./_outputs/stage2_fn_raw_note_snippets.csv
 """
 
 from __future__ import print_function
 import os
+import re
 import pandas as pd
 
-# -------------------------
-# Helpers
-# -------------------------
+INPUT_NOTES = "_staging_inputs/HPI11526 Operation Notes.csv"
+OUTPUT_SUMMARY = "_outputs/patient_stage_summary.csv"
+OUTPUT_AUDIT = "_outputs/stage2_fn_raw_note_snippets.csv"
+
+# ----------------------------
+# Robust CSV reader (match validator style)
+# ----------------------------
 
 def read_csv_robust(path, **kwargs):
     for enc in ["utf-8", "utf-8-sig", "cp1252", "latin1"]:
@@ -34,184 +30,153 @@ def read_csv_robust(path, **kwargs):
             continue
     raise IOError("Failed to read CSV with common encodings: {}".format(path))
 
-def normalize_cols(df):
-    df.columns = [str(c).replace(u"\xa0", " ").strip() for c in df.columns]
-    return df
+# ----------------------------
+# Regex Logic
+# ----------------------------
 
-def normalize_id(x):
-    if x is None:
-        return ""
-    s = str(x).strip()
-    if not s:
-        return ""
-    if s.lower() == "nan":
-        return ""
-    if s.endswith(".0"):
-        head = s[:-2]
-        if head.isdigit():
-            return head
-    return s
+EXCHANGE_STRICT = re.compile(
+    r"""
+    (
+        (underwent|performed|taken\s+to\s+the\s+OR|returned\s+to\s+the\s+operating\s+room)
+        .{0,120}?
+        (exchange|removal|removed|replacement)
+        .{0,120}?
+        (tissue\s+expander|implant)
+    )
+    |
+    (
+        (exchange|removal|removed|replacement)
+        .{0,80}?
+        (tissue\s+expander|implant)
+        .{0,80}?
+        (for|with)
+        .{0,80}?
+        (permanent\s+)?(silicone|saline)?\s*(implant)
+    )
+    """,
+    re.IGNORECASE | re.VERBOSE | re.DOTALL,
+)
 
-def normalize_mrn(x):
-    return normalize_id(x)
+INTRAOP_SIGNALS = re.compile(
+    r"""
+    (estimated\s+blood\s+loss|EBL|
+     specimen(s)?\s+sent|
+     drains?\s+(placed|inserted)|
+     anesthesia|
+     incision\s+made|
+     pocket\s+created|
+     implant\s+placed|
+     expander\s+removed|
+     capsulotomy|capsulectomy|
+     \bml\b\s+(removed|placed|instilled))
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
 
-def to01(v):
-    if v is None:
-        return 0
-    s = str(v).strip().lower()
-    if s in ["1", "y", "yes", "true", "t"]:
-        return 1
-    if s in ["0", "n", "no", "false", "f", ""]:
-        return 0
-    try:
-        return 1 if float(s) != 0.0 else 0
-    except Exception:
-        return 0
+NEGATIVE_CONTEXT = re.compile(
+    r"""
+    (scheduled\s+for|
+     will\s+undergo|
+     planning\s+to|
+     considering|
+     history\s+of|
+     status\s+post|
+     \bs/p\b|
+     discussed|
+     interested\s+in|
+     plan:|
+     follow[-\s]?up|
+     here\s+for\s+follow)
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
 
-def pick_first_existing(df, options):
-    for c in options:
-        if c in df.columns:
-            return c
-    return None
+def is_true_exchange(text):
+    if not EXCHANGE_STRICT.search(text):
+        return False
+    if NEGATIVE_CONTEXT.search(text):
+        return False
+    if not INTRAOP_SIGNALS.search(text):
+        return False
+    return True
 
-def safe_div(a, b):
-    return float(a) / float(b) if b else 0.0
+def get_snippet(text, match_obj, window=200):
+    start = max(match_obj.start() - window, 0)
+    end = min(match_obj.end() + window, len(text))
+    return text[start:end].replace("\n", " ").strip()
 
-def compute_binary_metrics(df, gold_col, pred_col):
-    tp = int(((df[gold_col] == 1) & (df[pred_col] == 1)).sum())
-    fp = int(((df[gold_col] == 0) & (df[pred_col] == 1)).sum())
-    fn = int(((df[gold_col] == 1) & (df[pred_col] == 0)).sum())
-    tn = int(((df[gold_col] == 0) & (df[pred_col] == 0)).sum())
-
-    precision = safe_div(tp, tp + fp)
-    recall = safe_div(tp, tp + fn)
-    f1 = safe_div(2 * precision * recall, precision + recall) if (precision + recall) else 0.0
-    acc = safe_div(tp + tn, tp + tn + fp + fn)
-
-    return {
-        "TP": tp, "FP": fp, "FN": fn, "TN": tn,
-        "precision": precision, "recall": recall, "f1": f1, "accuracy": acc
-    }
-
-# -------------------------
+# ----------------------------
 # Main
-# -------------------------
+# ----------------------------
 
 def main():
+
     root = os.path.abspath(".")
     out_dir = os.path.join(root, "_outputs")
     if not os.path.isdir(out_dir):
         os.makedirs(out_dir)
 
-    gold_path = os.path.join(root, "gold_cleaned_for_cedar.csv")
-    stage_pred_path = os.path.join(root, "_outputs", "patient_stage_summary.csv")
-    op_path = os.path.join(root, "_staging_inputs", "HPI11526 Operation Notes.csv")
+    if not os.path.isfile(INPUT_NOTES):
+        raise IOError("Operation Notes CSV not found: {}".format(INPUT_NOTES))
 
-    if not os.path.isfile(gold_path):
-        raise IOError("Gold file not found: {}".format(gold_path))
-    if not os.path.isfile(stage_pred_path):
-        raise IOError("Stage prediction file not found: {}".format(stage_pred_path))
-    if not os.path.isfile(op_path):
-        raise IOError("Operation Notes CSV not found: {}".format(op_path))
+    df = read_csv_robust(INPUT_NOTES, dtype=str, low_memory=False)
 
-    print("Using:")
-    print("  Gold      :", gold_path)
-    print("  Stage Pred:", stage_pred_path)
-    print("  Op Notes  :", op_path)
-    print("")
+    required_cols = ["ENCRYPTED_PAT_ID", "NOTE_ID", "NOTE_TEXT"]
+    for c in required_cols:
+        if c not in df.columns:
+            raise ValueError("Missing required column: {}. Found: {}".format(c, list(df.columns)))
 
-    gold = normalize_cols(read_csv_robust(gold_path, dtype=str, low_memory=False))
-    stage_pred = normalize_cols(read_csv_robust(stage_pred_path, dtype=str, low_memory=False))
-    op = normalize_cols(read_csv_robust(op_path, dtype=str, low_memory=False))
+    df["ENCRYPTED_PAT_ID"] = df["ENCRYPTED_PAT_ID"].fillna("").astype(str)
 
-    # --- Build MRN <-> ENCRYPTED_PAT_ID map from op notes
-    op_mrn_col = pick_first_existing(op, ["MRN", "mrn"])
-    op_encpat_col = pick_first_existing(op, ["ENCRYPTED_PAT_ID", "ENCRYPTED_PATID", "ENCRYPTED_PATIENT_ID"])
-    if not op_mrn_col or not op_encpat_col:
-        raise ValueError("Op notes must contain MRN and ENCRYPTED_PAT_ID. Found: {}".format(list(op.columns)))
+    stage2_patients = set()
+    audit_rows = []
 
-    op["MRN"] = op[op_mrn_col].map(normalize_mrn)
-    op["ENCRYPTED_PAT_ID"] = op[op_encpat_col].map(normalize_id)
-    id_map = op[["ENCRYPTED_PAT_ID", "MRN"]].drop_duplicates()
-    id_map = id_map[(id_map["ENCRYPTED_PAT_ID"] != "") & (id_map["MRN"] != "")].copy()
+    for _, row in df.iterrows():
 
-    # --- Gold MRN + Stage2 applicable (gold label)
-    gold_mrn_col = pick_first_existing(gold, ["MRN", "mrn"])
-    if not gold_mrn_col:
-        raise ValueError("Gold missing MRN column.")
-    gold[gold_mrn_col] = gold[gold_mrn_col].map(normalize_mrn)
+        pat_id = str(row["ENCRYPTED_PAT_ID"]).strip()
+        note_id = str(row["NOTE_ID"])
+        text = str(row["NOTE_TEXT"])
 
-    gold_stage2_app_col = pick_first_existing(gold, ["Stage2_Applicable", "STAGE2_APPLICABLE"])
-    if not gold_stage2_app_col:
-        raise ValueError("Gold missing Stage2_Applicable (or STAGE2_APPLICABLE).")
-    gold["GOLD_HAS_STAGE2"] = gold[gold_stage2_app_col].map(to01).astype(int)
+        if not pat_id:
+            continue
 
-    # --- Stage Pred: must have ENCRYPTED_PAT_ID and HAS_STAGE2 (or STAGE2_DATE)
-    pred_enc_col = pick_first_existing(stage_pred, ["ENCRYPTED_PAT_ID", "ENCRYPTED_PATID", "ENCRYPTED_PATIENT_ID"])
-    if not pred_enc_col:
-        raise ValueError("Stage prediction file missing ENCRYPTED_PAT_ID. Found: {}".format(list(stage_pred.columns)))
+        if is_true_exchange(text):
 
-    if pred_enc_col != "ENCRYPTED_PAT_ID":
-        stage_pred = stage_pred.rename(columns={pred_enc_col: "ENCRYPTED_PAT_ID"})
-    stage_pred["ENCRYPTED_PAT_ID"] = stage_pred["ENCRYPTED_PAT_ID"].map(normalize_id)
+            stage2_patients.add(pat_id)
 
-    # Map to MRN via op-notes id_map
-    stage_pred = stage_pred.merge(id_map, on="ENCRYPTED_PAT_ID", how="left")
-    stage_pred["MRN"] = stage_pred["MRN"].fillna("").map(normalize_mrn)
+            for match in EXCHANGE_STRICT.finditer(text):
+                snippet = get_snippet(text, match)
+                audit_rows.append({
+                    "ENCRYPTED_PAT_ID": pat_id,
+                    "NOTE_ID": note_id,
+                    "MATCH_TERM": "exchange_strict",
+                    "SNIPPET": snippet,
+                    "SOURCE_FILE": os.path.basename(INPUT_NOTES),
+                })
 
-    # Pred stage2 signal
-    if "HAS_STAGE2" in stage_pred.columns:
-        stage_pred["PRED_HAS_STAGE2"] = stage_pred["HAS_STAGE2"].map(to01).astype(int)
-    elif "STAGE2_DATE" in stage_pred.columns:
-        stage_pred["PRED_HAS_STAGE2"] = stage_pred["STAGE2_DATE"].fillna("").map(lambda x: 1 if str(x).strip() else 0).astype(int)
-    else:
-        raise ValueError("Stage prediction file missing HAS_STAGE2 or STAGE2_DATE. Found: {}".format(list(stage_pred.columns)))
+    # ----------------------------
+    # Build patient_stage_summary.csv
+    # MUST contain: ENCRYPTED_PAT_ID + HAS_STAGE2
+    # ----------------------------
 
-    # Collapse to one row per MRN
-    stage_pred = stage_pred[stage_pred["MRN"] != ""].copy()
-    stage_pred = stage_pred.groupby("MRN", as_index=False)["PRED_HAS_STAGE2"].max()
+    unique_patients = df["ENCRYPTED_PAT_ID"].dropna().unique()
 
-    # Merge gold + pred
-    merged = gold.merge(
-        stage_pred,
-        left_on=gold_mrn_col,
-        right_on="MRN",
-        how="left",
-        suffixes=("", "_pred")
-    )
-    merged["PRED_HAS_STAGE2"] = merged["PRED_HAS_STAGE2"].fillna(0).astype(int)
+    summary_rows = []
+    for pid in unique_patients:
+        summary_rows.append({
+            "ENCRYPTED_PAT_ID": pid,
+            "HAS_STAGE2": 1 if pid in stage2_patients else 0
+        })
 
-    # Metrics
-    metrics = compute_binary_metrics(merged, "GOLD_HAS_STAGE2", "PRED_HAS_STAGE2")
+    summary_df = pd.DataFrame(summary_rows)
+    summary_df.to_csv(OUTPUT_SUMMARY, index=False)
 
-    # Outputs
-    merged_path = os.path.join(out_dir, "validation_merged_STAGE2_ANCHOR_FIXED.csv")
-    mism_path = os.path.join(out_dir, "validation_mismatches_STAGE2_ANCHOR_FIXED.csv")
-    metrics_path = os.path.join(out_dir, "validation_metrics_STAGE2_ANCHOR_FIXED.txt")
+    audit_df = pd.DataFrame(audit_rows)
+    audit_df.to_csv(OUTPUT_AUDIT, index=False)
 
-    merged.to_csv(merged_path, index=False)
-    merged[merged["GOLD_HAS_STAGE2"] != merged["PRED_HAS_STAGE2"]].to_csv(mism_path, index=False)
-
-    with open(metrics_path, "w") as f:
-        f.write("=== Stage2 Anchor (Applicable) ===\n")
-        f.write("TP: {TP}\nFP: {FP}\nFN: {FN}\nTN: {TN}\n".format(**metrics))
-        f.write("Precision: {:.4f}\n".format(metrics["precision"]))
-        f.write("Recall: {:.4f}\n".format(metrics["recall"]))
-        f.write("F1: {:.4f}\n".format(metrics["f1"]))
-        f.write("Accuracy: {:.4f}\n".format(metrics["accuracy"]))
-
-    print("")
-    print("Validation complete.")
-    print("Stage2 Anchor:")
-    print("  TP={TP} FP={FP} FN={FN} TN={TN}".format(**metrics))
-    print("  Precision={:.3f} Recall={:.3f} F1={:.3f}".format(
-        metrics["precision"], metrics["recall"], metrics["f1"]
-    ))
-    print("")
-    print("Wrote:")
-    print("  ", merged_path)
-    print("  ", mism_path)
-    print("  ", metrics_path)
+    print("Staging complete.")
+    print("Patients:", len(unique_patients))
+    print("Stage2 positive patients:", len(stage2_patients))
 
 if __name__ == "__main__":
     main()
