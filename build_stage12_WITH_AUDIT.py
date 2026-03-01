@@ -2,6 +2,12 @@
 # build_stage12_WITH_AUDIT.py
 # Uses ORIGINAL full-note source files: "HPI11526 * Notes.csv" (not DEID_*).
 # Merge key: MRN
+#
+# Revision goals (TP-preserving, reduce FP):
+# 1) Detect Stage2 per-NOTE (not on concatenated patient text), so we can require op/operative context.
+# 2) Add "op-context gate": accept hits only if the note looks like an OP/operative note OR contains operative sections.
+# 3) Add "history/plan gate": reject matches that are clearly historical ("s/p", "status post", "history of", "plan to", etc.)
+# 4) Keep your paths/structure the same.
 
 import os
 import re
@@ -35,15 +41,17 @@ MERGE_KEY = "MRN"
 # STAGE 2 PATTERNS
 # ==============================
 
+# Keep your original patterns, but we will (a) score hits per note, and (b) gate by OP context.
 STAGE2_IMPLANT_PATTERNS = [
     r"exchange of tissue expanders? to (permanent )?implants?",
     r"exchange.*tissue expanders?.*implants?",
     r"expander.*exchange.*implants?",
     r"tissue expanders?.*removed.*implants?",
+    r"\bimplant exchange\b",
+    # The next two are common FP sources in clinic notes; we keep them but only allow in OP context
     r"\bimplant(s)? (are )?in\b",
     r"now with silicone implants?",
     r"\bs/p\b.*exchange.*(silicone|implant)",
-    r"\bimplant exchange\b",
 ]
 
 NEGATION_PATTERNS = [
@@ -52,10 +60,48 @@ NEGATION_PATTERNS = [
     r"\bno implant\b",
 ]
 
+# New: "history/plan" cues that often drive FPs (especially in clinic notes / H&P)
+HISTORY_PLAN_CUES = [
+    r"\bhistory of\b",
+    r"\bstatus post\b",
+    r"\bs\/p\b",
+    r"\bprior\b",
+    r"\bprevious(ly)?\b",
+    r"\bplan(s|ned)? to\b",
+    r"\bwill (undergo|consider|proceed)\b",
+    r"\brecommended\b",
+    r"\bdiscussed\b",
+    r"\bhere for (follow[- ]?up|post[- ]?op)\b",
+]
+
+# New: OP/operative note context signals
+OP_NOTE_TYPE_CUES = [
+    r"\bop note\b",
+    r"\boperative\b",
+    r"\boperation\b",
+    r"\boperative report\b",
+    r"\bbrief op\b",
+    r"\bprocedure note\b",
+    r"\bsurgery\b",
+]
+
+OP_SECTION_CUES = [
+    r"\bprocedure\s*:",
+    r"\boperation\s*:",
+    r"\boperative\s+report\s*:",
+    r"\bbrief\s+op\s*:",
+    r"\bimplants?\s*:",
+    r"\bhospital\s+course\s*:",
+]
+
 CONTEXT_WINDOW = 250
+HISTORY_LEFT_WINDOW = 120  # look back this many chars before a match for history/plan cues
 
 IMPLANT_REGEX  = [re.compile(p, re.IGNORECASE | re.DOTALL) for p in STAGE2_IMPLANT_PATTERNS]
 NEGATION_REGEX = [re.compile(p, re.IGNORECASE | re.DOTALL) for p in NEGATION_PATTERNS]
+HISTORY_REGEX  = [re.compile(p, re.IGNORECASE) for p in HISTORY_PLAN_CUES]
+OPTYPE_REGEX   = [re.compile(p, re.IGNORECASE) for p in OP_NOTE_TYPE_CUES]
+OPSEC_REGEX    = [re.compile(p, re.IGNORECASE) for p in OP_SECTION_CUES]
 
 # ==============================
 # HELPERS
@@ -108,24 +154,90 @@ def pick_note_text_col(df: pd.DataFrame) -> str:
     for c in candidates:
         if c in df.columns:
             return c
-    # fallback: pick the widest-looking text column
     text_like = [c for c in df.columns if "TEXT" in c.upper() or "NOTE" in c.upper()]
     if text_like:
         return text_like[0]
     raise RuntimeError(f"No obvious note text column found. Columns seen: {list(df.columns)[:40]}")
 
+def pick_note_type_col(df: pd.DataFrame):
+    candidates = ["NOTE_TYPE", "NOTE_TYPE_NAME", "TYPE", "NOTE_CATEGORY", "DOCUMENT_TYPE"]
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+def pick_note_date_col(df: pd.DataFrame):
+    candidates = ["NOTE_DATETIME", "NOTE_DATE", "NOTE_DATE_RAW", "NOTE_DATETIME_RAW", "SERVICE_DATE", "DATE"]
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
 def contains_negation(snippet: str) -> bool:
     return any(rx.search(snippet) for rx in NEGATION_REGEX)
 
-def find_stage2_hits(text: str):
+def has_op_context(note_type: str, source_file: str, text: str) -> bool:
+    """
+    Conservative gate to preserve TP:
+      - If it's from "Operation Notes" file => OP context
+      - OR note_type has operative cues
+      - OR note has operative section headers
+    """
+    sf = (source_file or "").lower()
+    nt = (note_type or "")
+    if "operation" in sf or "operative" in sf or "op" in sf:
+        # "Clinic Notes" will fail this, "Operation Notes" will pass
+        if "clinic" not in sf:
+            return True
+
+    if any(rx.search(nt) for rx in OPTYPE_REGEX):
+        return True
+
+    if any(rx.search(text) for rx in OPSEC_REGEX):
+        return True
+
+    return False
+
+def looks_like_history_or_plan(text: str, match_start: int) -> bool:
+    """
+    If the LEFT context (before the match) contains history/plan cues, treat as likely FP.
+    """
+    if not text:
+        return False
+    left = text[max(0, match_start - HISTORY_LEFT_WINDOW):match_start]
+    return any(rx.search(left) for rx in HISTORY_REGEX)
+
+def find_stage2_hits_in_note(text: str, note_type: str, source_file: str):
+    """
+    Returns list of snippets for Stage2 hits IN THIS NOTE that pass:
+      - pattern match
+      - no negation nearby
+      - op-context gate
+      - not clearly historical/plan mention (left-window cue)
+    """
     hits = []
+    if not text:
+        return hits
+
+    op_ok = has_op_context(note_type, source_file, text)
+    if not op_ok:
+        # key FP reducer: do not allow any Stage2 hits from non-op-context notes
+        return hits
+
     for rx in IMPLANT_REGEX:
         for m in rx.finditer(text):
+            # history/plan check
+            if looks_like_history_or_plan(text, m.start()):
+                continue
+
             start = max(0, m.start() - CONTEXT_WINDOW)
             end   = min(len(text), m.end() + CONTEXT_WINDOW)
             snippet = text[start:end].replace("\n", " ")
-            if not contains_negation(snippet):
-                hits.append(snippet)
+            if contains_negation(snippet):
+                continue
+
+            hits.append(snippet)
+
     return hits
 
 def existing_files(paths, globs_list):
@@ -136,12 +248,10 @@ def existing_files(paths, globs_list):
     if found:
         return sorted(set(found))
 
-    # fallback glob search
     globbed = []
     for g in globs_list:
         globbed.extend(glob(g, recursive=True))
-    globbed = sorted(set(globbed))
-    return globbed
+    return sorted(set(globbed))
 
 # ==============================
 # MAIN
@@ -160,35 +270,71 @@ note_dfs = []
 for fp in note_files:
     df = clean_cols(read_csv_robust(fp))
     df = normalize_mrn(df)
+
     text_col = pick_note_text_col(df)
+    type_col = pick_note_type_col(df)
+    date_col = pick_note_date_col(df)
+
     df[text_col] = df[text_col].fillna("").astype(str)
-    df["_NOTE_TEXT_COL_"] = text_col
+    if type_col:
+        df[type_col] = df[type_col].fillna("").astype(str)
+    if date_col:
+        df[date_col] = df[date_col].fillna("").astype(str)
+
     df["_SOURCE_FILE_"] = os.path.basename(fp)
-    note_dfs.append(df[[MERGE_KEY, text_col, "_SOURCE_FILE_"]].rename(columns={text_col: "NOTE_TEXT"}))
+    df["_NOTE_TYPE_"]   = df[type_col] if type_col else ""
+    df["_NOTE_DATE_"]   = df[date_col] if date_col else ""
+
+    note_dfs.append(
+        df[[MERGE_KEY, text_col, "_SOURCE_FILE_", "_NOTE_TYPE_", "_NOTE_DATE_"]]
+        .rename(columns={text_col: "NOTE_TEXT"})
+    )
 
 notes = pd.concat(note_dfs, ignore_index=True)
 
-print("Aggregating notes by MRN...")
-patient_text = (
-    notes.groupby(MERGE_KEY)["NOTE_TEXT"]
-    .apply(lambda x: " ".join(x))
-    .reset_index()
-)
-
-print("Detecting Stage 2 events...")
+print("Detecting Stage 2 events (per-note, OP-context gated)...")
 summary_rows = []
 hit_rows = []
 
-for _, r in patient_text.iterrows():
+# Per-patient accumulators
+hit_count_by_mrn = {}
+has_stage2_by_mrn = {}
+
+for _, r in notes.iterrows():
     mrn = r[MERGE_KEY]
     text = r["NOTE_TEXT"]
+    source_file = r["_SOURCE_FILE_"]
+    note_type = r["_NOTE_TYPE_"]
+    note_date = r["_NOTE_DATE_"]
 
-    hits = find_stage2_hits(text)
-    has_stage2 = 1 if hits else 0
+    hits = find_stage2_hits_in_note(text, note_type, source_file)
 
-    summary_rows.append({MERGE_KEY: mrn, "HAS_STAGE2": has_stage2, "HIT_COUNT": len(hits)})
-    for h in hits:
-        hit_rows.append({MERGE_KEY: mrn, "SNIPPET": h})
+    if hits:
+        has_stage2_by_mrn[mrn] = 1
+        hit_count_by_mrn[mrn] = hit_count_by_mrn.get(mrn, 0) + len(hits)
+
+        for h in hits:
+            hit_rows.append({
+                MERGE_KEY: mrn,
+                "NOTE_DATE": note_date,
+                "NOTE_TYPE": note_type,
+                "SOURCE_FILE": source_file,
+                "SNIPPET": h
+            })
+    else:
+        # ensure patient appears even if no hits
+        if mrn not in has_stage2_by_mrn:
+            has_stage2_by_mrn[mrn] = 0
+        if mrn not in hit_count_by_mrn:
+            hit_count_by_mrn[mrn] = 0
+
+# Build summary_df from per-note pass
+for mrn, y in has_stage2_by_mrn.items():
+    summary_rows.append({
+        MERGE_KEY: mrn,
+        "HAS_STAGE2": int(y),
+        "HIT_COUNT": int(hit_count_by_mrn.get(mrn, 0))
+    })
 
 summary_df = pd.DataFrame(summary_rows)
 hits_df = pd.DataFrame(hit_rows)
