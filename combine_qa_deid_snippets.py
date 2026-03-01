@@ -9,7 +9,7 @@ Reads:
   ./QA_DEID_BUNDLES/<patient_id>/note_*.txt
 
 Writes:
-  ./_outputs/FN_deid_note_snippets.csv
+  ./_outputs/FP_deid_note_snippets.csv
 """
 
 from __future__ import print_function
@@ -18,7 +18,7 @@ import pandas as pd
 
 ROOT = os.path.abspath(".")
 QA_DIR = os.path.join(ROOT, "QA_DEID_BUNDLES")
-OUT_PATH = os.path.join(ROOT, "_outputs", "FN_deid_note_snippets.csv")
+OUT_PATH = os.path.join(ROOT, "_outputs", "FP_deid_note_snippets.csv")
 
 rows = []
 
