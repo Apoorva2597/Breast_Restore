@@ -103,7 +103,7 @@ def main():
     op = normalize_cols(read_csv_robust(OP_PATH, dtype=str, low_memory=False))
 
     # --- Required cols for fp logic
-    if "GOLD_HAS_STAGE2" not in merged.columns or "PRED_HAS_STAGE2" not in merged.columns:
+    if "GOLD_HAS_STAGE2" not in merged.columns or "HAS_STAGE2" not in merged.columns:
         raise ValueError(
             "Merged file missing GOLD_HAS_STAGE2 or HAS_STAGE2. Found: {}".format(list(merged.columns))
         )
