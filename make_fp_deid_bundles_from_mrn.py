@@ -105,7 +105,7 @@ def main():
     # --- Required cols for fp logic
     if "GOLD_HAS_STAGE2" not in merged.columns or "PRED_HAS_STAGE2" not in merged.columns:
         raise ValueError(
-            "Merged file missing GOLD_HAS_STAGE2 or PRED_HAS_STAGE2. Found: {}".format(list(merged.columns))
+            "Merged file missing GOLD_HAS_STAGE2 or HAS_STAGE2. Found: {}".format(list(merged.columns))
         )
 
     # --- MRN column in merged
