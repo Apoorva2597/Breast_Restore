@@ -1,47 +1,56 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-build_stage12_WITH_AUDIT.py  (Python 3.6.8 compatible)
+build_stage12_WITH_AUDIT.py (Python 3.6.8 compatible)
 
-STAGING + AUDIT (NO validation here)
+Staging ONLY (+audit). No validation.
 
-KEY BEHAVIOR (per your decision):
-- KEEP HAS_STAGE2 strict (for stable TN/FP in validation).
-- ADD a separate looser planning flag:
-    CANDIDATE_PLANNING = 1  (clinic/intention language)
-  This does NOT affect validation metrics unless you change HAS_STAGE2.
+Goal:
+- Produce patient_stage_summary.csv with columns expected by downstream tooling:
+  ENCRYPTED_PAT_ID, HAS_STAGE2, STAGE2_DATE, STAGE2_NOTE_ID, STAGE2_NOTE_TYPE,
+  STAGE2_MATCH_PATTERN, STAGE2_HITS, CANDIDATE_PLANNING
 
-RUN FROM: /home/apokol/Breast_Restore
+- Produce audit artifacts:
+  _outputs/stage2_audit_event_hits.csv
+  _outputs/stage2_audit_bucket_counts.csv
+  _outputs/stage2_candidate_planning_hits.csv
 
-INPUTS (auto if present):
-- ./_staging_inputs/HPI11526 Operation Notes.csv
-- ./_staging_inputs/HPI11526 Clinic Notes.csv   (optional; helps planning candidates)
-
-OUTPUTS:
-- ./_outputs/patient_stage_summary.csv                  (required by validator + freeze)
-- ./_outputs/stage2_audit_event_hits.csv                (row-level evidence + buckets)
-- ./_outputs/stage2_audit_bucket_counts.csv             (bucket counts)
-- ./_outputs/stage2_candidate_planning_hits.csv         (planning-only hits)
+Default input:
+  _staging_inputs/HPI11526 Operation Notes.csv
 """
 
 from __future__ import print_function
+
 import os
 import re
+import sys
 import pandas as pd
 
 
+# -------------------------
+# Config (paths)
+# -------------------------
+
 ROOT = os.path.abspath(".")
-STAGING_DIR = os.path.join(ROOT, "_staging_inputs")
+IN_DIR = os.path.join(ROOT, "_staging_inputs")
 OUT_DIR = os.path.join(ROOT, "_outputs")
 
-OUT_PATIENT_SUMMARY = os.path.join(OUT_DIR, "patient_stage_summary.csv")
+# Default input (override by CLI arg 1)
+DEFAULT_INPUT_NOTES = os.path.join(IN_DIR, "HPI11526 Operation Notes.csv")
+
+OUT_SUMMARY = os.path.join(OUT_DIR, "patient_stage_summary.csv")
 OUT_AUDIT_HITS = os.path.join(OUT_DIR, "stage2_audit_event_hits.csv")
 OUT_AUDIT_BUCKETS = os.path.join(OUT_DIR, "stage2_audit_bucket_counts.csv")
 OUT_PLANNING_HITS = os.path.join(OUT_DIR, "stage2_candidate_planning_hits.csv")
 
+# Promotion behavior:
+# - strict intraop signals => HAS_STAGE2=1
+# - promote ONLY high-confidence planning phrases => HAS_STAGE2=1 (optional)
+PROMOTE_PLANNING_TO_HAS_STAGE2 = True
+
 
 # -------------------------
-# Robust CSV reader (same style as validator)
+# Helpers
 # -------------------------
 
 def read_csv_robust(path, **kwargs):
@@ -52,11 +61,9 @@ def read_csv_robust(path, **kwargs):
             continue
     raise IOError("Failed to read CSV with common encodings: {}".format(path))
 
-
 def normalize_cols(df):
     df.columns = [str(c).replace(u"\xa0", " ").strip() for c in df.columns]
     return df
-
 
 def pick_first_existing(df, options):
     for c in options:
@@ -64,21 +71,7 @@ def pick_first_existing(df, options):
             return c
     return None
 
-
-def normalize_id(x):
-    if x is None:
-        return ""
-    s = str(x).strip()
-    if not s or s.lower() == "nan":
-        return ""
-    if s.endswith(".0"):
-        head = s[:-2]
-        if head.isdigit():
-            return head
-    return s
-
-
-def safe_str(x):
+def norm_str(x):
     if x is None:
         return ""
     s = str(x)
@@ -86,191 +79,185 @@ def safe_str(x):
         return ""
     return s
 
+def normalize_id(x):
+    s = norm_str(x).strip()
+    if not s:
+        return ""
+    # drop ".0" if numeric
+    if s.endswith(".0"):
+        head = s[:-2]
+        if head.isdigit():
+            return head
+    return s
 
-def lower_clean(x):
-    return safe_str(x).replace(u"\xa0", " ").lower()
+def safe_snip(text, m, window=140):
+    if text is None:
+        return ""
+    t = norm_str(text)
+    if not t:
+        return ""
+    try:
+        a = max(m.start() - window, 0)
+        b = min(m.end() + window, len(t))
+        return t[a:b].replace("\n", " ").replace("\r", " ").strip()
+    except Exception:
+        return (t[:2*window] + "...") if len(t) > 2*window else t
 
+def coalesce_service_date(row, date_cols):
+    for c in date_cols:
+        if c and c in row and norm_str(row[c]).strip():
+            return norm_str(row[c]).strip()
+    return ""
 
-def detect_text_columns(df):
-    preferred = ["NOTE_TEXT", "Text", "TEXT", "NOTE", "NOTE_BODY", "BODY", "SNIPPET", "Snippet"]
-    c = pick_first_existing(df, preferred)
-    if c:
-        return [c]
-
-    snip_cols = []
-    for col in df.columns:
-        cl = str(col).lower()
-        if cl.startswith("snip_") or "snippet" in cl:
-            snip_cols.append(col)
-
-    # common older columns
-    for c2 in ["SNIP_01", "SNIP_02", "SNIP_03", "SNIP_04", "SNIP_05"]:
-        if c2 in df.columns and c2 not in snip_cols:
-            snip_cols.append(c2)
-
-    return snip_cols
-
-
-def coalesce_text(row, text_cols):
-    parts = []
-    for c in text_cols:
-        v = safe_str(row.get(c, ""))
-        if v.strip():
-            parts.append(v)
-    return " ".join(parts).strip()
-
-
-# -------------------------
-# Note-type inference
-# -------------------------
-
-def infer_note_type(row, note_type_col, source_col):
-    blob = ""
-    if note_type_col:
-        blob += " " + lower_clean(row.get(note_type_col, ""))
-    if source_col:
-        blob += " " + lower_clean(row.get(source_col, ""))
-    b = blob.strip()
-
-    if any(k in b for k in ["operative", "operation", "op note", "brief op", "surgical", "or note", "operative report"]):
-        return "OP"
-    if any(k in b for k in ["clinic", "office", "follow-up", "follow up", "outpatient", "visit", "hpi"]):
-        return "CLINIC"
-    return "OP"
+def lower(text):
+    return norm_str(text).lower()
 
 
 # -------------------------
-# Core regex signals
+# Patterns
 # -------------------------
 
-RE_EXCHANGE = re.compile(
-    r"\b(exchange|exchanged|replace|replaced|replacement|remove(?:d)?\s+and\s+replace(?:d)?)\b.{0,90}\b"
-    r"(tissue\s+expander|expander|te)\b"
-    r"|"
-    r"\b(tissue\s+expander|expander|te)\b.{0,90}\b(exchange|exchanged|replace|replaced|replacement)\b",
-    re.I | re.S
-)
+# Intraoperative signals (to keep EXCHANGE_TIGHT precise)
+INTRAOP_CONTEXT = [
+    r"\bebl\b",
+    r"\bestimated blood loss\b",
+    r"\banesthesia\b",
+    r"\bintubat(ed|ion)\b",
+    r"\bdrain(s)?\b",
+    r"\bjp drain(s)?\b",
+    r"\bblake drain(s)?\b",
+    r"\b(specimen|specimens)\b",
+    r"\bsent (to )?path(ology)?\b",
+    r"\bcounts? (were )?(correct|accurate)\b",
+    r"\bprocedure\b",
+    r"\bincision\b",
+    r"\boperative (note|report)\b",
+    r"\bbrief op note\b",
+    r"\bfindings\b",
+]
 
-RE_IMPLANT = re.compile(
-    r"\b(implant|implants|prosthesis)\b"
-    r"|"
-    r"\b(permanent)\s+(silicone|saline)\s+implant(s)?\b"
-    r"|"
-    r"\b(silicone|saline)\s+(gel\s+)?implant(s)?\b",
-    re.I
-)
+# Core stage2 concepts (strict)
+STAGE2_CORE = [
+    # exchange / removal / implant placement
+    r"\bexchange\b",
+    r"\bexchanged\b",
+    r"\bimplant (placement|placed|inserted)\b",
+    r"\bimplant exchange\b",
+    r"\btissue expander (removal|removed|remove)\b",
+    r"\bexpander (removal|removed|remove)\b",
+    r"\bremove(d)? (the )?tissue expander(s)?\b",
+    r"\bpermanent implant(s)?\b",
+]
 
-RE_INTRAOP = re.compile(
-    r"\b(estimated\s+blood\s+loss|ebl)\b"
-    r"|"
-    r"\b(drains?\s+(?:were\s+)?(?:placed|left)|jp\s+drain|jackson[-\s]?pratt|blake\s+drain)\b"
-    r"|"
-    r"\b(specimen(s)?|sent\s+to\s+pathology|sent\s+to\s+path)\b"
-    r"|"
-    r"\b(anesthesia|general\s+anesthesia|mac\b|lma\b|intubat(ed|ion)|endotracheal)\b"
-    r"|"
-    r"\b(prepped\s+and\s+draped|time\s*out|counts?\s+were\s+correct|operating\s+room|or\s+suite)\b"
-    r"|"
-    r"\b(procedure(s)?|operative\s+report|post[-\s]?op(?:erative)?)\b",
-    re.I
-)
+# Tight exchange phrase + intraop context required
+EXCHANGE_TIGHT = r"\b(exchange (of )?(the )?(tissue )?expander(s)? (for|to) (a )?(permanent )?(silicone|saline)? ?implant(s)?|expander[- ]?to[- ]?implant exchange|exchange of tissue expander)\b"
 
-RE_FUTURE_PLAN = re.compile(
-    r"\b(plan(?:s|ned)?\s+to|will\s+(?:schedule|plan|proceed|return)\s+for|scheduled\s+for|anticipate)\b"
-    r".{0,140}\b(exchange|implant|expander|stage\s*2|second\s+stage)\b",
-    re.I | re.S
-)
+# Planning (looser) patterns
+PLANNING_ANY = [
+    r"\bplan(ned|s)?\b",
+    r"\bschedule(d|)\b",
+    r"\bwill (proceed|undergo|have)\b",
+    r"\bto be (scheduled|done)\b",
+    r"\bconsent(ed|)\b",
+    r"\bpre[- ]?op\b",
+    r"\bpreoperative\b",
+    r"\bpost[- ]?op\b",
+]
 
-RE_NEG_PLAN = re.compile(
-    r"\b(no\s+plans?|not\s+planning|never\s+scheduled|declines?\s+surgery|does\s+not\s+want)\b",
-    re.I
-)
+# High-confidence planning patterns (eligible for promotion)
+PLANNING_HIGHCONF = [
+    r"\b(scheduled|schedule)\b.*\b(exchange|implant exchange|expander exchange|remove(d)? (the )?(tissue )?expander)\b",
+    r"\bwill\b.*\b(exchange|implant exchange|expander exchange|remove(d)? (the )?(tissue )?expander)\b",
+    r"\bplan(ned|)\b.*\b(exchange|implant exchange|expander exchange|remove(d)? (the )?(tissue )?expander)\b",
+    r"\bconsent(ed|)\b.*\b(exchange|implant exchange|expander exchange)\b",
+    r"\bto (the )?(operating room|or)\b.*\b(exchange|implant exchange|expander exchange)\b",
+    r"\bprocedure\b.*\b(exchange|implant exchange|expander exchange)\b",
+]
 
-RE_STAGE2_PHRASE = re.compile(
-    r"\b(stage\s*2|second\s+stage|expander\s+to\s+implant|tissue\s+expander\s+to\s+implant)\b",
-    re.I
-)
+# Negative / de-emphasis (avoid some common false positives)
+NEGATIONS = [
+    r"\bno (plan|plans)\b",
+    r"\bnot (planning|scheduled)\b",
+    r"\bdecline(s|d)?\b.*\b(exchange|implant)\b",
+    r"\bdefer(s|red)?\b.*\b(exchange|implant)\b",
+]
 
-RE_COUNSEL = re.compile(
-    r"\b(discuss(ed|ion)?|counsel(ing)?|options?|risks?\s+and\s+benefits|consider(ing)?|candidate)\b",
-    re.I
-)
+
+# Compile regex
+RE_INTRAOP_CTX = re.compile("(" + "|".join(INTRAOP_CONTEXT) + ")", re.I)
+RE_EXCHANGE_TIGHT = re.compile(EXCHANGE_TIGHT, re.I)
+RE_STAGE2_CORE = re.compile("(" + "|".join(STAGE2_CORE) + ")", re.I)
+RE_PLAN_ANY = re.compile("(" + "|".join(PLANNING_ANY) + ")", re.I)
+RE_PLAN_HI = [re.compile(p, re.I) for p in PLANNING_HIGHCONF]
+RE_NEG = re.compile("(" + "|".join(NEGATIONS) + ")", re.I)
+
 
 # -------------------------
-# Buckets + scoring
+# Detection logic
 # -------------------------
 
-def bucket_score(bucket):
-    order = {
-        "DEFINITIVE_OP": 60,
-        "PROBABLE_OP": 50,
-        "POSSIBLE_OP": 40,
-        "EXCHANGE_ONLY_OP": 30,
-        "IMPLANT_ONLY_OP": 20,
-        "CLINIC_ONLY": 10,
-        "FUTURE_PLAN": 0,
-        "OTHER": -1,
-    }
-    return order.get(bucket, -1)
-
-
-def compute_has_stage2_strict(bucket):
-    # strict signal used by validator
-    return 1 if bucket in ["DEFINITIVE_OP", "PROBABLE_OP", "POSSIBLE_OP", "EXCHANGE_ONLY_OP"] else 0
-
-
-def compute_candidate_planning(note_type, text, has_exchange, has_implant):
+def detect_strict_stage2(text):
     """
-    Separate flag for planning/intention.
-    Does NOT change HAS_STAGE2.
-
-    Rule: planning/counsel/scheduled language + stage2 phrase OR exchange/implant concepts,
-    excluding explicit negation.
+    STRICT stage2: require an exchange/removal/implant pattern AND intraop context.
+    Returns: (is_hit, bucket_name, match_obj)
     """
-    if not text:
-        return 0, ""
+    t = norm_str(text)
+    if not t:
+        return (False, "", None)
 
-    if RE_NEG_PLAN.search(text):
-        return 0, ""
+    # Quick negatives
+    if RE_NEG.search(t):
+        # still allow intraop hits if clearly operative; but for simplicity,
+        # treat as block in strict path
+        return (False, "", None)
 
-    planning_cue = True if (RE_FUTURE_PLAN.search(text) or RE_COUNSEL.search(text)) else False
-    stage2_cue = True if (RE_STAGE2_PHRASE.search(text) or has_exchange or has_implant) else False
+    # Must have intraop context
+    if not RE_INTRAOP_CTX.search(t):
+        return (False, "", None)
 
-    if note_type == "CLINIC" and planning_cue and stage2_cue:
-        # label
-        if RE_FUTURE_PLAN.search(text) and RE_STAGE2_PHRASE.search(text):
-            return 1, "CLINIC_PLAN_STAGE2_PHRASE"
-        if RE_FUTURE_PLAN.search(text) and has_exchange:
-            return 1, "CLINIC_PLAN_EXCHANGE"
-        if RE_FUTURE_PLAN.search(text) and has_implant:
-            return 1, "CLINIC_PLAN_IMPLANT"
-        if RE_COUNSEL.search(text) and RE_STAGE2_PHRASE.search(text):
-            return 1, "CLINIC_COUNSEL_STAGE2_PHRASE"
-        return 1, "CLINIC_PLANNING_OTHER"
+    # Prefer tight exchange phrase
+    m = RE_EXCHANGE_TIGHT.search(t)
+    if m:
+        return (True, "INTRAOP_EXCHANGE_TIGHT", m)
 
-    # allow OP note planning too, but keep separate from HAS_STAGE2
-    if note_type == "OP" and planning_cue and stage2_cue:
-        return 1, "OP_PLANNING"
+    # Otherwise, require a core stage2 signal + intraop context
+    m2 = RE_STAGE2_CORE.search(t)
+    if m2:
+        return (True, "INTRAOP_STAGE2_CORE", m2)
 
-    return 0, ""
+    return (False, "", None)
 
+def detect_planning(text):
+    """
+    PLANNING candidate: clinic-note intent language mentioning exchange/removal/implant.
+    Returns:
+      (is_any_planning, is_highconf_planning, bucket_name, match_obj)
+    """
+    t = norm_str(text)
+    if not t:
+        return (False, False, "", None)
 
-def derive_bucket(note_type, is_future, has_exchange, has_implant, has_intraop):
-    if is_future:
-        return "FUTURE_PLAN"
-    if note_type == "CLINIC" and (has_exchange or has_implant or has_intraop):
-        return "CLINIC_ONLY"
-    if has_exchange and has_implant and has_intraop:
-        return "DEFINITIVE_OP"
-    if note_type == "OP" and has_exchange and has_implant:
-        return "PROBABLE_OP"
-    if note_type == "OP" and has_exchange and has_intraop:
-        return "POSSIBLE_OP"
-    if note_type == "OP" and has_exchange:
-        return "EXCHANGE_ONLY_OP"
-    if note_type == "OP" and has_implant and has_intraop:
-        return "IMPLANT_ONLY_OP"
-    return "OTHER"
+    # If explicit negative planning, skip
+    if RE_NEG.search(t):
+        return (False, False, "", None)
+
+    # Must have some planning language
+    if not RE_PLAN_ANY.search(t):
+        return (False, False, "", None)
+
+    # Must mention stage2 concept somewhere
+    core = RE_STAGE2_CORE.search(t)
+    if not core:
+        return (False, False, "", None)
+
+    # High-confidence patterns
+    for r in RE_PLAN_HI:
+        m = r.search(t)
+        if m:
+            return (True, True, "PLAN_HIGHCONF", m)
+
+    # Otherwise low-confidence planning
+    return (True, False, "PLAN_LOWERCONF", core)
 
 
 # -------------------------
@@ -281,199 +268,243 @@ def main():
     if not os.path.isdir(OUT_DIR):
         os.makedirs(OUT_DIR)
 
-    # Collect inputs (op notes mandatory; clinic optional)
-    inputs = []
-    op_path = os.path.join(STAGING_DIR, "HPI11526 Operation Notes.csv")
-    cl_path = os.path.join(STAGING_DIR, "HPI11526 Clinic Notes.csv")
+    input_notes = DEFAULT_INPUT_NOTES
+    if len(sys.argv) > 1 and sys.argv[1].strip():
+        input_notes = sys.argv[1].strip()
 
-    if os.path.isfile(op_path):
-        inputs.append(op_path)
-    else:
-        raise IOError("Operation Notes CSV not found: {}".format(op_path))
+    if not os.path.isfile(input_notes):
+        raise IOError("Input notes CSV not found: {}".format(input_notes))
 
-    if os.path.isfile(cl_path):
-        inputs.append(cl_path)
+    df = normalize_cols(read_csv_robust(input_notes, dtype=str, low_memory=False))
 
-    # Load + concat
-    dfs = []
-    for p in inputs:
-        d = normalize_cols(read_csv_robust(p, dtype=str, low_memory=False))
-        d["_SOURCE_FILE"] = os.path.basename(p)
-        dfs.append(d)
-    df = pd.concat(dfs, axis=0, ignore_index=True, sort=False)
-
+    # Required ID
     enc_col = pick_first_existing(df, ["ENCRYPTED_PAT_ID", "ENCRYPTED_PATID", "ENCRYPTED_PATIENT_ID"])
     if not enc_col:
-        raise ValueError("Missing ENCRYPTED_PAT_ID in inputs. Found: {}".format(list(df.columns)))
+        raise ValueError("Missing ENCRYPTED_PAT_ID in input notes. Found: {}".format(list(df.columns)))
     if enc_col != "ENCRYPTED_PAT_ID":
         df = df.rename(columns={enc_col: "ENCRYPTED_PAT_ID"})
     df["ENCRYPTED_PAT_ID"] = df["ENCRYPTED_PAT_ID"].map(normalize_id)
 
-    note_id_col = pick_first_existing(df, ["NOTE_ID", "NOTEID", "DOCUMENT_ID", "ID"])
-    note_type_col = pick_first_existing(df, ["NOTE_TYPE", "DOC_TYPE", "DOCUMENT_TYPE", "TYPE"])
-    date_col = pick_first_existing(df, ["NOTE_DATE", "DATE", "SERVICE_DATE", "DATE_OF_SERVICE", "VISIT_DATE"])
+    # Optional cols
+    mrn_col = pick_first_existing(df, ["MRN", "mrn"])
+    note_id_col = pick_first_existing(df, ["NOTE_ID", "NOTEID", "NOTE_ID_NUM", "NOTEID_NUM", "ENCOUNTER_NOTE_ID"])
+    note_type_col = pick_first_existing(df, ["NOTE_TYPE", "NOTE_TYPE_DESC", "NOTECLASS", "DOC_TYPE", "TYPE"])
+    date_col = pick_first_existing(df, ["SERVICE_DATE", "NOTE_DATE", "DATE", "VISIT_DATE", "ENCOUNTER_DATE"])
 
-    source_col = "_SOURCE_FILE"
+    # Text columns: prefer NOTE_TEXT / TEXT, else stitch SNIP_* / HPI / etc.
+    text_col = pick_first_existing(df, ["NOTE_TEXT", "TEXT", "NOTE", "DOCUMENT_TEXT", "CONTENT"])
+    snip_cols = [c for c in df.columns if c.upper().startswith("SNIP_")]
+    if not text_col and not snip_cols:
+        raise ValueError("Missing note text. Expected NOTE_TEXT/TEXT/NOTE or SNIP_* columns. Found: {}".format(list(df.columns)))
 
-    text_cols = detect_text_columns(df)
-    if not text_cols:
-        raise ValueError("Could not detect any text/snippet columns. Found: {}".format(list(df.columns)))
+    def get_text(row):
+        if text_col and text_col in row:
+            return norm_str(row[text_col])
+        # stitch snips
+        parts = []
+        for c in snip_cols:
+            v = norm_str(row.get(c, ""))
+            if v.strip():
+                parts.append(v.strip())
+        return "\n".join(parts)
 
+    # Iterate rows and build hit logs
     audit_rows = []
     planning_rows = []
 
-    # Per-patient best evidence trackers
-    best_strict = {}     # pid -> (score, rowdict)
-    best_plan = {}       # pid -> (score, rowdict)
+    # patient-level aggregation
+    # Keep earliest (date, note_id) among hits for STAGE2_DATE / NOTE_ID
+    pat = {}
 
-    # Iterate rows
-    for _, r in df.iterrows():
-        pid = normalize_id(r.get("ENCRYPTED_PAT_ID", ""))
-        if not pid:
+    for idx in range(len(df)):
+        row = df.iloc[idx]
+        enc = normalize_id(row.get("ENCRYPTED_PAT_ID", ""))
+        if not enc:
             continue
 
-        note_id = safe_str(r.get(note_id_col, "")) if note_id_col else ""
-        note_date = safe_str(r.get(date_col, "")) if date_col else ""
-        note_type = infer_note_type(r, note_type_col, source_col)
+        mrn = norm_str(row.get(mrn_col, "")).strip() if mrn_col else ""
+        note_id = norm_str(row.get(note_id_col, "")).strip() if note_id_col else ""
+        note_type = norm_str(row.get(note_type_col, "")).strip() if note_type_col else ""
+        svc_date = coalesce_service_date(row, [date_col])
 
-        text = coalesce_text(r, text_cols)
-        t = text  # already str
-        has_exchange = True if RE_EXCHANGE.search(t) else False
-        has_implant = True if RE_IMPLANT.search(t) else False
-        has_intraop = True if RE_INTRAOP.search(t) else False
-        is_future = True if RE_FUTURE_PLAN.search(t) else False
+        text = get_text(row)
 
-        bucket = derive_bucket(note_type, is_future, has_exchange, has_implant, has_intraop)
-        score = bucket_score(bucket)
-        has_stage2 = compute_has_stage2_strict(bucket)
-
-        # candidate planning (separate)
-        cand_plan, plan_pat = compute_candidate_planning(note_type, t, has_exchange, has_implant)
-
-        # keep audit rows for anything relevant
-        if (has_exchange or has_implant or has_intraop or is_future or cand_plan):
-            audit_rows.append({
-                "ENCRYPTED_PAT_ID": pid,
-                "NOTE_ID": note_id,
-                "NOTE_DATE": note_date,
-                "NOTE_TYPE": note_type,
-                "SOURCE_FILE": safe_str(r.get(source_col, "")),
-                "BUCKET": bucket,
-                "HAS_STAGE2_STRICT": int(has_stage2),
-                "CANDIDATE_PLANNING": int(cand_plan),
-                "PLANNING_PATTERN": plan_pat,
-                "HAS_EXCHANGE": int(has_exchange),
-                "HAS_IMPLANT": int(has_implant),
-                "HAS_INTRAOP": int(has_intraop),
-                "IS_FUTURE_PLAN": int(is_future),
-                "TEXT_SNIPPET": re.sub(r"\s+", " ", t[:520]).strip()
-            })
-
-        # update best strict evidence
-        if has_stage2 == 1:
-            prev = best_strict.get(pid)
-            cur = (score, note_date, note_id)
-            if (prev is None) or (cur > (prev[0], prev[1], prev[2])):
-                best_strict[pid] = (score, note_date, note_id, note_type, bucket)
-
-        # update best planning evidence (separate)
-        if cand_plan == 1:
-            # planning score: prefer CLINIC plan-stage2 > other plan; then date/id
-            pscore = 0
-            if plan_pat in ["CLINIC_PLAN_STAGE2_PHRASE", "CLINIC_PLAN_EXCHANGE", "CLINIC_PLAN_IMPLANT"]:
-                pscore = 20
-            elif plan_pat.startswith("CLINIC_"):
-                pscore = 10
-            else:
-                pscore = 5
-            prevp = best_plan.get(pid)
-            curp = (pscore, note_date, note_id)
-            if (prevp is None) or (curp > (prevp[0], prevp[1], prevp[2])):
-                best_plan[pid] = (pscore, note_date, note_id, note_type, plan_pat)
-
-            planning_rows.append({
-                "ENCRYPTED_PAT_ID": pid,
-                "NOTE_ID": note_id,
-                "NOTE_DATE": note_date,
-                "NOTE_TYPE": note_type,
-                "SOURCE_FILE": safe_str(r.get(source_col, "")),
-                "PLANNING_PATTERN": plan_pat,
-                "TEXT_SNIPPET": re.sub(r"\s+", " ", t[:520]).strip()
-            })
-
-    audit = pd.DataFrame(audit_rows)
-    planning = pd.DataFrame(planning_rows)
-
-    # Bucket counts
-    if not audit.empty:
-        bucket_counts = audit.groupby("BUCKET", as_index=False).size().rename(columns={"size": "COUNT"})
-    else:
-        bucket_counts = pd.DataFrame({"BUCKET": [], "COUNT": []})
-
-    # Build patient summary with required columns + new planning columns
-    all_pats = df["ENCRYPTED_PAT_ID"].map(normalize_id)
-    all_pats = all_pats[all_pats != ""].drop_duplicates()
-
-    out_rows = []
-    for pid in all_pats:
-        # strict
-        if pid in best_strict:
-            _, s_date, s_note_id, s_note_type, s_bucket = best_strict[pid]
-            has_stage2 = 1
-            out_rows.append({
-                "ENCRYPTED_PAT_ID": pid,
-                "HAS_STAGE2": 1,
-                "STAGE2_DATE": safe_str(s_date),
-                "STAGE2_NOTE_ID": safe_str(s_note_id),
-                "STAGE2_NOTE_TYPE": safe_str(s_note_type),
-                "STAGE2_MATCH_PATTERN": safe_str(s_bucket),
-                "STAGE2_HITS": 1
-            })
-        else:
-            out_rows.append({
-                "ENCRYPTED_PAT_ID": pid,
+        # init patient
+        if enc not in pat:
+            pat[enc] = {
+                "ENCRYPTED_PAT_ID": enc,
+                "MRN": mrn,
+                "HAS_STAGE2_STRICT": 0,
                 "HAS_STAGE2": 0,
                 "STAGE2_DATE": "",
                 "STAGE2_NOTE_ID": "",
                 "STAGE2_NOTE_TYPE": "",
                 "STAGE2_MATCH_PATTERN": "",
-                "STAGE2_HITS": 0
+                "STAGE2_HITS": 0,
+                "CANDIDATE_PLANNING": 0,
+                "PLANNING_HITS": 0,
+                "PLANNING_HIGHCONF_HITS": 0,
+                "BEST_STRICT_KEY": None,   # (date, note_id)
+                "BEST_PLAN_KEY": None,     # (date, note_id)
+                "BEST_PLAN_BUCKET": "",
+            }
+
+        # STRICT detection
+        is_strict, bucket, m = detect_strict_stage2(text)
+        if is_strict:
+            pat[enc]["HAS_STAGE2_STRICT"] = 1
+            pat[enc]["STAGE2_HITS"] += 1
+
+            # choose earliest hit as representative
+            key = (svc_date or "9999-12-31", note_id or "ZZZ")
+            best = pat[enc]["BEST_STRICT_KEY"]
+            if (best is None) or (key < best):
+                pat[enc]["BEST_STRICT_KEY"] = key
+                pat[enc]["STAGE2_DATE"] = svc_date
+                pat[enc]["STAGE2_NOTE_ID"] = note_id
+                pat[enc]["STAGE2_NOTE_TYPE"] = note_type
+                pat[enc]["STAGE2_MATCH_PATTERN"] = bucket
+
+            audit_rows.append({
+                "ENCRYPTED_PAT_ID": enc,
+                "MRN": mrn,
+                "NOTE_ID": note_id,
+                "NOTE_TYPE": note_type,
+                "SERVICE_DATE": svc_date,
+                "BUCKET": bucket,
+                "MATCH_TERM": m.group(0) if m else "",
+                "SNIPPET": safe_snip(text, m) if m else (norm_str(text)[:300] if text else ""),
+                "SOURCE_FILE": os.path.basename(input_notes),
             })
 
-    out = pd.DataFrame(out_rows)
+        # PLANNING detection (independent logging)
+        is_plan, is_hi, plan_bucket, pm = detect_planning(text)
+        if is_plan:
+            pat[enc]["CANDIDATE_PLANNING"] = 1
+            pat[enc]["PLANNING_HITS"] += 1
+            if is_hi:
+                pat[enc]["PLANNING_HIGHCONF_HITS"] += 1
 
-    # Add separate planning columns (does not affect validator)
-    out["CANDIDATE_PLANNING"] = 0
-    out["PLANNING_DATE"] = ""
-    out["PLANNING_NOTE_ID"] = ""
-    out["PLANNING_NOTE_TYPE"] = ""
-    out["PLANNING_MATCH_PATTERN"] = ""
+            keyp = (svc_date or "9999-12-31", note_id or "ZZZ")
+            bestp = pat[enc]["BEST_PLAN_KEY"]
+            # store earliest highconf planning as representative (else earliest planning)
+            if is_hi:
+                if (bestp is None) or (keyp < bestp) or (pat[enc]["BEST_PLAN_BUCKET"] != "PLAN_HIGHCONF"):
+                    pat[enc]["BEST_PLAN_KEY"] = keyp
+                    pat[enc]["BEST_PLAN_BUCKET"] = "PLAN_HIGHCONF"
+            else:
+                if (bestp is None) and (pat[enc]["BEST_PLAN_BUCKET"] == ""):
+                    pat[enc]["BEST_PLAN_KEY"] = keyp
+                    pat[enc]["BEST_PLAN_BUCKET"] = plan_bucket
 
-    for pid, tup in best_plan.items():
-        _, p_date, p_note_id, p_note_type, p_pat = tup
-        m = (out["ENCRYPTED_PAT_ID"] == pid)
-        out.loc[m, "CANDIDATE_PLANNING"] = 1
-        out.loc[m, "PLANNING_DATE"] = safe_str(p_date)
-        out.loc[m, "PLANNING_NOTE_ID"] = safe_str(p_note_id)
-        out.loc[m, "PLANNING_NOTE_TYPE"] = safe_str(p_note_type)
-        out.loc[m, "PLANNING_MATCH_PATTERN"] = safe_str(p_pat)
+            planning_rows.append({
+                "ENCRYPTED_PAT_ID": enc,
+                "MRN": mrn,
+                "NOTE_ID": note_id,
+                "NOTE_TYPE": note_type,
+                "SERVICE_DATE": svc_date,
+                "PLAN_BUCKET": plan_bucket,
+                "IS_HIGHCONF": 1 if is_hi else 0,
+                "MATCH_TERM": pm.group(0) if pm else "",
+                "SNIPPET": safe_snip(text, pm) if pm else (norm_str(text)[:300] if text else ""),
+                "SOURCE_FILE": os.path.basename(input_notes),
+            })
+
+    # Finalize HAS_STAGE2 with promotion rule
+    has_stage2_ct = 0
+    strict_ct = 0
+    planning_ct = 0
+
+    for enc, rec in pat.items():
+        strict = 1 if rec.get("HAS_STAGE2_STRICT", 0) else 0
+        plan_hi = 1 if rec.get("PLANNING_HIGHCONF_HITS", 0) > 0 else 0
+
+        rec["HAS_STAGE2"] = 1 if strict else 0
+        if PROMOTE_PLANNING_TO_HAS_STAGE2 and (not strict) and plan_hi:
+            # Promote: represent using earliest highconf planning hit if no strict hit exists
+            rec["HAS_STAGE2"] = 1
+            # If we have no STAGE2_DATE from strict, set placeholder metadata so validation sees HAS_STAGE2=1
+            if not rec.get("STAGE2_MATCH_PATTERN"):
+                rec["STAGE2_MATCH_PATTERN"] = "PROMOTED_PLAN_HIGHCONF"
+            if not rec.get("STAGE2_DATE"):
+                # represent with earliest planning key if known
+                kp = rec.get("BEST_PLAN_KEY")
+                if kp:
+                    rec["STAGE2_DATE"] = kp[0] if kp[0] != "9999-12-31" else ""
+                    rec["STAGE2_NOTE_ID"] = rec.get("STAGE2_NOTE_ID") or ""
+            if not rec.get("STAGE2_NOTE_TYPE"):
+                rec["STAGE2_NOTE_TYPE"] = rec.get("STAGE2_NOTE_TYPE") or ""
+
+        if rec["HAS_STAGE2"]:
+            has_stage2_ct += 1
+        if strict:
+            strict_ct += 1
+        if rec.get("CANDIDATE_PLANNING", 0):
+            planning_ct += 1
+
+    # Build summary DF (keep MRN if present, but validation only needs ENCRYPTED_PAT_ID + HAS_STAGE2 or STAGE2_DATE)
+    summary_rows = []
+    for enc, rec in pat.items():
+        summary_rows.append({
+            "ENCRYPTED_PAT_ID": rec.get("ENCRYPTED_PAT_ID", ""),
+            "MRN": rec.get("MRN", ""),
+            "HAS_STAGE2": int(rec.get("HAS_STAGE2", 0)),
+            "HAS_STAGE2_STRICT": int(rec.get("HAS_STAGE2_STRICT", 0)),
+            "STAGE2_DATE": rec.get("STAGE2_DATE", ""),
+            "STAGE2_NOTE_ID": rec.get("STAGE2_NOTE_ID", ""),
+            "STAGE2_NOTE_TYPE": rec.get("STAGE2_NOTE_TYPE", ""),
+            "STAGE2_MATCH_PATTERN": rec.get("STAGE2_MATCH_PATTERN", ""),
+            "STAGE2_HITS": int(rec.get("STAGE2_HITS", 0)),
+            "CANDIDATE_PLANNING": int(rec.get("CANDIDATE_PLANNING", 0)),
+            "PLANNING_HITS": int(rec.get("PLANNING_HITS", 0)),
+            "PLANNING_HIGHCONF_HITS": int(rec.get("PLANNING_HIGHCONF_HITS", 0)),
+        })
+
+    summary = pd.DataFrame(summary_rows)
+    summary = summary[summary["ENCRYPTED_PAT_ID"] != ""].copy()
+
+    # Audit hits
+    audit_df = pd.DataFrame(audit_rows) if audit_rows else pd.DataFrame(
+        columns=["ENCRYPTED_PAT_ID", "MRN", "NOTE_ID", "NOTE_TYPE", "SERVICE_DATE", "BUCKET", "MATCH_TERM", "SNIPPET", "SOURCE_FILE"]
+    )
+    plan_df = pd.DataFrame(planning_rows) if planning_rows else pd.DataFrame(
+        columns=["ENCRYPTED_PAT_ID", "MRN", "NOTE_ID", "NOTE_TYPE", "SERVICE_DATE", "PLAN_BUCKET", "IS_HIGHCONF", "MATCH_TERM", "SNIPPET", "SOURCE_FILE"]
+    )
+
+    # Bucket counts
+    bucket_counts = []
+    if len(audit_df) > 0:
+        bc = audit_df.groupby("BUCKET", as_index=False).size()
+        # pandas 0.24 compatibility: 'size' comes as column named 0 sometimes; normalize
+        if "size" not in bc.columns:
+            # find the size column
+            size_col = [c for c in bc.columns if c != "BUCKET"][0]
+            bc = bc.rename(columns={size_col: "COUNT"})
+        else:
+            bc = bc.rename(columns={"size": "COUNT"})
+        bc = bc.sort_values("COUNT", ascending=False)
+        for _, r in bc.iterrows():
+            bucket_counts.append({"BUCKET": r["BUCKET"], "COUNT": int(r["COUNT"])})
+    bucket_df = pd.DataFrame(bucket_counts) if bucket_counts else pd.DataFrame(columns=["BUCKET", "COUNT"])
 
     # Write outputs
-    out.to_csv(OUT_PATIENT_SUMMARY, index=False)
-    audit.to_csv(OUT_AUDIT_HITS, index=False)
-    bucket_counts.to_csv(OUT_AUDIT_BUCKETS, index=False)
-    planning.to_csv(OUT_PLANNING_HITS, index=False)
+    summary.to_csv(OUT_SUMMARY, index=False)
+    audit_df.to_csv(OUT_AUDIT_HITS, index=False)
+    bucket_df.to_csv(OUT_AUDIT_BUCKETS, index=False)
+    plan_df.to_csv(OUT_PLANNING_HITS, index=False)
 
-    # Console summary
+    # Print run summary
     print("Staging complete.")
-    print("Patients:", int(out["ENCRYPTED_PAT_ID"].nunique()))
-    print("HAS_STAGE2=1 (strict):", int((out["HAS_STAGE2"] == 1).sum()))
-    print("CANDIDATE_PLANNING=1:", int((out["CANDIDATE_PLANNING"] == 1).sum()))
+    print("Patients: {}".format(int(summary["ENCRYPTED_PAT_ID"].nunique())))
+    print("Events: {}".format(int(len(audit_df))))
+    print("HAS_STAGE2=1 (strict): {}".format(int(strict_ct)))
+    print("HAS_STAGE2=1 (final):  {}".format(int(has_stage2_ct)))
+    print("CANDIDATE_PLANNING=1:  {}".format(int(planning_ct)))
     print("Wrote:")
-    print(" ", OUT_PATIENT_SUMMARY)
-    print(" ", OUT_AUDIT_HITS)
-    print(" ", OUT_AUDIT_BUCKETS)
-    print(" ", OUT_PLANNING_HITS)
+    print("  {}".format(OUT_SUMMARY))
+    print("  {}".format(OUT_AUDIT_HITS))
+    print("  {}".format(OUT_AUDIT_BUCKETS))
+    print("  {}".format(OUT_PLANNING_HITS))
 
 
 if __name__ == "__main__":
