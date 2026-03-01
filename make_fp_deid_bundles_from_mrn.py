@@ -27,7 +27,10 @@ import pandas as pd
 
 
 ROOT = os.path.abspath(".")
-MERGED_PATH = os.path.join(ROOT, "_outputs", "validation_merged_STAGE2_ANCHOR_FIXED.csv")
+MERGED_PATH = os.path.join(
+    ROOT,
+    "_outputs",
+    "stage2_rules_20260301_135501_validation_merged.csv"  
 OP_PATH = os.path.join(ROOT, "_staging_inputs", "HPI11526 Operation Notes.csv")
 
 OUT_IDS = os.path.join(ROOT, "_outputs", "FP_deid_patient_ids.csv")  # NO MRN column
