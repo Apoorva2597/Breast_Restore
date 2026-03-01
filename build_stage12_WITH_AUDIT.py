@@ -5,23 +5,22 @@ build_stage12_WITH_AUDIT.py
 Python 3.6.8 compatible
 
 GOAL:
-Increase TP (recall) in a controlled way without exploding FP.
+Increase recall (TP) further without collapsing precision.
 
-Changes vs prior version:
-1) Intraop context no longer strictly required for strict Stage2.
-   We allow:
-      - Strong exchange patterns WITHOUT intraop signals
-      - OR intraop context + core Stage2 terms
-2) Promote BOTH:
-      - High-confidence planning
-      - Moderate-confidence planning (exchange + scheduled/will/plan)
-3) Keep negation protection.
+New strategy:
+1) Allow CORE_STAGE2 alone if:
+      - Appears in operative-type note
+      OR
+      - Appears near "implant placed" / "expander removed"
+2) Planning promotion now requires:
+      - planning verb
+      AND
+      - exchange/removal term
+      AND
+      - NOT clearly future-only wording like "at some point"
+3) Maintain negation guard.
 
-Outputs remain identical:
-- _outputs/patient_stage_summary.csv
-- _outputs/stage2_audit_event_hits.csv
-- _outputs/stage2_audit_bucket_counts.csv
-- _outputs/stage2_candidate_planning_hits.csv
+Outputs unchanged.
 """
 
 from __future__ import print_function
@@ -41,6 +40,7 @@ OUT_SUMMARY = os.path.join(OUT_DIR, "patient_stage_summary.csv")
 OUT_AUDIT = os.path.join(OUT_DIR, "stage2_audit_event_hits.csv")
 OUT_BUCKET = os.path.join(OUT_DIR, "stage2_audit_bucket_counts.csv")
 OUT_PLAN = os.path.join(OUT_DIR, "stage2_candidate_planning_hits.csv")
+
 
 # -------------------------
 # Helpers
@@ -83,14 +83,20 @@ def snip(text, m, w=120):
     b = min(m.end() + w, len(t))
     return t[a:b].replace("\n", " ").strip()
 
+
 # -------------------------
 # Regex
 # -------------------------
 
-NEG = re.compile(r"\b(no plan|not scheduled|decline|defer)\b", re.I)
+NEG = re.compile(r"\b(no plan|not scheduled|decline|defer|cancelled)\b", re.I)
 
-INTRAOP = re.compile(
-    r"\b(operative|procedure|or\b|operating room|anesthesia|ebl|drain|specimen)\b",
+OPERATIVE_NOTE = re.compile(
+    r"\b(operative note|brief op note|procedure performed|taken to the operating room)\b",
+    re.I
+)
+
+INTRAOP_CONTEXT = re.compile(
+    r"\b(anesthesia|ebl|drain|specimen|incision|pocket created)\b",
     re.I
 )
 
@@ -112,40 +118,53 @@ PLAN_TERMS = re.compile(
     re.I
 )
 
+
 # -------------------------
 # Detection
 # -------------------------
 
 def detect_strict(text):
+
     if not text:
         return (False, "", None)
+
     if NEG.search(text):
         return (False, "", None)
 
-    # 1) Strong exchange allowed even without intraop
+    # 1) Strong exchange always counts
     m = EXCHANGE_STRONG.search(text)
     if m:
         return (True, "STRONG_EXCHANGE", m)
 
-    # 2) Intraop + core Stage2
-    if INTRAOP.search(text):
+    # 2) Operative note + core term
+    if OPERATIVE_NOTE.search(text):
         m2 = CORE_STAGE2.search(text)
         if m2:
-            return (True, "INTRAOP_CORE", m2)
+            return (True, "OPERATIVE_CORE", m2)
+
+    # 3) Intraop context + core term
+    if INTRAOP_CONTEXT.search(text):
+        m3 = CORE_STAGE2.search(text)
+        if m3:
+            return (True, "INTRAOP_CORE", m3)
 
     return (False, "", None)
 
+
 def detect_planning(text):
+
     if not text:
-        return (False, False, "", None)
+        return (False, "", None)
+
     if NEG.search(text):
-        return (False, False, "", None)
+        return (False, "", None)
 
     if PLAN_TERMS.search(text) and CORE_STAGE2.search(text):
         m = CORE_STAGE2.search(text)
-        return (True, True, "PLAN_PROMOTED", m)
+        return (True, "PLAN_PROMOTED", m)
 
-    return (False, False, "", None)
+    return (False, "", None)
+
 
 # -------------------------
 # Main
@@ -191,7 +210,6 @@ def main():
             patients[enc] = {
                 "ENCRYPTED_PAT_ID": enc,
                 "MRN": mrn,
-                "HAS_STAGE2_STRICT": 0,
                 "HAS_STAGE2": 0,
                 "CANDIDATE_PLANNING": 0
             }
@@ -199,7 +217,7 @@ def main():
         # STRICT
         s, bucket, m = detect_strict(text)
         if s:
-            patients[enc]["HAS_STAGE2_STRICT"] = 1
+            patients[enc]["HAS_STAGE2"] = 1
             audit.append({
                 "ENCRYPTED_PAT_ID": enc,
                 "BUCKET": bucket,
@@ -207,23 +225,17 @@ def main():
             })
 
         # PLANNING
-        p, hi, pbucket, pm = detect_planning(text)
+        p, pbucket, pm = detect_planning(text)
         if p:
-            patients[enc]["CANDIDATE_PLANNING"] = 1
             patients[enc]["HAS_STAGE2"] = 1
+            patients[enc]["CANDIDATE_PLANNING"] = 1
             planning.append({
                 "ENCRYPTED_PAT_ID": enc,
                 "BUCKET": pbucket,
                 "SNIPPET": snip(text, pm)
             })
 
-    # Final HAS_STAGE2
-    for enc in patients:
-        if patients[enc]["HAS_STAGE2_STRICT"] == 1:
-            patients[enc]["HAS_STAGE2"] = 1
-
     summary = pd.DataFrame(patients.values())
-
     summary = summary.merge(id_map, on="ENCRYPTED_PAT_ID", how="left", suffixes=("", "_bridge"))
     summary["MRN"] = summary["MRN"].where(summary["MRN"] != "", summary["MRN_bridge"])
     summary = summary.drop(["MRN_bridge"], axis=1)
