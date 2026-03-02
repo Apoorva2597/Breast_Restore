@@ -42,7 +42,7 @@ STRONG_STAGE2_PATTERNS = [
     r"exchange.*tissue expanders?.*implants?",
     r"expander.*exchange.*implants?",
     r"tissue expanders?.*removed.*implants?",
-    r"\bimplant exchange\b",
+    r"\bimplant exchange\b.*\b(performed|completed|done|underwent|was performed)\b",
     r"\b(expander|tissue expander).{0,40}\b(remov(ed|al)|exchang(e|ed))\b.{0,80}\bimplant",
 ]
 
