@@ -3,8 +3,10 @@
 # Uses ORIGINAL full-note source files: "HPI11526 * Notes.csv" (not DEID_*).
 # Merge key: MRN
 #
-# Revision (balanced): preserve TP/recall by allowing STRONG Stage2 phrases anywhere,
-# while OP-gating only WEAK/ambiguous implant mentions to reduce FP.
+# Revision (FP reduction, minimal TP risk):
+#  1) Tighten OP-context detection so "Procedure:" in clinic templates doesn't unlock WEAK hits.
+#  2) Block historical "s/p / status post / history of implant exchange" mentions even though they contain verbs,
+#     unless OP context OR explicit execution cues (underwent/performed/completed) are nearby.
 
 import os
 import re
@@ -42,7 +44,7 @@ STRONG_STAGE2_PATTERNS = [
     r"exchange.*tissue expanders?.*implants?",
     r"expander.*exchange.*implants?",
     r"tissue expanders?.*removed.*implants?",
-    r"\bimplant exchange\b.*\b(performed|completed|done|underwent|was performed)\b",
+    # Note: intentionally NOT using generic r"\bimplant exchange\b" (high FP in Hx)
     r"\b(expander|tissue expander).{0,40}\b(remov(ed|al)|exchang(e|ed))\b.{0,80}\bimplant",
 ]
 
@@ -59,7 +61,7 @@ NEGATION_PATTERNS = [
     r"\bno implant\b",
 ]
 
-# History/plan cues (we apply mainly to WEAK hits, or STRONG hits only if no procedure verbs nearby)
+# History/plan cues (mostly used to block background mentions)
 HISTORY_PLAN_CUES = [
     r"\bhistory of\b",
     r"\bstatus post\b",
@@ -72,7 +74,17 @@ HISTORY_PLAN_CUES = [
     r"\bdiscussed\b",
 ]
 
-# OP/operative note context signals (used only to “unlock” WEAK hits)
+# If we see these nearby, we allow even if history cues exist (because it reads like an event)
+EXECUTION_CUES = [
+    r"\bunderwent\b",
+    r"\bwas performed\b",
+    r"\bperformed\b",
+    r"\bcompleted\b",
+    r"\bdone\b",
+    r"\bs/p\s+(removal|exchange|placement)\b",  # OPTIONAL: comment out if you see it reintroduces FPs
+]
+
+# OP/operative note context signals (used to “unlock” WEAK hits)
 OP_NOTE_TYPE_CUES = [
     r"\bop note\b",
     r"\boperative\b",
@@ -82,13 +94,13 @@ OP_NOTE_TYPE_CUES = [
     r"\bprocedure note\b",
 ]
 
+# Section header cues (ONLY count if note seems operative; clinic templates often have "Procedure:")
 OP_SECTION_CUES = [
-    r"\bprocedure\s*:",
-    r"\boperation\s*:",
     r"\boperative\s+report\s*:",
     r"\bbrief\s+op\s*:",
     r"\bimplants?\s*:",
     r"\bhospital\s+course\s*:",
+    # intentionally REMOVED: r"\bprocedure\s*:" and r"\boperation\s*:" (common in clinic templates)
 ]
 
 # procedure verbs that indicate an actual event (helps rescue recall)
@@ -108,6 +120,7 @@ STRONG_REGEX   = [re.compile(p, re.IGNORECASE | re.DOTALL) for p in STRONG_STAGE
 WEAK_REGEX     = [re.compile(p, re.IGNORECASE | re.DOTALL) for p in WEAK_STAGE2_PATTERNS]
 NEGATION_REGEX = [re.compile(p, re.IGNORECASE | re.DOTALL) for p in NEGATION_PATTERNS]
 HISTORY_REGEX  = [re.compile(p, re.IGNORECASE) for p in HISTORY_PLAN_CUES]
+EXEC_REGEX     = [re.compile(p, re.IGNORECASE) for p in EXECUTION_CUES]
 OPTYPE_REGEX   = [re.compile(p, re.IGNORECASE) for p in OP_NOTE_TYPE_CUES]
 OPSEC_REGEX    = [re.compile(p, re.IGNORECASE) for p in OP_SECTION_CUES]
 PROCVERB_REGEX = [re.compile(p, re.IGNORECASE) for p in PROCEDURE_VERB_CUES]
@@ -185,7 +198,17 @@ def around_has_procedure_verb(text: str, match_start: int, match_end: int) -> bo
     around = text[max(0, match_start - AROUND_WINDOW):min(len(text), match_end + AROUND_WINDOW)]
     return any(rx.search(around) for rx in PROCVERB_REGEX)
 
+def around_has_execution_cue(text: str, match_start: int, match_end: int) -> bool:
+    around = text[max(0, match_start - AROUND_WINDOW):min(len(text), match_end + AROUND_WINDOW)]
+    return any(rx.search(around) for rx in EXEC_REGEX)
+
 def has_op_context(note_type: str, source_file: str, text: str) -> bool:
+    """
+    Tightened OP-context:
+      - Strong if source_file indicates operation/operative
+      - Strong if NOTE_TYPE indicates op/operative
+      - Section headers ONLY count if the note also contains operative-language (to avoid clinic templates)
+    """
     sf = (source_file or "").lower()
     nt = (note_type or "")
 
@@ -197,8 +220,10 @@ def has_op_context(note_type: str, source_file: str, text: str) -> bool:
     if any(rx.search(nt) for rx in OPTYPE_REGEX):
         return True
 
-    # section header cue
-    if any(rx.search(text) for rx in OPSEC_REGEX):
+    # section header cue ONLY if text contains operative-ish words (prevents clinic template "Procedure:")
+    tl = (text or "").lower()
+    operative_language = ("operative" in tl) or ("op note" in tl) or ("operative report" in tl) or ("brief op" in tl)
+    if operative_language and any(rx.search(text) for rx in OPSEC_REGEX):
         return True
 
     return False
@@ -210,7 +235,7 @@ def extract_hits(text: str, regex_list, label: str, note_type: str, source_file:
       - apply history/plan filter strongly
     gate_weak=False means:
       - allow STRONG patterns without OP-context
-      - history/plan filter only blocks if NO procedure verb nearby
+      - history/plan filter blocks background mentions unless OP context OR execution cues are nearby
     """
     hits = []
     if not text:
@@ -220,7 +245,6 @@ def extract_hits(text: str, regex_list, label: str, note_type: str, source_file:
 
     for rx in regex_list:
         for m in rx.finditer(text):
-            # build snippet
             start = max(0, m.start() - CONTEXT_WINDOW)
             end   = min(len(text), m.end() + CONTEXT_WINDOW)
             snippet = text[start:end].replace("\n", " ")
@@ -229,16 +253,23 @@ def extract_hits(text: str, regex_list, label: str, note_type: str, source_file:
             if contains_negation(snippet):
                 continue
 
-            # gating rules
+            hist_left = left_has_history_cue(text, m.start())
+            has_proc  = around_has_procedure_verb(text, m.start(), m.end())
+            has_exec  = around_has_execution_cue(text, m.start(), m.end())
+
             if gate_weak:
+                # WEAK: must be operative-context; then drop if Hx/plan
                 if not op_ok:
                     continue
-                # if it's WEAK and has history cues, drop it
-                if left_has_history_cue(text, m.start()):
+                if hist_left:
                     continue
             else:
-                # STRONG: only drop on history cue if it looks like background (no procedure verbs nearby)
-                if left_has_history_cue(text, m.start()) and not around_has_procedure_verb(text, m.start(), m.end()) and not op_ok:
+                # STRONG: if Hx/plan on left, block unless OP-context or explicit execution cue
+                # This specifically targets: "status post / s/p / history of ... exchange" FPs
+                if hist_left and (not op_ok) and (not has_exec):
+                    continue
+                # Keep your prior guard for non-op background mentions (still useful)
+                if hist_left and (not has_proc) and (not op_ok):
                     continue
 
             hits.append((label, snippet))
@@ -297,7 +328,7 @@ for fp in note_files:
 
 notes = pd.concat(note_dfs, ignore_index=True)
 
-print("Detecting Stage 2 events (balanced STRONG+WEAK logic)...")
+print("Detecting Stage 2 events (STRONG+WEAK with tightened OP-context + Hx blocking)...")
 summary_rows = []
 hit_rows = []
 
