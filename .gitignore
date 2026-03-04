@@ -1,18 +1,24 @@
+# =========================
 # environments / caches
+# =========================
 .venv/
 __pycache__/
 **/__pycache__/
 *.pyc
 .ipynb_checkpoints/
 
+# =========================
 # outputs and generated artifacts
+# =========================
 outputs/
 **/outputs/
 *.log
 *.pkl
 *.joblib
 
-# data / notes (IMPORTANT)
+# =========================
+# data / notes (IMPORTANT - contains PHI)
+# =========================
 Example Notes/
 **/Example Notes/
 *.txt
@@ -20,7 +26,16 @@ Example Notes/
 *.json
 *.jsonl
 
+# =========================
+# allow HuggingFace model metadata
+# (needed for offline transformers inference)
+# =========================
+!bart_large_mnli/*.json
+!bart_large_mnli/*.txt
+
+# =========================
 # local configs / secrets
+# =========================
 config_local.py
 .env
 *.key
