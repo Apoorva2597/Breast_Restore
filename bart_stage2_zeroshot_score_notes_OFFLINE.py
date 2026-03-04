@@ -42,15 +42,11 @@ OUT_META = os.path.join(OUT_DIR, "bart_stage2_run_metadata.json")
 
 MERGE_KEY = "MRN"
 
-# Zero-shot labels
-POS_LABEL = "stage2 reconstruction"
-NEG_LABEL = "not stage2 reconstruction"
-
-# Hypothesis (NLI template)
 HYPOTHESIS = (
-    "This clinical note describes a Stage 2 breast reconstruction event "
-    "in which a tissue expander was exchanged for a permanent implant."
+    "This clinical note describes {}."
 )
+POS_LABEL = "a Stage 2 breast reconstruction surgery where a tissue expander was exchanged for a permanent implant"
+NEG_LABEL = "a clinical note that does not describe Stage 2 expander-to-implant exchange surgery"
 
 # Runtime controls
 BATCH_SIZE = 8          # CPU batching
