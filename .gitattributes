@@ -1,1 +1,2 @@
 bart_large_mnli/** filter=lfs diff=lfs merge=lfs -text
+bart_large_mnli/pytorch_model.bin filter=lfs diff=lfs merge=lfs -text
