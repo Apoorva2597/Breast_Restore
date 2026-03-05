@@ -29,8 +29,8 @@ from typing import Optional, Any, List, Dict
 # =========================
 # CONFIG: EDIT PATHS HERE
 # =========================
-ENCOUNTERS_CSV = "/home/apokol/Breast_Restore/_staging_inputs/HP11526 Operation Encounters.csv"
-CLINIC_NOTES_CSV = "/home/apokol/Breast_Restore/_staging_inputs/HP11526 Clinic Notes.csv"  
+ENCOUNTERS_CSV = "/home/apokol/Breast_Restore/_staging_inputs/HPI11526 Operation Encounters.csv"
+CLINIC_NOTES_CSV = "/home/apokol/Breast_Restore/_staging_inputs/HPI11526 Clinic Notes.csv"  
 OUT_CSV = "_outputs/patient_master.csv"
 
 # =========================
