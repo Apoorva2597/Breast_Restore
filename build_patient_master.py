@@ -1,17 +1,10 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
 """
 Patient-level abstraction pipeline
 
-Reads original HPI11526 encounter and note files and builds
-a patient-level abstraction table.
-
-Input directory:
-/home/apokol/my_data_Breast/HPI-11526/HPI11256
-
-Output:
-_outputs/patient_master.csv
+Compatible with Python 3.6.8 and older pandas versions.
 """
 
 import pandas as pd
@@ -19,14 +12,10 @@ import os
 import re
 
 # ---------------------------------------------------
-# DATA DIRECTORY (FULL PATH)
+# DATA DIRECTORY
 # ---------------------------------------------------
 
 DATA_DIR = "/home/apokol/my_data_Breast/HPI-11526/HPI11256"
-
-# ---------------------------------------------------
-# Encounter files
-# ---------------------------------------------------
 
 ENCOUNTER_FILES = [
     os.path.join(DATA_DIR, "HPI11526 Clinic Encounters.csv"),
@@ -34,19 +23,11 @@ ENCOUNTER_FILES = [
     os.path.join(DATA_DIR, "HPI11526 Operation Encounters.csv")
 ]
 
-# ---------------------------------------------------
-# Note files
-# ---------------------------------------------------
-
 NOTE_FILES = [
     os.path.join(DATA_DIR, "HPI11526 Clinic Notes.csv"),
     os.path.join(DATA_DIR, "HPI11526 Inpatient Notes.csv"),
     os.path.join(DATA_DIR, "HPI11526 Operation Notes.csv")
 ]
-
-# ---------------------------------------------------
-# Output
-# ---------------------------------------------------
 
 OUTPUT_DIR = "_outputs"
 OUTPUT_FILE = os.path.join(OUTPUT_DIR, "patient_master.csv")
@@ -54,34 +35,41 @@ OUTPUT_FILE = os.path.join(OUTPUT_DIR, "patient_master.csv")
 PATIENT_ID = "ENCRYPTED_PAT_ID"
 NOTE_TEXT_COL = "NOTE_TEXT"
 
-
 # ---------------------------------------------------
 # Regex patterns
 # ---------------------------------------------------
 
-BMI_RE = re.compile(r"\bbmi[: ]*([0-9]{2}\.?[0-9]?)\b", re.I)
+BMI_RE = re.compile(r"\bbmi[: ]*([0-9]{2}\.?[0-9]?)", re.I)
 
-SMOKING_CURRENT_RE = re.compile(r"\b(smoker|smoking|tobacco use)\b", re.I)
-SMOKING_FORMER_RE = re.compile(r"\bformer smoker\b", re.I)
+SMOKING_CURRENT_RE = re.compile(r"\b(smoker|smoking|tobacco)", re.I)
+SMOKING_FORMER_RE = re.compile(r"\bformer smoker", re.I)
 
-DIABETES_RE = re.compile(r"\bdiabetes\b", re.I)
-HTN_RE = re.compile(r"\bhypertension\b", re.I)
-CARDIAC_RE = re.compile(r"\b(coronary artery disease|cad|heart failure)\b", re.I)
-VTE_RE = re.compile(r"\b(dvt|pe|venous thromboembolism)\b", re.I)
-STEROID_RE = re.compile(r"\bsteroid\b", re.I)
+DIABETES_RE = re.compile(r"\bdiabetes", re.I)
+HTN_RE = re.compile(r"\bhypertension", re.I)
+CARDIAC_RE = re.compile(r"\b(cad|coronary artery disease|heart failure)", re.I)
+VTE_RE = re.compile(r"\b(dvt|pe|venous thromboembolism)", re.I)
+STEROID_RE = re.compile(r"\bsteroid", re.I)
 
-LUMPECTOMY_RE = re.compile(r"\blumpectomy\b", re.I)
-REDUCTION_RE = re.compile(r"\breduction mammoplasty\b", re.I)
-MASTOPEXY_RE = re.compile(r"\bmastopexy\b", re.I)
-AUGMENT_RE = re.compile(r"\baugmentation\b", re.I)
+LUMPECTOMY_RE = re.compile(r"\blumpectomy", re.I)
+REDUCTION_RE = re.compile(r"\breduction mammoplasty", re.I)
+MASTOPEXY_RE = re.compile(r"\bmastopexy", re.I)
+AUGMENT_RE = re.compile(r"\baugmentation", re.I)
 
-RADIATION_RE = re.compile(r"\bradiation\b", re.I)
-CHEMO_RE = re.compile(r"\bchemo|chemotherapy\b", re.I)
+RADIATION_RE = re.compile(r"\bradiation", re.I)
+CHEMO_RE = re.compile(r"\bchemo|chemotherapy", re.I)
 
 
 # ---------------------------------------------------
-# Helper extraction functions
+# Helper functions
 # ---------------------------------------------------
+
+def safe_read_csv(path):
+    """Read CSV safely with encoding fallback."""
+    try:
+        return pd.read_csv(path, encoding="utf-8")
+    except:
+        return pd.read_csv(path, encoding="latin1")
+
 
 def extract_bmi(text):
     m = BMI_RE.search(text)
@@ -102,41 +90,43 @@ def extract_smoking(text):
 
 
 def flag(regex, text):
-    return 1 if regex.search(text) else 0
+    if regex.search(text):
+        return 1
+    return 0
 
 
 # ---------------------------------------------------
-# Main pipeline
+# Main
 # ---------------------------------------------------
 
 def main():
 
     print("Loading encounter tables...")
 
-    encounters = pd.concat(
-        [pd.read_csv(f) for f in ENCOUNTER_FILES],
-        ignore_index=True
-    )
+    encounter_frames = []
+    for f in ENCOUNTER_FILES:
+        print("Reading:", f)
+        encounter_frames.append(safe_read_csv(f))
+
+    encounters = pd.concat(encounter_frames, ignore_index=True)
 
     print("Loading note tables...")
 
-    notes = pd.concat(
-        [pd.read_csv(f) for f in NOTE_FILES],
-        ignore_index=True
-    )
+    note_frames = []
+    for f in NOTE_FILES:
+        print("Reading:", f)
+        note_frames.append(safe_read_csv(f))
 
-    print("Total encounters:", len(encounters))
-    print("Total notes:", len(notes))
+    notes = pd.concat(note_frames, ignore_index=True)
+
+    print("Encounters loaded:", len(encounters))
+    print("Notes loaded:", len(notes))
 
     # ---------------------------------------------------
-    # Create patient list
+    # Build patient list
     # ---------------------------------------------------
 
     patients = encounters[[PATIENT_ID]].drop_duplicates().copy()
-
-    # ---------------------------------------------------
-    # Structured demographics (if available)
-    # ---------------------------------------------------
 
     demo = encounters.groupby(PATIENT_ID).first().reset_index()
 
@@ -150,31 +140,21 @@ def main():
         patients["Age"] = demo["AGE_AT_ENCOUNTER"]
 
     # ---------------------------------------------------
-    # Initialize variables
+    # Initialize abstraction fields
     # ---------------------------------------------------
 
     fields = [
-        "BMI",
-        "Obesity",
-        "SmokingStatus",
-        "Diabetes",
-        "Hypertension",
-        "CardiacDisease",
-        "VenousThromboembolism",
-        "Steroid",
-        "PBS_Lumpectomy",
-        "PBS_Reduction",
-        "PBS_Mastopexy",
-        "PBS_Augmentation",
-        "Radiation",
-        "Chemo"
+        "BMI","Obesity","SmokingStatus","Diabetes","Hypertension",
+        "CardiacDisease","VenousThromboembolism","Steroid",
+        "PBS_Lumpectomy","PBS_Reduction","PBS_Mastopexy",
+        "PBS_Augmentation","Radiation","Chemo"
     ]
 
     for f in fields:
         patients[f] = None
 
     # ---------------------------------------------------
-    # Aggregate notes per patient
+    # Aggregate notes by patient
     # ---------------------------------------------------
 
     notes[NOTE_TEXT_COL] = notes[NOTE_TEXT_COL].fillna("").str.lower()
@@ -186,10 +166,10 @@ def main():
     print("Patients with notes:", len(patient_notes))
 
     # ---------------------------------------------------
-    # Run extraction
+    # Extraction
     # ---------------------------------------------------
 
-    for _, row in patient_notes.iterrows():
+    for i, row in patient_notes.iterrows():
 
         pid = row[PATIENT_ID]
         text = row[NOTE_TEXT_COL]
@@ -225,15 +205,16 @@ def main():
         patients.loc[idx, "Chemo"] = flag(CHEMO_RE, text)
 
     # ---------------------------------------------------
-    # Save output
+    # Save
     # ---------------------------------------------------
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    if not os.path.exists(OUTPUT_DIR):
+        os.makedirs(OUTPUT_DIR)
 
     patients.to_csv(OUTPUT_FILE, index=False)
 
-    print("Build complete.")
-    print("Output:", OUTPUT_FILE)
+    print("Build complete")
+    print("Output written to:", OUTPUT_FILE)
 
 
 if __name__ == "__main__":
