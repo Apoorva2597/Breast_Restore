@@ -4,10 +4,10 @@
 """
 validate_abstraction.py
 
-Compares patient_master.csv against gold_cleaned_for_cedar.csv
-and computes accuracy for each abstraction variable.
+Compares abstraction output against gold labels.
 
-Python 3.6.8 compatible.
+Python 3.6.8 compatible
+Handles encoding issues and PID column mismatches.
 """
 
 import pandas as pd
@@ -16,7 +16,7 @@ import os
 MASTER_FILE = "_outputs/patient_master.csv"
 GOLD_FILE = "gold_cleaned_for_cedar.csv"
 
-PID = "ENCRYPTED_PAT_ID"
+PID_STANDARD = "ENCRYPTED_PAT_ID"
 
 VARIABLES = [
     "Race",
@@ -39,7 +39,7 @@ VARIABLES = [
 
 
 # ---------------------------------------------------
-# Safe CSV reader (handles encoding issues)
+# Safe CSV reader
 # ---------------------------------------------------
 
 def safe_read_csv(path):
@@ -51,7 +51,39 @@ def safe_read_csv(path):
 
 
 # ---------------------------------------------------
-# Standardize values before comparison
+# Normalize column names
+# ---------------------------------------------------
+
+def normalize_columns(df):
+
+    df.columns = [c.strip() for c in df.columns]
+
+    return df
+
+
+# ---------------------------------------------------
+# Detect patient ID column
+# ---------------------------------------------------
+
+def find_pid_column(df):
+
+    candidates = [
+        "ENCRYPTED_PAT_ID",
+        "encrypted_pat_id",
+        "PAT_ID",
+        "PATIENT_ID",
+        "MRN"
+    ]
+
+    for c in candidates:
+        if c in df.columns:
+            return c
+
+    raise Exception("Could not find patient ID column in gold file")
+
+
+# ---------------------------------------------------
+# Normalize values before comparison
 # ---------------------------------------------------
 
 def normalize(series):
@@ -74,7 +106,6 @@ def compute_metrics(pred, gold):
     gold = normalize(gold)
 
     total = len(gold)
-
     matches = (pred == gold).sum()
 
     accuracy = float(matches) / float(total)
@@ -93,14 +124,38 @@ def main():
     master = safe_read_csv(MASTER_FILE)
     gold = safe_read_csv(GOLD_FILE)
 
+    master = normalize_columns(master)
+    gold = normalize_columns(gold)
+
     print("Master rows:", len(master))
     print("Gold rows:", len(gold))
 
-    merged = pd.merge(master, gold, on=PID, suffixes=("_pred", "_gold"))
+    # ---------------------------------------------------
+    # Find patient ID column
+    # ---------------------------------------------------
+
+    gold_pid = find_pid_column(gold)
+
+    if gold_pid != PID_STANDARD:
+        print("Renaming gold PID column:", gold_pid, "->", PID_STANDARD)
+        gold.rename(columns={gold_pid: PID_STANDARD}, inplace=True)
+
+    if PID_STANDARD not in master.columns:
+        raise Exception("Master file missing ENCRYPTED_PAT_ID")
+
+    # ---------------------------------------------------
+    # Merge
+    # ---------------------------------------------------
+
+    merged = pd.merge(master, gold, on=PID_STANDARD, suffixes=("_pred", "_gold"))
 
     print("Merged rows:", len(merged))
 
     results = []
+
+    # ---------------------------------------------------
+    # Evaluate variables
+    # ---------------------------------------------------
 
     for v in VARIABLES:
 
@@ -108,7 +163,7 @@ def main():
         gold_col = v + "_gold"
 
         if pred_col not in merged.columns or gold_col not in merged.columns:
-            print("Skipping missing variable:", v)
+            print("Skipping variable:", v)
             continue
 
         pred = merged[pred_col]
@@ -125,7 +180,7 @@ def main():
 
     df = pd.DataFrame(results)
 
-    print("\nValidation results:\n")
+    print("\nValidation Results:\n")
     print(df)
 
     if not os.path.exists("_outputs"):
@@ -134,7 +189,7 @@ def main():
     df.to_csv("_outputs/validation_summary.csv", index=False)
 
     print("\nValidation complete.")
-    print("Results saved to: _outputs/validation_summary.csv")
+    print("Results saved to _outputs/validation_summary.csv")
 
 
 if __name__ == "__main__":
