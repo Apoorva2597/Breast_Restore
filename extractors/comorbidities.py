@@ -1,123 +1,235 @@
+# extractors/comorbidities.py
+
+import re
 from typing import List
-
 from models import Candidate, SectionedNote
-from config import (
-    NEGATION_CUES, PLANNED_CUES, PERFORMED_CUES,
-    DM_POS, DM_EXCLUDE,
-    HTN_POS, HTN_EXCLUDE,
-    CARDIAC_POS, CARDIAC_EXCLUDE,
-    VTE_POS,
-    STEROID_POS, STEROID_EXCLUDE,
-    CANCER_OTHER_POS,
-)
-from .utils import window_around, classify_status, has_any, find_first, should_skip_block
+from .utils import window_around, classify_status
 
-# Family history contains relatives' conditions; do not treat as patient comorbidities.
-SUPPRESS_PATIENT_COMORBIDITY_SECTIONS = {"FAMILY HISTORY"}
+NEG_SECTIONS = {
+    "FAMILY HISTORY",
+    "ALLERGIES",
+    "REVIEW OF SYSTEMS"
+}
 
-# Allergies list is not exposure; do not infer SteroidUse from prednisone allergy.
-SUPPRESS_STEROID_SECTIONS = {"ALLERGIES"}
+# -------------------------
+# Diabetes
+# -------------------------
 
-# VTE false positive guard: prophylaxis language ≠ VTE history
-VTE_PROPHYLAXIS_EXCLUDE = [
-    r"\bprophylaxis\b",
-    r"\bppx\b",
-    r"\bdvt\s+ppx\b",
-    r"\bscd(s)?\b",
-    r"\bsequential\s+compression\b",
-    r"\bheparin\b.*\bprophylaxis\b",
-    r"\bsubcutaneous\s+heparin\b",
+DM_POS = [
+    r"\bdiabetes\b",
+    r"\bdiabetes mellitus\b",
+    r"\btype\s*[12]\s*diabetes\b",
+    r"\bIDDM\b",
+    r"\bNIDDM\b"
 ]
 
-def _extract_binary(
-    field: str,
-    pos_patterns: List[str],
-    exclude_patterns: List[str],
-    note: SectionedNote
-) -> List[Candidate]:
-    cands: List[Candidate] = []
+DM_MEDS = [
+    r"\binsulin\b",
+    r"\blantus\b",
+    r"\bnovolog\b",
+]
 
-    for section, text in note.sections.items():
+DM_EXCLUDE = [
+    r"\bgestational\b",
+    r"\bdiabetes insipidus\b",
+    r"\bprediabetes\b",
+]
 
-        # 1) Section suppression
-        if section in SUPPRESS_PATIENT_COMORBIDITY_SECTIONS and field in {
-            "DiabetesMellitus", "Hypertension", "CardiacDisease", "VTE", "SteroidUse"
-        }:
-            continue
-        if section in SUPPRESS_STEROID_SECTIONS and field == "SteroidUse":
-            continue
+# -------------------------
+# Hypertension
+# -------------------------
 
-        m = find_first(pos_patterns, text)
-        if not m:
-            continue
+HTN_POS = [
+    r"\bhypertension\b",
+    r"\bHTN\b"
+]
 
-        evid = window_around(text, m.start(), m.end(), 120)
-        ctx = evid.lower()
+HTN_EXCLUDE = [
+    r"\bgestational\b",
+    r"\bpulmonary hypertension\b",
+    r"\bportal hypertension\b",
+]
 
-        # Eliminate Family History + Allergies content entirely (even if embedded)
-        if should_skip_block(section, evid):
-            continue
+# -------------------------
+# Cardiac disease
+# -------------------------
 
-        # 2) Excludes
-        if exclude_patterns and has_any(exclude_patterns, ctx):
-            continue
+CARDIAC_POS = [
+    r"\bcoronary artery disease\b",
+    r"\bCAD\b",
+    r"\bcongestive heart failure\b",
+    r"\bCHF\b",
+    r"\bmyocardial infarction\b",
+    r"\bprior MI\b"
+]
 
-        # 3) Field-specific excludes
-        if field == "VTE" and find_first(VTE_PROPHYLAXIS_EXCLUDE, ctx):
-            continue
+# -------------------------
+# VTE
+# -------------------------
 
-        status = classify_status(text, m.start(), m.end(), PERFORMED_CUES, PLANNED_CUES, NEGATION_CUES)
-        if status == "performed":
-            status = "history"
+VTE_POS = [
+    r"\bdeep vein thrombosis\b",
+    r"\bDVT\b",
+    r"\bpulmonary embolism\b",
+    r"\bPE\b"
+]
 
-        value = False if status == "denied" else True
+VTE_EXCLUDE = [
+    r"\bprophylaxis\b",
+    r"\bppx\b",
+]
 
-        cands.append(Candidate(
-            field=field,
-            value=value,
-            status=status,
-            evidence=evid,
-            section=section,
-            note_type=note.note_type,
-            note_id=note.note_id,
-            note_date=note.note_date,
-            confidence=0.75
-        ))
+# -------------------------
+# Steroids
+# -------------------------
 
-    return cands
+STEROID_POS = [
+    r"\bprednisone\b",
+    r"\bdexamethasone\b",
+    r"\bmethylprednisolone\b",
+]
+
+STEROID_EXCLUDE = [
+    r"\binhaled\b",
+    r"\btopical\b"
+]
 
 
 def extract_comorbidities(note: SectionedNote) -> List[Candidate]:
-    cands: List[Candidate] = []
-    cands += _extract_binary("DiabetesMellitus", DM_POS, DM_EXCLUDE, note)
-    cands += _extract_binary("Hypertension", HTN_POS, HTN_EXCLUDE, note)
 
-    # Cardiac: hardened to avoid pre-op template CHF header noise
-    cands += _extract_binary("CardiacDisease", CARDIAC_POS, CARDIAC_EXCLUDE, note)
+    cands = []
 
-    cands += _extract_binary("VTE", VTE_POS, [], note)
-    cands += _extract_binary("SteroidUse", STEROID_POS, STEROID_EXCLUDE, note)
-
-    # Other cancer history
     for section, text in note.sections.items():
-        m = find_first(CANCER_OTHER_POS, text)
-        if not m:
+
+        if section in NEG_SECTIONS:
             continue
 
-        status = classify_status(text, m.start(), m.end(), PERFORMED_CUES, PLANNED_CUES, NEGATION_CUES)
-        if status == "performed":
-            status = "history"
+        lower = text.lower()
 
-        cands.append(Candidate(
-            field="CancerHistoryOther",
-            value=True,
-            status=status,
-            evidence=window_around(text, m.start(), m.end(), 140),
-            section=section,
-            note_type=note.note_type,
-            note_id=note.note_id,
-            note_date=note.note_date,
-            confidence=0.7
-        ))
+        # -------------------------
+        # Diabetes
+        # -------------------------
+
+        if any(re.search(p, lower) for p in DM_POS):
+
+            if not any(re.search(p, lower) for p in DM_EXCLUDE):
+
+                cands.append(
+                    Candidate(
+                        field="Diabetes",
+                        value=True,
+                        status="history",
+                        evidence=window_around(text, 0, 100, 200),
+                        section=section,
+                        note_type=note.note_type,
+                        note_id=note.note_id,
+                        note_date=note.note_date,
+                        confidence=0.85
+                    )
+                )
+
+        # medication inference
+
+        if any(re.search(p, lower) for p in DM_MEDS):
+
+            cands.append(
+                Candidate(
+                    field="Diabetes",
+                    value=True,
+                    status="history",
+                    evidence=text[:200],
+                    section=section,
+                    note_type=note.note_type,
+                    note_id=note.note_id,
+                    note_date=note.note_date,
+                    confidence=0.80
+                )
+            )
+
+        # -------------------------
+        # Hypertension
+        # -------------------------
+
+        if any(re.search(p, lower) for p in HTN_POS):
+
+            if not any(re.search(p, lower) for p in HTN_EXCLUDE):
+
+                cands.append(
+                    Candidate(
+                        field="Hypertension",
+                        value=True,
+                        status="history",
+                        evidence=text[:200],
+                        section=section,
+                        note_type=note.note_type,
+                        note_id=note.note_id,
+                        note_date=note.note_date,
+                        confidence=0.85
+                    )
+                )
+
+        # -------------------------
+        # Cardiac disease
+        # -------------------------
+
+        if any(re.search(p, lower) for p in CARDIAC_POS):
+
+            cands.append(
+                Candidate(
+                    field="CardiacDisease",
+                    value=True,
+                    status="history",
+                    evidence=text[:200],
+                    section=section,
+                    note_type=note.note_type,
+                    note_id=note.note_id,
+                    note_date=note.note_date,
+                    confidence=0.85
+                )
+            )
+
+        # -------------------------
+        # VTE
+        # -------------------------
+
+        if any(re.search(p, lower) for p in VTE_POS):
+
+            if not any(re.search(p, lower) for p in VTE_EXCLUDE):
+
+                cands.append(
+                    Candidate(
+                        field="VTE",
+                        value=True,
+                        status="history",
+                        evidence=text[:200],
+                        section=section,
+                        note_type=note.note_type,
+                        note_id=note.note_id,
+                        note_date=note.note_date,
+                        confidence=0.85
+                    )
+                )
+
+        # -------------------------
+        # Steroids
+        # -------------------------
+
+        if any(re.search(p, lower) for p in STEROID_POS):
+
+            if not any(re.search(p, lower) for p in STEROID_EXCLUDE):
+
+                cands.append(
+                    Candidate(
+                        field="SteroidUse",
+                        value=True,
+                        status="current",
+                        evidence=text[:200],
+                        section=section,
+                        note_type=note.note_type,
+                        note_id=note.note_id,
+                        note_date=note.note_date,
+                        confidence=0.80
+                    )
+                )
 
     return cands
