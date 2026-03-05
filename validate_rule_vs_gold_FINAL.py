@@ -10,7 +10,7 @@ from typing import Dict, Tuple
 
 BASE_DIR = "/home/apokol/Breast_Restore"
 GOLD_PATH = f"{BASE_DIR}/gold_cleaned_for_cedar.csv"
-PRED_PATH = f"{BASE_DIR}/_outputs/master_abstraction_rule_ONLY_FINAL.csv"
+PRED_PATH = f"{BASE_DIR}/_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv"
 
 OUT_REPORT = f"{BASE_DIR}/_outputs/rule_vs_gold_validation_report_FINAL.csv"
 OUT_MISMATCH = f"{BASE_DIR}/_outputs/rule_vs_gold_mismatches_FINAL.csv"
