@@ -2,273 +2,67 @@
 # -*- coding: utf-8 -*-
 
 """
-build_patient_master_from_original.py  (Python 3.6.8 friendly)
+build_patient_master.py  (Python 3.6.8 friendly)
 
-Builds a patient-level abstraction table keyed by ENCRYPTED_PAT_ID using ONLY:
+Builds patient-level abstraction table from ORIGINAL HPI11526 files.
+
+Inputs (default directory):
   /home/apokol/my_data_Breast/HPI-11526/HPI11256
 
-- Seeds patients + structured demographics from encounter CSVs
-- Loads original note CSVs, reconstructs note text (NOTE_ID + LINE)
-- Runs rule-based extractors from ./extractors
-- Aggregates to patient-level (best candidate per field; boolean OR logic)
-- Normalizes Race/Ethnicity/Smoking + binaries to match GOLD conventions
-- Writes:
-    /home/apokol/Breast_Restore/_outputs/patient_master.csv
-    /home/apokol/Breast_Restore/_outputs/rule_hit_evidence.csv
+Expected filenames (exactly as you showed):
+  HPI11526 Clinic Encounters.csv
+  HPI11526 Inpatient Encounters.csv
+  HPI11526 Operation Encounters.csv
+  HPI11526 Clinic Notes.csv
+  HPI11526 Inpatient Notes.csv
+  HPI11526 Operation Notes.csv
+
+Outputs:
+  _outputs/patient_master.csv
+  _outputs/mrn_encrypted_map.csv   (only if MRN present)
+
+Notes:
+- Uses encounter fields where available (more reliable than NLP).
+- Falls back to note text regex for missing items and for Chemo/Radiation/PBS/Steroid signals.
+- Handles UnicodeDecodeError by trying utf-8, then latin-1.
 """
 
 from __future__ import print_function
 
 import os
 import re
-from glob import glob
-
+import sys
+import argparse
 import pandas as pd
 
-# -----------------------
-# PATHS
-# -----------------------
-BASE_DIR = "/home/apokol/Breast_Restore"  # repo + outputs
-DATA_DIR = "/home/apokol/my_data_Breast/HPI-11526/HPI11256"  # ORIGINAL DATA ONLY
 
-OUT_DIR = os.path.join(BASE_DIR, "_outputs")
-OUT_MASTER = os.path.join(OUT_DIR, "patient_master.csv")
-OUT_EVID = os.path.join(OUT_DIR, "rule_hit_evidence.csv")
+# -----------------------------
+# Config
+# -----------------------------
 
-# Original files (exact names you showed)
+DEFAULT_DATA_DIR = "/home/apokol/my_data_Breast/HPI-11526/HPI11256"
+
 ENCOUNTER_FILES = [
-    os.path.join(DATA_DIR, "HPI11526 Clinic Encounters.csv"),
-    os.path.join(DATA_DIR, "HPI11526 Inpatient Encounters.csv"),
-    os.path.join(DATA_DIR, "HPI11526 Operation Encounters.csv"),
+    "HPI11526 Clinic Encounters.csv",
+    "HPI11526 Inpatient Encounters.csv",
+    "HPI11526 Operation Encounters.csv",
 ]
+
 NOTE_FILES = [
-    os.path.join(DATA_DIR, "HPI11526 Clinic Notes.csv"),
-    os.path.join(DATA_DIR, "HPI11526 Inpatient Notes.csv"),
-    os.path.join(DATA_DIR, "HPI11526 Operation Notes.csv"),
+    "HPI11526 Clinic Notes.csv",
+    "HPI11526 Inpatient Notes.csv",
+    "HPI11526 Operation Notes.csv",
 ]
 
-PID = "ENCRYPTED_PAT_ID"
-MRN = "MRN"
+OUT_DIR = "_outputs"
+OUT_MASTER = os.path.join(OUT_DIR, "patient_master.csv")
+OUT_MAP = os.path.join(OUT_DIR, "mrn_encrypted_map.csv")
 
-# -----------------------
-# Imports from your repo
-# -----------------------
-from models import SectionedNote, Candidate  # noqa: E402
+PID_STANDARD = "ENCRYPTED_PAT_ID"
 
-from extractors.age import extract_age  # noqa: E402
-from extractors.bmi import extract_bmi  # noqa: E402
-from extractors.smoking import extract_smoking  # noqa: E402
-from extractors.comorbidities import extract_comorbidities  # noqa: E402
-from extractors.pbs import extract_pbs  # noqa: E402
-from extractors.cancer_treatment import extract_cancer_treatment  # noqa: E402
-
-# -----------------------
-# Robust CSV read (Py3.6 / older pandas friendly)
-# -----------------------
-def read_csv_robust(path):
-    """
-    Handles:
-      - bad lines
-      - weird encodings (latin-1 fallback)
-      - unicode decode errors
-    Compatible with older pandas (no on_bad_lines).
-    """
-    if not os.path.exists(path):
-        raise IOError("Missing file: %s" % path)
-
-    common = dict(dtype=str, engine="python")
-    try:
-        return pd.read_csv(path, error_bad_lines=False, warn_bad_lines=True, **common)
-    except UnicodeDecodeError:
-        return pd.read_csv(path, encoding="latin-1", error_bad_lines=False, warn_bad_lines=True, **common)
-    except Exception:
-        # last resort: read as bytes-ish via latin-1
-        return pd.read_csv(path, encoding="latin-1", error_bad_lines=False, warn_bad_lines=True, **common)
-
-
-def clean_cols(df):
-    df.columns = [str(c).replace("\ufeff", "").strip() for c in df.columns]
-    return df
-
-
-def pick_col(df, options, required=True):
-    for c in options:
-        if c in df.columns:
-            return c
-    if required:
-        raise RuntimeError("Missing required column. Tried=%s Seen=%s" % (options, list(df.columns)[:80]))
-    return None
-
-
-def to_int_safe(x):
-    try:
-        s = str(x).strip()
-        if s == "":
-            return None
-        return int(float(s))
-    except Exception:
-        return None
-
-
-# -----------------------
-# Lightweight sectionizer
-# -----------------------
-HEADER_RX = re.compile(r"^\s*([A-Z][A-Z0-9 /&\-]{2,60})\s*:\s*$")
-
-def sectionize(text):
-    if not text:
-        return {"FULL": ""}
-
-    lines = text.splitlines()
-    sections = {"FULL": []}
-    current = "FULL"
-
-    for line in lines:
-        m = HEADER_RX.match(line)
-        if m:
-            hdr = m.group(1).strip().upper()
-            current = hdr
-            if current not in sections:
-                sections[current] = []
-            continue
-        sections[current].append(line)
-
-    out = {}
-    for k, v in sections.items():
-        joined = "\n".join(v).strip()
-        if joined:
-            out[k] = joined
-    return out if out else {"FULL": text}
-
-
-def build_sectioned_note(note_text, note_type, note_id, note_date):
-    return SectionedNote(
-        sections=sectionize(note_text),
-        note_type=note_type or "",
-        note_id=note_id or "",
-        note_date=note_date or ""
-    )
-
-
-# -----------------------
-# Normalization to match GOLD conventions
-# -----------------------
-def norm_str(x):
-    if x is None:
-        return ""
-    s = str(x).strip()
-    if s.lower() in ("", "nan", "none", "null"):
-        return ""
-    return s
-
-def normalize_race(val):
-    """
-    Target examples in your gold: Caucasian, Black or African American, Other Asian, Chinese, Unknown
-    We keep this conservative to avoid wrong mapping.
-    """
-    v = norm_str(val).lower()
-    if not v:
-        return ""
-
-    if "cauc" in v or v == "white" or "white" in v:
-        return "Caucasian"
-    if "black" in v or "african" in v:
-        return "Black or African American"
-    if "asian" in v:
-        # if specific subgroup appears, preserve if present
-        if "chinese" in v:
-            return "Chinese"
-        return "Other Asian"
-    if "unknown" in v or "decline" in v or "not to disclose" in v:
-        return "Unknown"
-    # keep original trimmed if already looks like gold-style
-    return str(val).strip()
-
-def normalize_ethnicity(val):
-    """
-    Target examples in your gold: Non-hispanic, Hispanic, Unknown
-    """
-    v = norm_str(val).lower()
-    if not v:
-        return ""
-    if "non" in v and "hisp" in v:
-        return "Non-hispanic"
-    if "hisp" in v:
-        return "Hispanic"
-    if "unknown" in v or "decline" in v or "not to disclose" in v:
-        return "Unknown"
-    return str(val).strip()
-
-def normalize_smoking(val):
-    """
-    Target examples: Never, Former, Current
-    """
-    v = norm_str(val).lower()
-    if not v:
-        return ""
-    if "never" in v:
-        return "Never"
-    if "former" in v or "ex" in v or "quit" in v:
-        return "Former"
-    if "current" in v or "smokes" in v or "every day" in v or "daily" in v:
-        return "Current"
-    return str(val).strip()
-
-def to_binary01(x):
-    """
-    Convert common boolean-ish values to 0/1, else blank.
-    """
-    v = norm_str(x).lower()
-    if not v:
-        return ""
-    if v in ("1", "true", "t", "yes", "y", "positive", "+"):
-        return 1
-    if v in ("0", "false", "f", "no", "n", "negative", "-"):
-        return 0
-    # if already numeric-like:
-    try:
-        fx = float(v)
-        if fx == 1.0:
-            return 1
-        if fx == 0.0:
-            return 0
-    except Exception:
-        pass
-    return ""
-
-
-# -----------------------
-# Candidate aggregation
-# -----------------------
-def cand_score(c):
-    conf = float(getattr(c, "confidence", 0.0) or 0.0)
-    nt = str(getattr(c, "note_type", "") or "").lower()
-    op_bonus = 0.05 if ("op" in nt or "operative" in nt or "operation" in nt) else 0.0
-    date_bonus = 0.01 if norm_str(getattr(c, "note_date", "")) else 0.0
-    return conf + op_bonus + date_bonus
-
-def choose_best(existing, new):
-    if existing is None:
-        return new
-    return new if cand_score(new) > cand_score(existing) else existing
-
-def merge_boolean(existing, new):
-    if existing is None:
-        return new
-    exv = to_binary01(getattr(existing, "value", ""))
-    nwv = to_binary01(getattr(new, "value", ""))
-    if nwv == 1 and exv != 1:
-        return new
-    if exv == 1 and nwv != 1:
-        return existing
-    return choose_best(existing, new)
-
-
-# -----------------------
-# Output schema (bucket 2)
-# -----------------------
-MASTER_COLUMNS = [
-    PID,
+# Variables you’re validating right now (keep aligned with validate script)
+OUTPUT_COLUMNS = [
+    PID_STANDARD,
     "Race",
     "Ethnicity",
     "Age",
@@ -281,359 +75,685 @@ MASTER_COLUMNS = [
     "VenousThromboembolism",
     "Steroid",
     "PBS_Lumpectomy",
-    "PBS_Breast Reduction",
+    "PBS_Reduction",
     "PBS_Mastopexy",
     "PBS_Augmentation",
     "Radiation",
     "Chemo",
 ]
 
-BOOLEAN_FIELDS = set([
-    "Diabetes",
-    "Hypertension",
-    "CardiacDisease",
-    "VenousThromboembolism",
-    "Steroid",
-    "PBS_Lumpectomy",
-    "PBS_Breast Reduction",
-    "PBS_Mastopexy",
-    "PBS_Augmentation",
-    "Radiation",
-    "Chemo",
-])
 
-FIELD_MAP = {
-    # from extractors -> our master columns
-    "Age": "Age",
-    "Age_DOS": "Age",
-    "BMI": "BMI",
-    "SmokingStatus": "SmokingStatus",
-    "Diabetes": "Diabetes",
-    "DiabetesMellitus": "Diabetes",
-    "Hypertension": "Hypertension",
-    "CardiacDisease": "CardiacDisease",
-    "VTE": "VenousThromboembolism",
-    "VenousThromboembolism": "VenousThromboembolism",
-    "SteroidUse": "Steroid",
-    "Steroid": "Steroid",
-    "PBS_Lumpectomy": "PBS_Lumpectomy",
-    "PBS_Breast Reduction": "PBS_Breast Reduction",
-    "PBS_Mastopexy": "PBS_Mastopexy",
-    "PBS_Augmentation": "PBS_Augmentation",
-    "Radiation": "Radiation",
-    "Chemo": "Chemo",
-}
+# -----------------------------
+# Helpers
+# -----------------------------
+
+def log(msg):
+    sys.stdout.write(msg + "\n")
+    sys.stdout.flush()
 
 
-# -----------------------
-# Load encounters -> seed patients + demographics
-# -----------------------
-def load_encounters_seed():
-    frames = []
-    for fp in ENCOUNTER_FILES:
-        df = clean_cols(read_csv_robust(fp))
-        # Required ID columns (per your screenshots)
-        pid_col = pick_col(df, [PID, "ENCRYPTED_PATID", "ENCRYPTED PAT ID"], required=True)
-        mrn_col = pick_col(df, [MRN, "mrn"], required=False)
+def ensure_outdir():
+    if not os.path.isdir(OUT_DIR):
+        os.makedirs(OUT_DIR)
 
-        race_col = pick_col(df, ["RACE", "Race", "2. Race"], required=False)
-        eth_col = pick_col(df, ["ETHNICITY", "Ethnicity", "3. Ethnicity"], required=False)
-        age_col = pick_col(df, ["AGE_AT_ENCOUNTER", "AGE AT ENCOUNTER", "Age", "4. Age"], required=False)
 
-        out = pd.DataFrame()
-        out[PID] = df[pid_col].astype(str).str.strip()
+def read_csv_flexible(path):
+    """
+    Read CSV robustly for older datasets / mixed encodings.
+    Tries utf-8, then latin-1. Uses pandas default engine for speed.
+    """
+    for enc in ("utf-8", "latin-1"):
+        try:
+            return pd.read_csv(path, encoding=enc)
+        except UnicodeDecodeError:
+            continue
+    # last resort: python engine sometimes survives weird bytes
+    try:
+        return pd.read_csv(path, encoding="latin-1", engine="python")
+    except Exception as e:
+        raise e
 
-        if mrn_col:
-            out[MRN] = df[mrn_col].astype(str).str.strip()
-        else:
-            out[MRN] = ""
 
-        out["Race_raw"] = df[race_col].astype(str).str.strip() if race_col else ""
-        out["Ethnicity_raw"] = df[eth_col].astype(str).str.strip() if eth_col else ""
-        out["Age_raw"] = df[age_col].astype(str).str.strip() if age_col else ""
+def normalize_str(x):
+    if pd.isnull(x):
+        return None
+    s = str(x).strip()
+    if s == "" or s.lower() in ("nan", "none", "null"):
+        return None
+    return s
 
-        frames.append(out)
 
-    all_enc = pd.concat(frames, ignore_index=True)
-    all_enc = all_enc[all_enc[PID].astype(str).str.strip() != ""].copy()
+def to_int_safe(x):
+    if pd.isnull(x):
+        return None
+    try:
+        # handle floats like "47.0"
+        return int(float(str(x).strip()))
+    except Exception:
+        return None
 
-    # patient-level: choose most frequent non-empty race/eth + median age (if numeric)
-    def mode_nonempty(series):
-        vals = [norm_str(x) for x in series.tolist()]
-        vals = [x for x in vals if x]
-        if not vals:
-            return ""
-        # mode
-        vc = pd.Series(vals).value_counts()
-        return str(vc.index[0])
 
-    grp = all_enc.groupby(PID, dropna=False)
+def to_float_safe(x):
+    if pd.isnull(x):
+        return None
+    try:
+        return float(str(x).strip())
+    except Exception:
+        return None
 
-    pat = pd.DataFrame({PID: list(grp.groups.keys())})
-    pat[PID] = pat[PID].astype(str).str.strip()
 
-    race_mode = grp["Race_raw"].apply(mode_nonempty).reset_index().rename(columns={"Race_raw": "Race"})
-    eth_mode = grp["Ethnicity_raw"].apply(mode_nonempty).reset_index().rename(columns={"Ethnicity_raw": "Ethnicity"})
+def bool01_from_any(x):
+    """
+    Normalize common boolean-ish representations to 0/1/None.
+    """
+    if pd.isnull(x):
+        return None
+    s = str(x).strip().lower()
+    if s in ("1", "true", "t", "yes", "y", "present", "pos", "+"):
+        return 1
+    if s in ("0", "false", "f", "no", "n", "absent", "neg", "-"):
+        return 0
+    # sometimes "Current"/"Former" etc - not boolean
+    try:
+        v = int(float(s))
+        if v in (0, 1):
+            return v
+    except Exception:
+        pass
+    return None
 
-    # age: median of numeric-able values
-    def median_age(series):
-        nums = []
-        for x in series.tolist():
-            s = norm_str(x)
-            try:
-                nums.append(float(s))
-            except Exception:
+
+def coalesce_first_nonnull(values):
+    for v in values:
+        if v is not None and not pd.isnull(v):
+            return v
+    return None
+
+
+def mode_nonnull(series):
+    """
+    Most common non-null value; tie breaks by first encountered.
+    """
+    if series is None or len(series) == 0:
+        return None
+    s = series.dropna()
+    if len(s) == 0:
+        return None
+    # Normalize string whitespace for stable mode
+    s2 = s.map(lambda x: str(x).strip() if not pd.isnull(x) else x)
+    vc = s2.value_counts()
+    if vc.empty:
+        return None
+    return vc.index[0]
+
+
+def max01(series):
+    """
+    For 0/1/None series: if any 1 -> 1; else if any 0 -> 0; else None
+    """
+    if series is None or len(series) == 0:
+        return None
+    s = series.dropna()
+    if len(s) == 0:
+        return None
+    # convert to ints when possible
+    vals = []
+    for x in s.values:
+        b = bool01_from_any(x)
+        if b is not None:
+            vals.append(b)
+    if not vals:
+        return None
+    return 1 if 1 in vals else 0
+
+
+# -----------------------------
+# Column discovery
+# -----------------------------
+
+def find_column(df, candidates_regex):
+    """
+    Find a column name in df matching any regex (case-insensitive).
+    Returns first match by df column order.
+    """
+    cols = list(df.columns)
+    for c in cols:
+        c_low = str(c).strip().lower()
+        for rx in candidates_regex:
+            if re.search(rx, c_low):
+                return c
+    return None
+
+
+def standardize_pid(df):
+    """
+    Ensure df has ENCRYPTED_PAT_ID. If already present, keep it.
+    Otherwise try common variants.
+    """
+    if PID_STANDARD in df.columns:
+        return df
+
+    pid_col = find_column(df, [
+        r"encrypted.*pat.*id",
+        r"enc.*pat.*id",
+        r"patient.*encrypted",
+        r"pat.*enc",
+        r"encryptedid",
+    ])
+    if pid_col is None:
+        raise ValueError("Could not find ENCRYPTED patient id column in file.")
+    df = df.rename(columns={pid_col: PID_STANDARD})
+    return df
+
+
+def pick_text_column(df):
+    """
+    Notes file: pick best note text column.
+    Original datasets vary. Try common names.
+    """
+    text_col = find_column(df, [
+        r"note.*text",
+        r"text",
+        r"document.*text",
+        r"full.*text",
+        r"body",
+        r"content",
+    ])
+    return text_col
+
+
+# -----------------------------
+# Regex extractors from notes
+# -----------------------------
+
+RX_AGE = re.compile(r"\b(\d{2,3})\s*(?:yo|y/o|year[- ]old)\b", re.I)
+RX_BMI = re.compile(r"\bBMI\b[^0-9]{0,15}(\d{2}\.\d|\d{2})\b", re.I)
+
+# Smoking normalization patterns
+RX_SMOKE_CURRENT = re.compile(r"\b(current smoker|smokes\b|smoking\b.*current)\b", re.I)
+RX_SMOKE_FORMER = re.compile(r"\b(former smoker|quit smoking|stopped smoking|ex-smoker)\b", re.I)
+RX_SMOKE_NEVER = re.compile(r"\b(never smoker|never smoked|non-smoker|nonsmoker)\b", re.I)
+
+# Steroid: broad + common meds
+RX_STEROID = re.compile(r"\b(steroid|prednisone|prednisolone|methylprednisolone|dexamethasone|hydrocortisone)\b", re.I)
+
+# Chemo / Radiation with negation
+RX_CHEMO_POS = re.compile(r"\b(chemotherapy|chemo)\b", re.I)
+RX_CHEMO_NEG = re.compile(r"\b(no|not|without|denies)\b[^\.]{0,35}\b(chemotherapy|chemo)\b", re.I)
+
+RX_RAD_POS = re.compile(r"\b(radiation therapy|radiotherapy|xrt|rt\b)\b", re.I)
+RX_RAD_NEG = re.compile(r"\b(no|not|without|denies)\b[^\.]{0,35}\b(radiation therapy|radiotherapy|xrt|rt\b)\b", re.I)
+
+# PBS procedures
+RX_LUMPECTOMY = re.compile(r"\b(lumpectomy|partial mastectomy)\b", re.I)
+RX_REDUCTION = re.compile(r"\b(breast reduction|reduction mammoplasty|mammoplasty)\b", re.I)
+RX_MASTOPEXY = re.compile(r"\b(mastopexy|breast lift)\b", re.I)
+RX_AUGMENT = re.compile(r"\b(augmentation|breast augmentation|augment)\b", re.I)
+
+# Comorbidity hints (fallback only)
+RX_DIABETES = re.compile(r"\bdiabetes\b", re.I)
+RX_HTN = re.compile(r"\b(hypertension|htn)\b", re.I)
+RX_CARDIAC = re.compile(r"\b(coronary|cad\b|mi\b|myocardial infarction|heart failure|chf\b|angina)\b", re.I)
+RX_VTE = re.compile(r"\b(dvt\b|pe\b|pulmonary embol|venous thromboembol|thrombosis)\b", re.I)
+
+
+def note_signal(text, rx_pos, rx_neg=None):
+    """
+    Returns 1/0/None from a note:
+      - if negation match -> 0
+      - elif positive match -> 1
+      - else None
+    """
+    if text is None:
+        return None
+    if rx_neg is not None and rx_neg.search(text):
+        return 0
+    if rx_pos.search(text):
+        return 1
+    return None
+
+
+def extract_from_notes_group(note_texts):
+    """
+    note_texts: list of strings for one patient
+    returns dict of extracted values (only for fields we want to fill/boost)
+    """
+    out = {}
+
+    # Try to find first plausible age / BMI
+    age_vals = []
+    bmi_vals = []
+    smoke = []
+
+    steroid_any = 0
+    chemo_votes = []
+    rad_votes = []
+    pbs_lump = 0
+    pbs_red = 0
+    pbs_mast = 0
+    pbs_aug = 0
+
+    diab_any = 0
+    htn_any = 0
+    card_any = 0
+    vte_any = 0
+
+    for t in note_texts:
+        if not t:
+            continue
+
+        # Age
+        m = RX_AGE.search(t)
+        if m:
+            age_vals.append(to_int_safe(m.group(1)))
+
+        # BMI
+        m2 = RX_BMI.search(t)
+        if m2:
+            bmi_vals.append(to_float_safe(m2.group(1)))
+
+        # Smoking
+        if RX_SMOKE_CURRENT.search(t):
+            smoke.append("Current")
+        elif RX_SMOKE_FORMER.search(t):
+            smoke.append("Former")
+        elif RX_SMOKE_NEVER.search(t):
+            smoke.append("Never")
+
+        # Steroid
+        if RX_STEROID.search(t):
+            steroid_any = 1
+
+        # Chemo / Rad (vote with negation awareness)
+        chemo_votes.append(note_signal(t, RX_CHEMO_POS, RX_CHEMO_NEG))
+        rad_votes.append(note_signal(t, RX_RAD_POS, RX_RAD_NEG))
+
+        # PBS
+        if RX_LUMPECTOMY.search(t):
+            pbs_lump = 1
+        if RX_REDUCTION.search(t):
+            pbs_red = 1
+        if RX_MASTOPEXY.search(t):
+            pbs_mast = 1
+        if RX_AUGMENT.search(t):
+            pbs_aug = 1
+
+        # Comorbidities (weak fallback)
+        if RX_DIABETES.search(t):
+            diab_any = 1
+        if RX_HTN.search(t):
+            htn_any = 1
+        if RX_CARDIAC.search(t):
+            card_any = 1
+        if RX_VTE.search(t):
+            vte_any = 1
+
+    # consolidate
+    age_vals = [a for a in age_vals if a is not None and 0 < a < 120]
+    bmi_vals = [b for b in bmi_vals if b is not None and 10.0 < b < 90.0]
+
+    out["Age_note"] = age_vals[0] if age_vals else None
+    out["BMI_note"] = round(bmi_vals[0], 1) if bmi_vals else None
+
+    out["SmokingStatus_note"] = smoke[0] if smoke else None
+    out["Steroid_note"] = steroid_any if steroid_any == 1 else None
+
+    # chemo/rad: if any explicit 1 -> 1, else if any explicit 0 -> 0, else None
+    def consolidate_votes(votes):
+        vv = [v for v in votes if v is not None]
+        if not vv:
+            return None
+        return 1 if 1 in vv else 0
+
+    out["Chemo_note"] = consolidate_votes(chemo_votes)
+    out["Radiation_note"] = consolidate_votes(rad_votes)
+
+    out["PBS_Lumpectomy_note"] = 1 if pbs_lump else None
+    out["PBS_Reduction_note"] = 1 if pbs_red else None
+    out["PBS_Mastopexy_note"] = 1 if pbs_mast else None
+    out["PBS_Augmentation_note"] = 1 if pbs_aug else None
+
+    out["Diabetes_note"] = 1 if diab_any else None
+    out["Hypertension_note"] = 1 if htn_any else None
+    out["CardiacDisease_note"] = 1 if card_any else None
+    out["VenousThromboembolism_note"] = 1 if vte_any else None
+
+    return out
+
+
+# -----------------------------
+# Main build logic
+# -----------------------------
+
+def build_patient_table(enc_df, notes_by_pid):
+    """
+    enc_df: concatenated encounters (all settings)
+    notes_by_pid: dict pid -> list of note texts
+    """
+    enc_df = standardize_pid(enc_df)
+
+    # identify likely encounter columns (best-effort)
+    col_race = find_column(enc_df, [r"^race$", r"race"])
+    col_eth = find_column(enc_df, [r"ethnic", r"hispanic"])
+    col_age = find_column(enc_df, [r"^age$", r"age"])
+    col_bmi = find_column(enc_df, [r"\bbmi\b"])
+    col_smoke = find_column(enc_df, [r"smok"])
+    col_diab = find_column(enc_df, [r"diabet"])
+    col_htn = find_column(enc_df, [r"hypert", r"\bhtn\b"])
+    col_card = find_column(enc_df, [r"cardiac", r"\bcad\b", r"heart"])
+    col_vte = find_column(enc_df, [r"thrombo", r"\bvte\b", r"\bdvt\b", r"embol"])
+    col_steroid = find_column(enc_df, [r"steroid", r"predni", r"cortic"])
+
+    # Sometimes chemo/rad stored as flags
+    col_chemo = find_column(enc_df, [r"\bchemo\b", r"chemotherapy"])
+    col_rad = find_column(enc_df, [r"radiat", r"\bxrt\b", r"\brt\b"])
+
+    # PBS structured columns (rare)
+    col_lump = find_column(enc_df, [r"lumpect"])
+    col_red = find_column(enc_df, [r"reduction"])
+    col_mast = find_column(enc_df, [r"mastopex", r"breast lift"])
+    col_aug = find_column(enc_df, [r"augment"])
+
+    # obesity sometimes present, else derive from BMI
+    col_obesity = find_column(enc_df, [r"obes"])
+
+    # group by patient
+    grouped = enc_df.groupby(PID_STANDARD, sort=False)
+
+    rows = []
+    for pid, g in grouped:
+        # Encounter-driven (preferred)
+        race = mode_nonnull(g[col_race]) if col_race else None
+        eth = mode_nonnull(g[col_eth]) if col_eth else None
+
+        age_enc = None
+        if col_age:
+            # if multiple, take most recent non-null (last row order) else mode
+            vals = [to_int_safe(x) for x in g[col_age].values]
+            vals = [v for v in vals if v is not None and 0 < v < 120]
+            age_enc = vals[-1] if vals else None
+
+        bmi_enc = None
+        if col_bmi:
+            vals = [to_float_safe(x) for x in g[col_bmi].values]
+            vals = [v for v in vals if v is not None and 10.0 < v < 90.0]
+            bmi_enc = round(vals[-1], 1) if vals else None
+
+        smoke_enc = None
+        if col_smoke:
+            smoke_raw = mode_nonnull(g[col_smoke])
+            smoke_enc = normalize_smoking(smoke_raw)
+
+        diab_enc = max01(g[col_diab]) if col_diab else None
+        htn_enc = max01(g[col_htn]) if col_htn else None
+        card_enc = max01(g[col_card]) if col_card else None
+        vte_enc = max01(g[col_vte]) if col_vte else None
+        steroid_enc = max01(g[col_steroid]) if col_steroid else None
+
+        chemo_enc = max01(g[col_chemo]) if col_chemo else None
+        rad_enc = max01(g[col_rad]) if col_rad else None
+
+        pbs_lump_enc = max01(g[col_lump]) if col_lump else None
+        pbs_red_enc = max01(g[col_red]) if col_red else None
+        pbs_mast_enc = max01(g[col_mast]) if col_mast else None
+        pbs_aug_enc = max01(g[col_aug]) if col_aug else None
+
+        obesity = None
+        if col_obesity:
+            obesity = max01(g[col_obesity])
+        # derive if missing
+        if obesity is None and bmi_enc is not None:
+            obesity = 1 if bmi_enc >= 30.0 else 0
+
+        # Note-driven fallback/boost
+        note_pack = extract_from_notes_group(notes_by_pid.get(pid, []))
+
+        age = coalesce_first_nonnull([age_enc, note_pack.get("Age_note")])
+        bmi = coalesce_first_nonnull([bmi_enc, note_pack.get("BMI_note")])
+
+        # If BMI found late, re-derive obesity
+        if (obesity is None or pd.isnull(obesity)) and bmi is not None:
+            obesity = 1 if float(bmi) >= 30.0 else 0
+
+        smoke = coalesce_first_nonnull([smoke_enc, note_pack.get("SmokingStatus_note")])
+        if smoke is None:
+            smoke = "Unknown"
+
+        diabetes = coalesce_first_nonnull([diab_enc, note_pack.get("Diabetes_note")])
+        hypertension = coalesce_first_nonnull([htn_enc, note_pack.get("Hypertension_note")])
+        cardiac = coalesce_first_nonnull([card_enc, note_pack.get("CardiacDisease_note")])
+        vte = coalesce_first_nonnull([vte_enc, note_pack.get("VenousThromboembolism_note")])
+        steroid = coalesce_first_nonnull([steroid_enc, note_pack.get("Steroid_note")])
+
+        chemo = coalesce_first_nonnull([chemo_enc, note_pack.get("Chemo_note")])
+        rad = coalesce_first_nonnull([rad_enc, note_pack.get("Radiation_note")])
+
+        pbs_lump = coalesce_first_nonnull([pbs_lump_enc, note_pack.get("PBS_Lumpectomy_note")])
+        pbs_red = coalesce_first_nonnull([pbs_red_enc, note_pack.get("PBS_Reduction_note")])
+        pbs_mast = coalesce_first_nonnull([pbs_mast_enc, note_pack.get("PBS_Mastopexy_note")])
+        pbs_aug = coalesce_first_nonnull([pbs_aug_enc, note_pack.get("PBS_Augmentation_note")])
+
+        # Final type normalization: force 0/1 where applicable
+        def force01(x):
+            b = bool01_from_any(x)
+            return b if b is not None else 0  # default conservative 0
+
+        # For these binary variables, default to 0 if still None (avoid NA mismatches in validation)
+        diabetes = force01(diabetes)
+        hypertension = force01(hypertension)
+        cardiac = force01(cardiac)
+        vte = force01(vte)
+        steroid = force01(steroid)
+        pbs_lump = force01(pbs_lump)
+        pbs_red = force01(pbs_red)
+        pbs_mast = force01(pbs_mast)
+        pbs_aug = force01(pbs_aug)
+        rad = force01(rad)
+        chemo = force01(chemo)
+
+        # Race/Ethnicity normalization (light-touch)
+        race = normalize_race(race)
+        eth = normalize_ethnicity(eth)
+
+        row = {
+            PID_STANDARD: pid,
+            "Race": race if race is not None else "Unknown",
+            "Ethnicity": eth if eth is not None else "Unknown",
+            "Age": age if age is not None else "",
+            "BMI": bmi if bmi is not None else "",
+            "Obesity": force01(obesity) if obesity is not None else 0,
+            "SmokingStatus": smoke,
+            "Diabetes": diabetes,
+            "Hypertension": hypertension,
+            "CardiacDisease": cardiac,
+            "VenousThromboembolism": vte,
+            "Steroid": steroid,
+            "PBS_Lumpectomy": pbs_lump,
+            "PBS_Reduction": pbs_red,
+            "PBS_Mastopexy": pbs_mast,
+            "PBS_Augmentation": pbs_aug,
+            "Radiation": rad,
+            "Chemo": chemo,
+        }
+        rows.append(row)
+
+    out = pd.DataFrame(rows)
+
+    # Ensure all expected columns exist
+    for c in OUTPUT_COLUMNS:
+        if c not in out.columns:
+            out[c] = ""
+
+    out = out[OUTPUT_COLUMNS]
+    return out
+
+
+def normalize_smoking(smoke_raw):
+    s = normalize_str(smoke_raw)
+    if s is None:
+        return None
+    sl = s.lower()
+    if "current" in sl:
+        return "Current"
+    if "former" in sl or "quit" in sl or "ex-" in sl:
+        return "Former"
+    if "never" in sl or "non" in sl:
+        return "Never"
+    # sometimes encoded as 0/1/2 etc
+    if sl in ("0", "none"):
+        return "Never"
+    return s  # keep original if unrecognized
+
+
+def normalize_race(race_raw):
+    s = normalize_str(race_raw)
+    if s is None:
+        return None
+    sl = s.lower()
+    if "white" in sl or "cauc" in sl:
+        return "Caucasian"
+    if "black" in sl or "african" in sl:
+        return "Black"
+    if "asian" in sl:
+        return "Asian"
+    if "unknown" in sl or "declin" in sl:
+        return "Unknown"
+    return s
+
+
+def normalize_ethnicity(eth_raw):
+    s = normalize_str(eth_raw)
+    if s is None:
+        return None
+    sl = s.lower()
+    if "non" in sl and "hisp" in sl:
+        return "Non-hispanic"
+    if "hisp" in sl or "latin" in sl:
+        return "Hispanic"
+    if "unknown" in sl or "declin" in sl:
+        return "Unknown"
+    return s
+
+
+def build_notes_index(data_dir):
+    """
+    Build dict: ENCRYPTED_PAT_ID -> list of note texts
+    Keeps memory reasonable by only storing text (not whole df).
+    """
+    notes_by_pid = {}
+
+    for fn in NOTE_FILES:
+        path = os.path.join(data_dir, fn)
+        if not os.path.exists(path):
+            log("WARNING: missing notes file: {}".format(path))
+            continue
+
+        log("Reading notes: {}".format(path))
+        df = read_csv_flexible(path)
+        df = standardize_pid(df)
+
+        text_col = pick_text_column(df)
+        if text_col is None:
+            log("WARNING: could not find note text column in {}".format(fn))
+            continue
+
+        # iterate rows (vectorized grouping can be memory heavy for huge notes)
+        for _, row in df[[PID_STANDARD, text_col]].iterrows():
+            pid = row[PID_STANDARD]
+            txt = row[text_col]
+            if pd.isnull(pid) or pd.isnull(txt):
                 continue
-        if not nums:
-            return ""
-        return str(int(round(pd.Series(nums).median())))
+            pid = str(pid).strip()
+            t = str(txt)
 
-    age_med = grp["Age_raw"].apply(median_age).reset_index().rename(columns={"Age_raw": "Age"})
+            # light cleaning to remove artifacts like <U+0095>
+            t = re.sub(r"<U\+\d+>", " ", t)
+            t = re.sub(r"\s+", " ", t)
 
-    pat = pat.merge(race_mode, on=PID, how="left")
-    pat = pat.merge(eth_mode, on=PID, how="left")
-    pat = pat.merge(age_med, on=PID, how="left")
+            if pid not in notes_by_pid:
+                notes_by_pid[pid] = []
+            notes_by_pid[pid].append(t)
 
-    # normalize to gold-style
-    pat["Race"] = pat["Race"].apply(normalize_race)
-    pat["Ethnicity"] = pat["Ethnicity"].apply(normalize_ethnicity)
-
-    # ensure master columns exist
-    for c in MASTER_COLUMNS:
-        if c not in pat.columns:
-            pat[c] = ""
-    pat = pat[MASTER_COLUMNS].copy()
-    return pat
+    return notes_by_pid
 
 
-# -----------------------
-# Load + reconstruct notes (original schema)
-# -----------------------
-def load_and_reconstruct_notes():
-    all_rows = []
+def extract_mrn_mapping(enc_df):
+    """
+    If MRN exists in encounters, write mapping MRN -> ENCRYPTED_PAT_ID.
+    """
+    mrn_col = find_column(enc_df, [r"\bmrn\b", r"medical.*record"])
+    if mrn_col is None:
+        return None
 
-    for fp in NOTE_FILES:
-        df = clean_cols(read_csv_robust(fp))
+    tmp = enc_df[[PID_STANDARD, mrn_col]].dropna()
+    if tmp.empty:
+        return None
 
-        pid_col = pick_col(df, [PID, "ENCRYPTED PAT ID", "ENCRYPTED_PATID"], required=True)
-        note_id_col = pick_col(df, ["NOTE_ID", "NOTE ID"], required=True)
-        text_col = pick_col(df, ["NOTE_TEXT", "NOTE TEXT", "NOTE_TEXT_FULL", "TEXT", "NOTE"], required=True)
-        line_col = pick_col(df, ["LINE"], required=False)
-        note_type_col = pick_col(df, ["NOTE_TYPE", "NOTE TYPE"], required=False)
-        date_col = pick_col(df, ["NOTE_DATE_OF_SERVICE", "NOTE DATE OF SERVICE"], required=False)
+    tmp[mrn_col] = tmp[mrn_col].map(lambda x: str(x).strip())
+    tmp[PID_STANDARD] = tmp[PID_STANDARD].map(lambda x: str(x).strip())
 
-        tmp = pd.DataFrame()
-        tmp[PID] = df[pid_col].astype(str).str.strip()
-        tmp["NOTE_ID"] = df[note_id_col].fillna("").astype(str).str.strip()
-        tmp["NOTE_TEXT"] = df[text_col].fillna("").astype(str)
-        tmp["LINE"] = df[line_col].fillna("").astype(str) if line_col else ""
-        tmp["NOTE_TYPE"] = df[note_type_col].fillna("").astype(str) if note_type_col else os.path.basename(fp)
-        tmp["NOTE_DATE"] = df[date_col].fillna("").astype(str) if date_col else ""
-        tmp["SOURCE_FILE"] = os.path.basename(fp)
-
-        tmp = tmp[(tmp[PID].astype(str).str.strip() != "") & (tmp["NOTE_ID"].astype(str).str.strip() != "")]
-        all_rows.append(tmp)
-
-    notes_raw = pd.concat(all_rows, ignore_index=True)
-
-    # reconstruct per (PID, NOTE_ID)
-    reconstructed = []
-    g = notes_raw.groupby([PID, "NOTE_ID"], dropna=False)
-
-    for (pid, nid), block in g:
-        pid = str(pid).strip()
-        nid = str(nid).strip()
-        if not pid or not nid:
-            continue
-
-        b = block.copy()
-        b["_LINE_NUM_"] = b["LINE"].apply(to_int_safe)
-        b = b.sort_values(by=["_LINE_NUM_"], na_position="last")
-
-        full_text = "\n".join(b["NOTE_TEXT"].tolist()).strip()
-        if not full_text:
-            continue
-
-        note_type = ""
-        if (b["NOTE_TYPE"].astype(str).str.strip() != "").any():
-            note_type = b["NOTE_TYPE"].astype(str).iloc[0]
-        else:
-            note_type = b["SOURCE_FILE"].astype(str).iloc[0]
-
-        note_date = ""
-        if (b["NOTE_DATE"].astype(str).str.strip() != "").any():
-            note_date = b["NOTE_DATE"].astype(str).iloc[0]
-
-        reconstructed.append({
-            PID: pid,
-            "NOTE_ID": nid,
-            "NOTE_TYPE": note_type,
-            "NOTE_DATE": note_date,
-            "SOURCE_FILE": b["SOURCE_FILE"].astype(str).iloc[0],
-            "NOTE_TEXT": full_text,
-        })
-
-    return pd.DataFrame(reconstructed)
+    # Keep first observed mapping per MRN (assumes stable)
+    tmp = tmp.drop_duplicates(subset=[mrn_col], keep="first")
+    tmp = tmp.rename(columns={mrn_col: "MRN"})
+    return tmp[["MRN", PID_STANDARD]]
 
 
-# -----------------------
-# MAIN
-# -----------------------
 def main():
-    print("Building patient master from ORIGINAL files only...")
-    print("DATA_DIR:", DATA_DIR)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_dir", default=DEFAULT_DATA_DIR,
+                        help="Directory containing original HPI11526 files.")
+    args = parser.parse_args()
 
-    os.makedirs(OUT_DIR, exist_ok=True)
+    data_dir = args.data_dir
 
-    print("\n1) Seeding patients + structured demographics from encounters...")
-    master = load_encounters_seed()
-    print("Seeded patients:", len(master))
+    log("Using data_dir: {}".format(data_dir))
+    for fn in ENCOUNTER_FILES + NOTE_FILES:
+        p = os.path.join(data_dir, fn)
+        if not os.path.exists(p):
+            log("WARNING: expected file missing: {}".format(p))
 
-    print("\n2) Loading + reconstructing notes...")
-    notes_df = load_and_reconstruct_notes()
-    print("Reconstructed notes:", len(notes_df))
+    ensure_outdir()
 
-    print("\n3) Running extractors + aggregating to patient-level...")
-    extractor_fns = [
-        extract_age,
-        extract_bmi,
-        extract_smoking,
-        extract_comorbidities,
-        extract_pbs,
-        extract_cancer_treatment,
-    ]
-
-    best_by_pid = {}   # pid -> logical_field -> Candidate
-    evidence_rows = []
-
-    for _, row in notes_df.iterrows():
-        pid = str(row[PID]).strip()
-        snote = build_sectioned_note(
-            note_text=row["NOTE_TEXT"],
-            note_type=row["NOTE_TYPE"],
-            note_id=row["NOTE_ID"],
-            note_date=row["NOTE_DATE"]
-        )
-
-        cands = []
-        for fn in extractor_fns:
-            try:
-                cands.extend(fn(snote))
-            except Exception as e:
-                evidence_rows.append({
-                    PID: pid,
-                    "NOTE_ID": row["NOTE_ID"],
-                    "NOTE_DATE": row["NOTE_DATE"],
-                    "NOTE_TYPE": row["NOTE_TYPE"],
-                    "FIELD": "EXTRACTOR_ERROR",
-                    "VALUE": "",
-                    "STATUS": "",
-                    "CONFIDENCE": "",
-                    "SECTION": "",
-                    "EVIDENCE": "%s failed: %s" % (fn.__name__, repr(e)),
-                })
-
-        if not cands:
+    # Load encounters
+    enc_list = []
+    for fn in ENCOUNTER_FILES:
+        path = os.path.join(data_dir, fn)
+        if not os.path.exists(path):
+            log("WARNING: missing encounters file: {}".format(path))
             continue
+        log("Reading encounters: {}".format(path))
+        df = read_csv_flexible(path)
+        df = standardize_pid(df)
+        enc_list.append(df)
 
-        if pid not in best_by_pid:
-            best_by_pid[pid] = {}
+    if not enc_list:
+        raise RuntimeError("No encounter files could be loaded. Check paths.")
 
-        for c in cands:
-            logical = FIELD_MAP.get(str(getattr(c, "field", "")))
-            if not logical:
-                continue
+    enc = pd.concat(enc_list, axis=0, sort=False, ignore_index=True)
+    log("Total encounter rows: {}".format(len(enc)))
+    log("Unique patients in encounters: {}".format(enc[PID_STANDARD].nunique()))
 
-            # evidence row
-            evidence_rows.append({
-                PID: pid,
-                "NOTE_ID": getattr(c, "note_id", row["NOTE_ID"]),
-                "NOTE_DATE": getattr(c, "note_date", row["NOTE_DATE"]),
-                "NOTE_TYPE": getattr(c, "note_type", row["NOTE_TYPE"]),
-                "FIELD": logical,
-                "VALUE": getattr(c, "value", ""),
-                "STATUS": getattr(c, "status", ""),
-                "CONFIDENCE": getattr(c, "confidence", ""),
-                "SECTION": getattr(c, "section", ""),
-                "EVIDENCE": getattr(c, "evidence", ""),
-            })
+    # Build notes index
+    notes_by_pid = build_notes_index(data_dir)
+    log("Patients with notes indexed: {}".format(len(notes_by_pid)))
 
-            existing = best_by_pid[pid].get(logical)
-            if logical in BOOLEAN_FIELDS:
-                best_by_pid[pid][logical] = merge_boolean(existing, c)
-            else:
-                best_by_pid[pid][logical] = choose_best(existing, c)
+    # Build patient table
+    log("Building patient-level master...")
+    master = build_patient_table(enc, notes_by_pid)
 
-    print("Patients with any extracted signals:", len(best_by_pid))
-
-    print("\n4) Writing values into master + normalizing to gold conventions...")
-    # fast index
-    master[PID] = master[PID].astype(str).str.strip()
-    master_idx = {pid: i for i, pid in enumerate(master[PID].tolist())}
-
-    for pid, fields in best_by_pid.items():
-        if pid not in master_idx:
-            continue
-        i = master_idx[pid]
-
-        for logical, cand in fields.items():
-            val = getattr(cand, "value", "")
-
-            if logical == "SmokingStatus":
-                master.at[i, "SmokingStatus"] = normalize_smoking(val)
-                continue
-
-            if logical == "BMI":
-                # numeric BMI + obesity
-                try:
-                    bmi = float(str(val).strip())
-                    master.at[i, "BMI"] = round(bmi, 1)
-                    master.at[i, "Obesity"] = 1 if bmi >= 30.0 else 0
-                except Exception:
-                    # leave blank if not parseable
-                    pass
-                continue
-
-            if logical == "Age":
-                # store as int if possible
-                try:
-                    age = int(float(str(val).strip()))
-                    master.at[i, "Age"] = age
-                except Exception:
-                    # leave existing structured Age if present
-                    pass
-                continue
-
-            if logical in BOOLEAN_FIELDS:
-                b = to_binary01(val)
-                if b in (0, 1):
-                    master.at[i, logical] = b
-                continue
-
-            # fallback: write raw
-            if logical in master.columns:
-                master.at[i, logical] = val
-
-    # normalize Race/Ethnicity again (in case extractor ever touches them later)
-    master["Race"] = master["Race"].apply(normalize_race)
-    master["Ethnicity"] = master["Ethnicity"].apply(normalize_ethnicity)
-
-    # ensure binary columns are 0/1 or blank (not "True"/"False")
-    for c in BOOLEAN_FIELDS.union(set(["Obesity"])):
-        if c in master.columns:
-            master[c] = master[c].apply(lambda x: to_binary01(x) if norm_str(x) != "" else "")
-
-    # order + write
-    master = master[MASTER_COLUMNS].copy()
+    # Save outputs
     master.to_csv(OUT_MASTER, index=False)
+    log("Wrote: {}".format(os.path.abspath(OUT_MASTER)))
 
-    pd.DataFrame(evidence_rows).to_csv(OUT_EVID, index=False)
+    # Save MRN mapping if possible
+    mrn_map = extract_mrn_mapping(enc)
+    if mrn_map is not None and not mrn_map.empty:
+        mrn_map.to_csv(OUT_MAP, index=False)
+        log("Wrote: {}".format(os.path.abspath(OUT_MAP)))
+    else:
+        log("No MRN mapping written (MRN column not found or empty).")
 
-    print("\nDONE.")
-    print("Master:", OUT_MASTER)
-    print("Evidence:", OUT_EVID)
-    print("\nRun:")
-    print("  python build_patient_master_from_original.py")
+    log("Done.")
 
 
 if __name__ == "__main__":
