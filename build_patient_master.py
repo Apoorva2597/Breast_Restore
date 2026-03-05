@@ -2,16 +2,13 @@
 # -*- coding: utf-8 -*-
 
 """
-Build patient-level abstraction table from the original HPI11526 files.
+Patient-level abstraction pipeline
 
-Inputs (must exist in the same directory as this script):
+Reads original HPI11526 encounter and note files and builds
+a patient-level abstraction table.
 
-HPI11526 Clinic Encounters.csv
-HPI11526 Inpatient Encounters.csv
-HPI11526 Operation Encounters.csv
-HPI11526 Clinic Notes.csv
-HPI11526 Inpatient Notes.csv
-HPI11526 Operation Notes.csv
+Input directory:
+/home/apokol/my_data_Breast/HPI-11526/HPI11256
 
 Output:
 _outputs/patient_master.csv
@@ -22,20 +19,34 @@ import os
 import re
 
 # ---------------------------------------------------
-# Input files (original data only)
+# DATA DIRECTORY (FULL PATH)
+# ---------------------------------------------------
+
+DATA_DIR = "/home/apokol/my_data_Breast/HPI-11526/HPI11256"
+
+# ---------------------------------------------------
+# Encounter files
 # ---------------------------------------------------
 
 ENCOUNTER_FILES = [
-    "HPI11526 Clinic Encounters.csv",
-    "HPI11526 Inpatient Encounters.csv",
-    "HPI11526 Operation Encounters.csv"
+    os.path.join(DATA_DIR, "HPI11526 Clinic Encounters.csv"),
+    os.path.join(DATA_DIR, "HPI11526 Inpatient Encounters.csv"),
+    os.path.join(DATA_DIR, "HPI11526 Operation Encounters.csv")
 ]
 
+# ---------------------------------------------------
+# Note files
+# ---------------------------------------------------
+
 NOTE_FILES = [
-    "HPI11526 Clinic Notes.csv",
-    "HPI11526 Inpatient Notes.csv",
-    "HPI11526 Operation Notes.csv"
+    os.path.join(DATA_DIR, "HPI11526 Clinic Notes.csv"),
+    os.path.join(DATA_DIR, "HPI11526 Inpatient Notes.csv"),
+    os.path.join(DATA_DIR, "HPI11526 Operation Notes.csv")
 ]
+
+# ---------------------------------------------------
+# Output
+# ---------------------------------------------------
 
 OUTPUT_DIR = "_outputs"
 OUTPUT_FILE = os.path.join(OUTPUT_DIR, "patient_master.csv")
@@ -45,7 +56,7 @@ NOTE_TEXT_COL = "NOTE_TEXT"
 
 
 # ---------------------------------------------------
-# Regex extractors
+# Regex patterns
 # ---------------------------------------------------
 
 BMI_RE = re.compile(r"\bbmi[: ]*([0-9]{2}\.?[0-9]?)\b", re.I)
@@ -69,7 +80,7 @@ CHEMO_RE = re.compile(r"\bchemo|chemotherapy\b", re.I)
 
 
 # ---------------------------------------------------
-# Extraction helpers
+# Helper extraction functions
 # ---------------------------------------------------
 
 def extract_bmi(text):
@@ -90,7 +101,7 @@ def extract_smoking(text):
     return None
 
 
-def extract_flag(regex, text):
+def flag(regex, text):
     return 1 if regex.search(text) else 0
 
 
@@ -118,13 +129,13 @@ def main():
     print("Total notes:", len(notes))
 
     # ---------------------------------------------------
-    # Build patient list
+    # Create patient list
     # ---------------------------------------------------
 
     patients = encounters[[PATIENT_ID]].drop_duplicates().copy()
 
     # ---------------------------------------------------
-    # Structured demographics (if present)
+    # Structured demographics (if available)
     # ---------------------------------------------------
 
     demo = encounters.groupby(PATIENT_ID).first().reset_index()
@@ -139,7 +150,7 @@ def main():
         patients["Age"] = demo["AGE_AT_ENCOUNTER"]
 
     # ---------------------------------------------------
-    # Initialize abstraction variables
+    # Initialize variables
     # ---------------------------------------------------
 
     fields = [
@@ -163,10 +174,8 @@ def main():
         patients[f] = None
 
     # ---------------------------------------------------
-    # Patient-level note aggregation
+    # Aggregate notes per patient
     # ---------------------------------------------------
-
-    print("Aggregating notes by patient...")
 
     notes[NOTE_TEXT_COL] = notes[NOTE_TEXT_COL].fillna("").str.lower()
 
@@ -180,9 +189,7 @@ def main():
     # Run extraction
     # ---------------------------------------------------
 
-    print("Running patient-level abstraction...")
-
-    for i, row in patient_notes.iterrows():
+    for _, row in patient_notes.iterrows():
 
         pid = row[PATIENT_ID]
         text = row[NOTE_TEXT_COL]
@@ -194,33 +201,28 @@ def main():
 
         idx = idx[0]
 
-        # BMI
         bmi = extract_bmi(text)
         if bmi:
             patients.loc[idx, "BMI"] = bmi
             patients.loc[idx, "Obesity"] = 1 if bmi >= 30 else 0
 
-        # Smoking
         sm = extract_smoking(text)
         if sm:
             patients.loc[idx, "SmokingStatus"] = sm
 
-        # Comorbidities
-        patients.loc[idx, "Diabetes"] = extract_flag(DIABETES_RE, text)
-        patients.loc[idx, "Hypertension"] = extract_flag(HTN_RE, text)
-        patients.loc[idx, "CardiacDisease"] = extract_flag(CARDIAC_RE, text)
-        patients.loc[idx, "VenousThromboembolism"] = extract_flag(VTE_RE, text)
-        patients.loc[idx, "Steroid"] = extract_flag(STEROID_RE, text)
+        patients.loc[idx, "Diabetes"] = flag(DIABETES_RE, text)
+        patients.loc[idx, "Hypertension"] = flag(HTN_RE, text)
+        patients.loc[idx, "CardiacDisease"] = flag(CARDIAC_RE, text)
+        patients.loc[idx, "VenousThromboembolism"] = flag(VTE_RE, text)
+        patients.loc[idx, "Steroid"] = flag(STEROID_RE, text)
 
-        # Prior breast surgery
-        patients.loc[idx, "PBS_Lumpectomy"] = extract_flag(LUMPECTOMY_RE, text)
-        patients.loc[idx, "PBS_Reduction"] = extract_flag(REDUCTION_RE, text)
-        patients.loc[idx, "PBS_Mastopexy"] = extract_flag(MASTOPEXY_RE, text)
-        patients.loc[idx, "PBS_Augmentation"] = extract_flag(AUGMENT_RE, text)
+        patients.loc[idx, "PBS_Lumpectomy"] = flag(LUMPECTOMY_RE, text)
+        patients.loc[idx, "PBS_Reduction"] = flag(REDUCTION_RE, text)
+        patients.loc[idx, "PBS_Mastopexy"] = flag(MASTOPEXY_RE, text)
+        patients.loc[idx, "PBS_Augmentation"] = flag(AUGMENT_RE, text)
 
-        # Treatments
-        patients.loc[idx, "Radiation"] = extract_flag(RADIATION_RE, text)
-        patients.loc[idx, "Chemo"] = extract_flag(CHEMO_RE, text)
+        patients.loc[idx, "Radiation"] = flag(RADIATION_RE, text)
+        patients.loc[idx, "Chemo"] = flag(CHEMO_RE, text)
 
     # ---------------------------------------------------
     # Save output
@@ -230,8 +232,8 @@ def main():
 
     patients.to_csv(OUTPUT_FILE, index=False)
 
-    print("Build complete")
-    print("Output written to:", OUTPUT_FILE)
+    print("Build complete.")
+    print("Output:", OUTPUT_FILE)
 
 
 if __name__ == "__main__":
