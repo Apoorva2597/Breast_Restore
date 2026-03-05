@@ -30,7 +30,7 @@ from typing import Optional, Any, List, Dict
 # CONFIG: EDIT PATHS HERE
 # =========================
 ENCOUNTERS_CSV = "_staging_inputs/HP11526 Operation Encounters.csv"
-CLINIC_NOTES_CSV = "_staging_inputs/HP11526_Clinic_Notes.csv"  # <-- update to your actual filename
+CLINIC_NOTES_CSV = "_staging_inputs/HP11526 Clinic Notes.csv"  
 OUT_CSV = "_outputs/patient_master.csv"
 
 # =========================
