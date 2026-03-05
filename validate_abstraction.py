@@ -4,10 +4,9 @@
 """
 validate_abstraction.py
 
-Validates abstraction output against gold labels.
+Validates abstraction output against gold labels using MRN→ENCRYPTED_PAT_ID mapping.
 
 Compatible with Python 3.6.8.
-Handles encoding issues, PID mismatches, and zero merges.
 """
 
 import pandas as pd
@@ -17,7 +16,16 @@ import sys
 MASTER_FILE = "_outputs/patient_master.csv"
 GOLD_FILE = "gold_cleaned_for_cedar.csv"
 
+DATA_DIR = "/home/apokol/my_data_Breast/HPI-11526/HPI11256"
+
+ENCOUNTER_FILES = [
+    os.path.join(DATA_DIR, "HPI11526 Clinic Encounters.csv"),
+    os.path.join(DATA_DIR, "HPI11526 Inpatient Encounters.csv"),
+    os.path.join(DATA_DIR, "HPI11526 Operation Encounters.csv")
+]
+
 PID = "ENCRYPTED_PAT_ID"
+MRN = "MRN"
 
 VARIABLES = [
     "Race",
@@ -52,38 +60,6 @@ def safe_read_csv(path):
 
 
 # ---------------------------------------------------
-# Normalize column names
-# ---------------------------------------------------
-
-def normalize_columns(df):
-
-    df.columns = [c.strip() for c in df.columns]
-
-    return df
-
-
-# ---------------------------------------------------
-# Detect PID column
-# ---------------------------------------------------
-
-def find_pid_column(df):
-
-    candidates = [
-        "ENCRYPTED_PAT_ID",
-        "encrypted_pat_id",
-        "PAT_ID",
-        "PATIENT_ID",
-        "MRN"
-    ]
-
-    for c in candidates:
-        if c in df.columns:
-            return c
-
-    return None
-
-
-# ---------------------------------------------------
 # Normalize values
 # ---------------------------------------------------
 
@@ -91,14 +67,13 @@ def normalize(series):
 
     series = series.fillna("NA")
     series = series.astype(str)
-    series = series.str.strip()
-    series = series.str.lower()
+    series = series.str.strip().str.lower()
 
     return series
 
 
 # ---------------------------------------------------
-# Compute accuracy safely
+# Compute accuracy
 # ---------------------------------------------------
 
 def compute_metrics(pred, gold):
@@ -119,6 +94,34 @@ def compute_metrics(pred, gold):
 
 
 # ---------------------------------------------------
+# Build MRN → ENCRYPTED_PAT_ID mapping
+# ---------------------------------------------------
+
+def build_mapping():
+
+    frames = []
+
+    for f in ENCOUNTER_FILES:
+        df = safe_read_csv(f)
+
+        if MRN in df.columns and PID in df.columns:
+            frames.append(df[[MRN, PID]])
+
+    if len(frames) == 0:
+        print("ERROR: Could not find MRN ↔ ENCRYPTED_PAT_ID mapping in encounter files.")
+        sys.exit(1)
+
+    mapping = pd.concat(frames)
+
+    mapping = mapping.drop_duplicates()
+
+    mapping[MRN] = mapping[MRN].astype(str)
+    mapping[PID] = mapping[PID].astype(str)
+
+    return mapping
+
+
+# ---------------------------------------------------
 # Main
 # ---------------------------------------------------
 
@@ -129,35 +132,37 @@ def main():
     master = safe_read_csv(MASTER_FILE)
     gold = safe_read_csv(GOLD_FILE)
 
-    master = normalize_columns(master)
-    gold = normalize_columns(gold)
-
     print("Master rows:", len(master))
     print("Gold rows:", len(gold))
 
-    # ---------------------------------------------------
-    # Identify gold PID column
-    # ---------------------------------------------------
+    master[PID] = master[PID].astype(str)
 
-    gold_pid = find_pid_column(gold)
-
-    if gold_pid is None:
-        print("ERROR: Could not find patient ID column in gold file")
+    if MRN not in gold.columns:
+        print("ERROR: gold file missing MRN column")
         sys.exit(1)
 
-    if gold_pid != PID:
-        print("Renaming gold PID column:", gold_pid, "->", PID)
-        gold.rename(columns={gold_pid: PID}, inplace=True)
+    gold[MRN] = gold[MRN].astype(str)
 
     # ---------------------------------------------------
-    # Force IDs to string
+    # Build mapping
     # ---------------------------------------------------
 
-    master[PID] = master[PID].astype(str)
-    gold[PID] = gold[PID].astype(str)
+    print("Building MRN → ENCRYPTED_PAT_ID mapping...")
+
+    mapping = build_mapping()
+
+    print("Mapping rows:", len(mapping))
 
     # ---------------------------------------------------
-    # Merge
+    # Attach ENCRYPTED_PAT_ID to gold
+    # ---------------------------------------------------
+
+    gold = pd.merge(gold, mapping, on=MRN, how="left")
+
+    print("Gold rows after mapping:", len(gold))
+
+    # ---------------------------------------------------
+    # Merge with master abstraction
     # ---------------------------------------------------
 
     merged = pd.merge(master, gold, on=PID, suffixes=("_pred", "_gold"))
@@ -165,12 +170,8 @@ def main():
     print("Merged rows:", len(merged))
 
     if len(merged) == 0:
-        print("\nWARNING: No patient IDs matched between files.")
-        print("Likely cause:")
-        print(" - master uses ENCRYPTED_PAT_ID")
-        print(" - gold uses MRN")
-        print("These identifiers cannot be merged directly.\n")
-        sys.exit(0)
+        print("ERROR: No rows matched after mapping.")
+        sys.exit(1)
 
     results = []
 
@@ -209,7 +210,7 @@ def main():
 
     df.to_csv("_outputs/validation_summary.csv", index=False)
 
-    print("\nValidation complete")
+    print("\nValidation complete.")
     print("Results saved to _outputs/validation_summary.csv")
 
 
