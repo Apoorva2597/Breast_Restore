@@ -4,10 +4,15 @@
 """
 validate_abstraction.py
 
-Compares abstraction output against gold labels.
+Validates abstraction output against gold labels.
 
-Python 3.6.8 compatible
-Handles encoding issues and PID column mismatches.
+Fixes:
+- encoding errors
+- patient ID name mismatches
+- patient ID datatype mismatches
+- safe normalization for comparisons
+
+Compatible with Python 3.6.8
 """
 
 import pandas as pd
@@ -16,7 +21,7 @@ import os
 MASTER_FILE = "_outputs/patient_master.csv"
 GOLD_FILE = "gold_cleaned_for_cedar.csv"
 
-PID_STANDARD = "ENCRYPTED_PAT_ID"
+PID = "ENCRYPTED_PAT_ID"
 
 VARIABLES = [
     "Race",
@@ -39,7 +44,7 @@ VARIABLES = [
 
 
 # ---------------------------------------------------
-# Safe CSV reader
+# Safe CSV reader (handles Epic encoding issues)
 # ---------------------------------------------------
 
 def safe_read_csv(path):
@@ -62,7 +67,7 @@ def normalize_columns(df):
 
 
 # ---------------------------------------------------
-# Detect patient ID column
+# Detect PID column in gold file
 # ---------------------------------------------------
 
 def find_pid_column(df):
@@ -83,7 +88,7 @@ def find_pid_column(df):
 
 
 # ---------------------------------------------------
-# Normalize values before comparison
+# Normalize comparison values
 # ---------------------------------------------------
 
 def normalize(series):
@@ -131,23 +136,27 @@ def main():
     print("Gold rows:", len(gold))
 
     # ---------------------------------------------------
-    # Find patient ID column
+    # Identify gold PID column
     # ---------------------------------------------------
 
     gold_pid = find_pid_column(gold)
 
-    if gold_pid != PID_STANDARD:
-        print("Renaming gold PID column:", gold_pid, "->", PID_STANDARD)
-        gold.rename(columns={gold_pid: PID_STANDARD}, inplace=True)
+    if gold_pid != PID:
+        print("Renaming gold PID column:", gold_pid, "->", PID)
+        gold.rename(columns={gold_pid: PID}, inplace=True)
 
-    if PID_STANDARD not in master.columns:
-        raise Exception("Master file missing ENCRYPTED_PAT_ID")
+    # ---------------------------------------------------
+    # FORCE BOTH PID COLUMNS TO STRING
+    # ---------------------------------------------------
+
+    master[PID] = master[PID].astype(str)
+    gold[PID] = gold[PID].astype(str)
 
     # ---------------------------------------------------
     # Merge
     # ---------------------------------------------------
 
-    merged = pd.merge(master, gold, on=PID_STANDARD, suffixes=("_pred", "_gold"))
+    merged = pd.merge(master, gold, on=PID, suffixes=("_pred", "_gold"))
 
     print("Merged rows:", len(merged))
 
@@ -180,7 +189,7 @@ def main():
 
     df = pd.DataFrame(results)
 
-    print("\nValidation Results:\n")
+    print("\nValidation Results\n")
     print(df)
 
     if not os.path.exists("_outputs"):
@@ -188,7 +197,7 @@ def main():
 
     df.to_csv("_outputs/validation_summary.csv", index=False)
 
-    print("\nValidation complete.")
+    print("\nValidation complete")
     print("Results saved to _outputs/validation_summary.csv")
 
 
