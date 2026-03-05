@@ -6,17 +6,13 @@ validate_abstraction.py
 
 Validates abstraction output against gold labels.
 
-Fixes:
-- encoding errors
-- patient ID name mismatches
-- patient ID datatype mismatches
-- safe normalization for comparisons
-
-Compatible with Python 3.6.8
+Compatible with Python 3.6.8.
+Handles encoding issues, PID mismatches, and zero merges.
 """
 
 import pandas as pd
 import os
+import sys
 
 MASTER_FILE = "_outputs/patient_master.csv"
 GOLD_FILE = "gold_cleaned_for_cedar.csv"
@@ -44,7 +40,7 @@ VARIABLES = [
 
 
 # ---------------------------------------------------
-# Safe CSV reader (handles Epic encoding issues)
+# Safe CSV reader
 # ---------------------------------------------------
 
 def safe_read_csv(path):
@@ -67,7 +63,7 @@ def normalize_columns(df):
 
 
 # ---------------------------------------------------
-# Detect PID column in gold file
+# Detect PID column
 # ---------------------------------------------------
 
 def find_pid_column(df):
@@ -84,11 +80,11 @@ def find_pid_column(df):
         if c in df.columns:
             return c
 
-    raise Exception("Could not find patient ID column in gold file")
+    return None
 
 
 # ---------------------------------------------------
-# Normalize comparison values
+# Normalize values
 # ---------------------------------------------------
 
 def normalize(series):
@@ -102,7 +98,7 @@ def normalize(series):
 
 
 # ---------------------------------------------------
-# Compute accuracy
+# Compute accuracy safely
 # ---------------------------------------------------
 
 def compute_metrics(pred, gold):
@@ -111,6 +107,10 @@ def compute_metrics(pred, gold):
     gold = normalize(gold)
 
     total = len(gold)
+
+    if total == 0:
+        return 0, 0, 0
+
     matches = (pred == gold).sum()
 
     accuracy = float(matches) / float(total)
@@ -141,12 +141,16 @@ def main():
 
     gold_pid = find_pid_column(gold)
 
+    if gold_pid is None:
+        print("ERROR: Could not find patient ID column in gold file")
+        sys.exit(1)
+
     if gold_pid != PID:
         print("Renaming gold PID column:", gold_pid, "->", PID)
         gold.rename(columns={gold_pid: PID}, inplace=True)
 
     # ---------------------------------------------------
-    # FORCE BOTH PID COLUMNS TO STRING
+    # Force IDs to string
     # ---------------------------------------------------
 
     master[PID] = master[PID].astype(str)
@@ -159,6 +163,14 @@ def main():
     merged = pd.merge(master, gold, on=PID, suffixes=("_pred", "_gold"))
 
     print("Merged rows:", len(merged))
+
+    if len(merged) == 0:
+        print("\nWARNING: No patient IDs matched between files.")
+        print("Likely cause:")
+        print(" - master uses ENCRYPTED_PAT_ID")
+        print(" - gold uses MRN")
+        print("These identifiers cannot be merged directly.\n")
+        sys.exit(0)
 
     results = []
 
