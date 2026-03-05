@@ -1,3 +1,4 @@
+# extractors/mastectomy.py
 import re
 from typing import List
 
@@ -16,15 +17,25 @@ MASTECTOMY_TYPE_PATTERNS = [
     (r"\bradical\s+mastectomy\b", "radical"),
 ]
 
+# High-FP template phrases
+TEMPLATE_EXCLUDES = [
+    r"\bplanned\b",
+    r"\bwill undergo\b",
+    r"\bscheduled for\b",
+    r"\bdiscussed\b.*\bmastectomy\b",
+]
 
-def _infer_laterality(ctx):
-    ctx = ctx.lower()
-    has_left = "left" in ctx
-    has_right = "right" in ctx
+# Context cues that indicate it actually happened
+PERFORMED_CONTEXT = re.compile(r"\b(performed|underwent|completed|status post|s/p)\b", re.IGNORECASE)
 
-    if has_left and has_right:
+
+def _infer_laterality(ctx: str):
+    c = (ctx or "").lower()
+    if "bilateral" in c:
         return "bilateral"
-    if "bilateral" in ctx:
+    has_left = "left" in c or "lt" in c
+    has_right = "right" in c or "rt" in c
+    if has_left and has_right:
         return "bilateral"
     if has_left:
         return "left"
@@ -33,7 +44,7 @@ def _infer_laterality(ctx):
     return None
 
 
-def _infer_type(ctx):
+def _infer_type(ctx: str):
     for pat, label in MASTECTOMY_TYPE_PATTERNS:
         if re.search(pat, ctx, re.IGNORECASE):
             return label
@@ -41,63 +52,72 @@ def _infer_type(ctx):
 
 
 def extract_mastectomy(note: SectionedNote) -> List[Candidate]:
-    cands = []  # type: List[Candidate]
+    cands: List[Candidate] = []
 
     for section, text in note.sections.items():
+        if not text:
+            continue
+
         for m in MASTECTOMY_RX.finditer(text):
-            ctx = window_around(text, m.start(), m.end(), 140)
+            ctx = window_around(text, m.start(), m.end(), 220)
+            low = ctx.lower()
 
-            status = classify_status(
-                text, m.start(), m.end(),
-                PERFORMED_CUES, PLANNED_CUES, NEGATION_CUES
-            )
+            # exclude template/plan-y contexts
+            if any(re.search(p, low) for p in TEMPLATE_EXCLUDES):
+                # allow if op note OR explicit performed cue in same window
+                if not (str(note.note_type).lower() in {"op note", "operation notes", "brief op notes"} or PERFORMED_CONTEXT.search(ctx)):
+                    continue
 
-            # op-note default
-            if note.note_type in {"OP NOTE", "BRIEF OP NOTES"} and status not in {"denied", "planned"}:
+            status = classify_status(text, m.start(), m.end(), PERFORMED_CUES, PLANNED_CUES, NEGATION_CUES)
+
+            # op-note default: if not denied/planned, treat as performed
+            if str(note.note_type).lower() in {"op note", "operation notes", "brief op notes"} and status not in {"denied", "planned"}:
                 status = "performed"
 
-            # Laterality
+            if status == "planned":
+                # conservative: don’t mark mastectomy performed from planned text
+                continue
+            if status == "denied":
+                continue
+
             lat = _infer_laterality(ctx)
             if lat:
                 cands.append(Candidate(
                     field="Mastectomy_Laterality",
                     value=lat,
-                    status=status,
+                    status=status if status != "performed" else "history",
                     evidence=ctx,
                     section=section,
                     note_type=note.note_type,
                     note_id=note.note_id,
                     note_date=note.note_date,
-                    confidence=0.75
+                    confidence=0.80 if str(note.note_type).lower() in {"op note", "operation notes", "brief op notes"} else 0.70
                 ))
 
-            # Type
             mtype = _infer_type(ctx)
             if mtype:
                 cands.append(Candidate(
                     field="Mastectomy_Type",
                     value=mtype,
-                    status=status,
+                    status=status if status != "performed" else "history",
                     evidence=ctx,
                     section=section,
                     note_type=note.note_type,
                     note_id=note.note_id,
                     note_date=note.note_date,
-                    confidence=0.75
+                    confidence=0.78
                 ))
 
-            # Mastectomy_Performed flag
-            if status in {"performed", "history"}:
-                cands.append(Candidate(
-                    field="Mastectomy_Performed",
-                    value=True,
-                    status=status,
-                    evidence=ctx,
-                    section=section,
-                    note_type=note.note_type,
-                    note_id=note.note_id,
-                    note_date=note.note_date,
-                    confidence=0.8
-                ))
+            cands.append(Candidate(
+                field="Mastectomy_Performed",
+                value=True,
+                status=status if status != "performed" else "history",
+                evidence=ctx,
+                section=section,
+                note_type=note.note_type,
+                note_id=note.note_id,
+                note_date=note.note_date,
+                confidence=0.82
+            ))
 
     return cands
