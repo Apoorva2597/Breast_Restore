@@ -2,270 +2,300 @@
 # -*- coding: utf-8 -*-
 
 """
-build_patient_master.py  (Python 3.6.8 friendly)
+build_patient_master.py
 
-Creates a PATIENT-LEVEL abstraction table (patient_master.csv) for the HPI11526 dataset.
+Builds _outputs/patient_master.csv (patient-level abstraction) by combining:
+  1) Structured patient file with ENCRYPTED_PAT_ID (Race/Ethnicity/Age/BMI/Smoking + surgery flags + etc.)
+  2) Clinic notes CSV (free text) to extract:
+        - Comorbidities from PAST MEDICAL HISTORY section (primary)
+        - Medications as a trigger, then confirm by searching full note (secondary)
+        - Lumpectomy evidence from clinic exam language (e.g., "lumpectomy scar")
+        - Age fallback (if structured Age missing) from early lines of note text
 
-Key updates (per your latest guidance):
-- Comorbidities (Diabetes / HTN / Cardiac / VTE / Steroid) primarily from CLINIC NOTES:
-    * section-aware extraction from "PAST MEDICAL HISTORY" (PMH) block
-    * medication signals as a secondary confirmation layer
-- Lumpectomy: include "lumpectomy scar" (commonly documented on exam) in CLINIC NOTES
-- Uses ORIGINAL data only (no synthetic NOTE_DEID column assumptions):
-    * auto-detects the note text column (NOTE_TEXT*, TEXT, BODY, etc.)
-- Reads the real file paths under:
-    /home/apokol/my_data_Breast/HPI-11526/HPI11256
+IMPORTANT per user constraints:
+  - Do NOT look for NOTE_TEXT_DEID (it does not exist in original data file).
+  - Use broad age patterns.
+  - Prefer structured Age column when present; use note only as fallback.
 
 Outputs:
-  Breast_Restore/_outputs/patient_master.csv
-  Breast_Restore/_outputs/build_audit_summary.csv
+  - _outputs/patient_master.csv
+  - _outputs/build_audit_summary.csv
+  - _outputs/build_audit_patients.csv
 
 Run:
-  (.venv) python build_patient_master.py
+  python build_patient_master.py
 """
-
-from __future__ import print_function
 
 import os
 import re
 import sys
-import time
+from collections import Counter, defaultdict
+
 import pandas as pd
-from collections import defaultdict, Counter
-
-# -----------------------------
-# INPUT PATHS (FULL PATHS)
-# -----------------------------
-DATA_DIR = "/home/apokol/my_data_Breast/HPI-11526/HPI11256"
-
-CLINIC_ENC = os.path.join(DATA_DIR, "HPI11526 Clinic Encounters.csv")
-INPAT_ENC  = os.path.join(DATA_DIR, "HPI11526 Inpatient Encounters.csv")
-OP_ENC     = os.path.join(DATA_DIR, "HPI11526 Operation Encounters.csv")
-
-CLINIC_NOTES = os.path.join(DATA_DIR, "HPI11526 Clinic Notes.csv")
-INPAT_NOTES  = os.path.join(DATA_DIR, "HPI11526 Inpatient Notes.csv")
-OP_NOTES     = os.path.join(DATA_DIR, "HPI11526 Operation Notes.csv")
-
-# -----------------------------
-# OUTPUTS (relative to CWD)
-# -----------------------------
-OUT_DIR = "_outputs"
-MASTER_OUT = os.path.join(OUT_DIR, "patient_master.csv")
-AUDIT_OUT  = os.path.join(OUT_DIR, "build_audit_summary.csv")
-
-# -----------------------------
-# ID COLUMN
-# -----------------------------
-PID_COL = "ENCRYPTED_PAT_ID"
-
-# -----------------------------
-# HELPERS: robust CSV read
-# -----------------------------
-def safe_read_csv(path, usecols=None, chunksize=None):
-    """
-    Tries a few encodings to avoid UnicodeDecodeError in older pandas/Python.
-    """
-    encodings = ["utf-8", "latin1", "cp1252"]
-    last_err = None
-    for enc in encodings:
-        try:
-            return pd.read_csv(path, usecols=usecols, chunksize=chunksize, encoding=enc)
-        except Exception as e:
-            last_err = e
-    raise last_err
 
 
-def norm_col(s):
-    if s is None:
+# -----------------------------
+# Paths / filenames (edit if needed)
+# -----------------------------
+STRUCTURED_FILE = "_outputs/patient_stage_summary.csv"   # your structured patient-level file (has ENCRYPTED_PAT_ID)
+CLINIC_NOTES_FILE = "_staging_inputs/HPI11526 Clinic Notes.csv"  # your clinic notes CSV
+OUT_MASTER = "_outputs/patient_master.csv"
+OUT_AUDIT_SUMMARY = "_outputs/build_audit_summary.csv"
+OUT_AUDIT_PATIENTS = "_outputs/build_audit_patients.csv"
+
+PID = "ENCRYPTED_PAT_ID"
+
+
+# -----------------------------
+# What we output / validate (subset)
+# -----------------------------
+OUTPUT_COLUMNS = [
+    PID,
+    "Race",
+    "Ethnicity",
+    "Age",
+    "BMI",
+    "SmokingStatus",
+    "Diabetes",
+    "Hypertension",
+    "CardiacDisease",
+    "VenousThromboembolism",
+    "Steroid",
+    "PBS_Lumpectomy",
+    "PBS_Reduction",
+    "PBS_Mastopexy",
+    "PBS_Augmentation",
+    "Radiation",
+    "Chemo",
+]
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def _safe_str(x):
+    if pd.isna(x):
         return ""
-    return re.sub(r"[^a-z0-9]+", "", str(s).strip().lower())
+    return str(x)
 
 
-def pick_col(cols, candidates):
+def normalize_spaces(s: str) -> str:
+    s = s.replace("\r", "\n")
+    s = re.sub(r"[ \t]+", " ", s)
+    return s
+
+
+def has_positive(text: str, pattern: re.Pattern) -> bool:
     """
-    Find best match among columns given a list of candidate names (normalized).
-    """
-    norm_map = {norm_col(c): c for c in cols}
-    for cand in candidates:
-        c = norm_map.get(norm_col(cand))
-        if c:
-            return c
-    # fallback: partial match
-    for cand in candidates:
-        nc = norm_col(cand)
-        for k, v in norm_map.items():
-            if nc and nc in k:
-                return v
-    return None
-
-
-def ensure_outdir():
-    if not os.path.exists(OUT_DIR):
-        os.makedirs(OUT_DIR)
-
-
-# -----------------------------
-# SECTION EXTRACTION: PMH block
-# -----------------------------
-PMH_HDR = re.compile(r"(^|\n)\s*(past medical history|pmh|medical history)\s*:?\s*(\n|$)",
-                     re.IGNORECASE)
-# Stop when next header appears (often ALL CAPS or Title Case section lines)
-SECTION_STOP = re.compile(r"\n\s*[A-Z][A-Z \-/]{2,}\s*:?\s*\n")
-
-def extract_pmh_block(text):
-    """
-    Returns the PMH block text if found, else None.
-    """
-    if not text:
-        return None
-    m = PMH_HDR.search(text)
-    if not m:
-        return None
-    start = m.end()
-    tail = text[start:]
-    stop = SECTION_STOP.search(tail)
-    if stop:
-        return tail[:stop.start()]
-    return tail[:2000]  # safety cap (keeps it fast)
-
-
-# -----------------------------
-# NEGATION HANDLING (lightweight)
-# -----------------------------
-NEG_WINDOW_CHARS = 40
-NEG_RE = re.compile(r"\b(no|not|denies|deny|without|negative for|never had|rule out|r/o)\b",
-                    re.IGNORECASE)
-
-def has_positive(text, keyword_re):
-    """
-    Finds keyword occurrences not negated in a short preceding window.
+    True if pattern matches and it's not negated in a short window.
+    Simple negation guard (not full NLP).
     """
     if not text:
         return False
-    for m in keyword_re.finditer(text):
-        left = text[max(0, m.start() - NEG_WINDOW_CHARS):m.start()]
-        if NEG_RE.search(left):
+    for m in pattern.finditer(text):
+        start = max(0, m.start() - 40)
+        window = text[start:m.start()].lower()
+        # crude negation triggers
+        if re.search(r"\b(no|denies|deny|without|neg|negative for|h/o\s+no)\b", window):
             continue
         return True
     return False
 
 
-# -----------------------------
-# Regex patterns (compiled)
-# -----------------------------
-# Comorbidities (PMH primary)
-RX_DM = re.compile(r"\b(diabetes|dm\b|t2dm|type\s*2\s*dm|type\s*ii\s*dm|t1dm|type\s*1\s*dm)\b",
-                   re.IGNORECASE)
-RX_HTN = re.compile(r"\b(hypertension|htn|high blood pressure)\b", re.IGNORECASE)
-RX_CARDIAC = re.compile(r"\b(coronary artery disease|cad\b|chf\b|heart failure|angina|"
-                        r"myocardial infarction|\bmi\b|afib|atrial fibrillation)\b",
-                        re.IGNORECASE)
-RX_VTE = re.compile(r"\b(venous thromboembolism|vte\b|dvt\b|deep vein thrombosis|"
-                    r"pulmonary embolism|\bpe\b)\b",
-                    re.IGNORECASE)
-
-# Meds (secondary)
-RX_DM_MEDS = re.compile(r"\b(metformin|insulin|glipizide|glyburide|glimepiride|"
-                        r"lantus|humalog|novolog|ozempic|semaglutide|"
-                        r"jardiance|empagliflozin)\b",
-                        re.IGNORECASE)
-
-RX_HTN_MEDS = re.compile(r"\b(lisinopril|enalapril|benazepril|losartan|valsartan|"
-                         r"amlodipine|diltiazem|metoprolol|carvedilol|"
-                         r"hydrochlorothiazide|hctz\b)\b",
-                         re.IGNORECASE)
-
-RX_CARDIAC_MEDS = re.compile(r"\b(nitroglycerin|ntg\b|clopidogrel|plavix|"
-                             r"warfarin|coumadin|"
-                             r"atorvastatin|rosuvastatin|simvastatin)\b",
-                             re.IGNORECASE)
-
-RX_ANTICOAG = re.compile(r"\b(apixaban|eliquis|rivaroxaban|xarelto|dabigatran|"
-                         r"pradaxa|warfarin|coumadin|enoxaparin|lovenox|heparin)\b",
-                         re.IGNORECASE)
-
-RX_STEROID = re.compile(r"\b(steroid|prednisone|prednisolone|methylprednisolone|"
-                        r"dexamethasone|hydrocortisone)\b",
-                        re.IGNORECASE)
-
-# Smoking (clinic notes often have Tobacco/Smoking lines)
-RX_SMOKE_LINE = re.compile(r"\b(tobacco|smok(ing|es)?)\b[^\n]{0,60}\b(current|former|never|none)\b",
-                           re.IGNORECASE)
-
-# Lumpectomy (include scar)
-RX_LUMP = re.compile(r"\b(lumpectomy|lumpectomy scar|partial mastectomy)\b", re.IGNORECASE)
-RX_REDUCT = re.compile(r"\b(breast reduction|reduction mammoplasty)\b", re.IGNORECASE)
-RX_MASTOPEXY = re.compile(r"\b(mastopexy|breast lift)\b", re.IGNORECASE)
-RX_AUG = re.compile(r"\b(augmentation|breast augmentation|implants?\b)\b", re.IGNORECASE)
-
-# Chemo / Radiation (simple but negation-aware)
-RX_RAD = re.compile(r"\b(radiation|xrt\b|radiotherapy)\b", re.IGNORECASE)
-
-# Avoid endocrine-only meds being counted as chemo (tamoxifen etc.)
-RX_CHEMO = re.compile(r"\b(chemotherapy|chemo\b|paclitaxel|taxol|docetaxel|taxotere|"
-                      r"doxorubicin|adriamycin|cyclophosphamide|carboplatin|"
-                      r"cisplatin|capecitabine|xeloda)\b",
-                      re.IGNORECASE)
-
-# Age/BMI from notes (fallback if not in encounters)
-RX_AGE = re.compile(r"\b(\d{2})\s*[- ]?(yo|y/o|year old|years old)\b", re.IGNORECASE)
-RX_BMI = re.compile(r"\bbmi\b[^\d]{0,10}(\d{2}\.\d|\d{2})\b", re.IGNORECASE)
-RX_BMI2 = re.compile(r"\b(bmi of|bmi is)\s*(\d{2}\.\d|\d{2})\b", re.IGNORECASE)
-
-
-def parse_smoking_status(text):
-    if not text:
-        return None
-    m = RX_SMOKE_LINE.search(text)
-    if not m:
-        return None
-    val = m.group(3).strip().lower()
-    if val in ("none",):
-        return "Never"
-    if val == "never":
-        return "Never"
-    if val == "former":
-        return "Former"
-    if val == "current":
-        return "Current"
-    return None
-
-
-def parse_age(text):
-    if not text:
-        return None
-    m = RX_AGE.search(text)
+def get_first_match_int(text: str, pattern: re.Pattern):
+    m = pattern.search(text)
     if not m:
         return None
     try:
-        age = int(m.group(1))
-        if 0 < age < 120:
-            return age
+        return int(m.group(1))
     except Exception:
         return None
+
+
+def majority_vote(counter: Counter):
+    if not counter:
+        return None
+    return counter.most_common(1)[0][0]
+
+
+def normalize_race(val):
+    if val is None:
+        return None
+    v = str(val).strip().lower()
+    if v in ("white", "caucasian", "w", "white or caucasian"):
+        return "Caucasian"
+    if "black" in v or "african" in v:
+        return "African American"
+    if "asian" in v:
+        return "Asian"
+    if "native" in v and "american" in v:
+        return "Native American"
+    if "pacific" in v or "hawai" in v:
+        return "Pacific Islander"
+    if "other" in v:
+        return "Other"
+    if "unknown" in v or "declined" in v or v == "nan":
+        return None
+    return str(val).strip()
+
+
+def normalize_ethnicity(val):
+    if val is None:
+        return None
+    v = str(val).strip().lower()
+    if ("not" in v and "hisp" in v) or ("non" in v and "hisp" in v):
+        return "Non-hispanic"
+    if "hisp" in v or "latino" in v:
+        return "Hispanic"
+    if "unknown" in v or "declined" in v or v == "nan":
+        return None
+    return str(val).strip()
+
+
+def read_csv_or_die(path: str) -> pd.DataFrame:
+    if not os.path.exists(path):
+        print(f"ERROR: Missing file: {path}", file=sys.stderr)
+        sys.exit(1)
+    return pd.read_csv(path)
+
+
+def ensure_dir(path: str):
+    d = os.path.dirname(path)
+    if d and not os.path.exists(d):
+        os.makedirs(d, exist_ok=True)
+
+
+# -----------------------------
+# Regex patterns
+# -----------------------------
+# PMH header (MEDICAL) + common section headers as stop markers
+PMH_HDR = re.compile(
+    r"(^|\n)\s*(past\s+medical\s+history|pmh|medical\s+history)\s*:?\s*(\n|$)",
+    re.IGNORECASE,
+)
+
+SECTION_STOP = re.compile(
+    r"(^|\n)\s*(history of present illness|hpi|assessment|plan|review of systems|ros|medications|allergies|family history|social history|surgical history|problem list)\s*:?\s*(\n|$)",
+    re.IGNORECASE,
+)
+
+# Diseases
+RX_DM = re.compile(r"\b(diabetes|dm\b|type\s*2\s*dm|type\s*ii\s*dm)\b", re.IGNORECASE)
+RX_HTN = re.compile(r"\b(hypertension|htn\b|high blood pressure)\b", re.IGNORECASE)
+RX_VTE = re.compile(r"\b(dvt|pe\b|pulmonary embol(ism)?|deep vein thrombosis|vte|thromboembol(ism)?)\b", re.IGNORECASE)
+
+# Cardiac: keep broad but avoid common false positives like "no chest pain"
+RX_CARDIAC = re.compile(
+    r"\b(cad\b|coronary artery disease|mi\b|myocardial infarction|chf\b|heart failure|afib|a-fib|atrial fibrillation|angina|cardiomyopathy)\b",
+    re.IGNORECASE,
+)
+
+# Steroids
+RX_STEROID = re.compile(
+    r"\b(steroid(s)?|prednisone|prednisolone|methylprednisolone|solu-medrol|dexamethasone|hydrocortisone)\b",
+    re.IGNORECASE,
+)
+
+# Medication “trigger” lists (secondary layer)
+RX_DM_MEDS = re.compile(r"\b(metformin|insulin|glipizide|glyburide|glimepiride|liraglutide|semaglutide|sitagliptin|empagliflozin|canagliflozin)\b", re.IGNORECASE)
+RX_HTN_MEDS = re.compile(r"\b(lisinopril|losartan|valsartan|amlodipine|metoprolol|carvedilol|hydrochlorothiazide|chlorthalidone|diltiazem|verapamil)\b", re.IGNORECASE)
+RX_CARDIAC_MEDS = re.compile(r"\b(nitroglycerin|atorvastatin|rosuvastatin|clopidogrel|prasugrel|ticagrelor)\b", re.IGNORECASE)
+RX_ANTICOAG = re.compile(r"\b(warfarin|coumadin|heparin|enoxaparin|lovenox|apixaban|eliquis|rivaroxaban|xarelto|dabigatran|pradaxa)\b", re.IGNORECASE)
+
+# Lumpectomy evidence from clinic exam language
+RX_LUMPECTOMY = re.compile(
+    r"\b(lumpectomy(\s+site|\s+scar)?|status\s+post\s+lumpectomy|s\/p\s+lumpectomy|lumpectomy\s+scar)\b",
+    re.IGNORECASE,
+)
+
+# Age patterns (use many variants; search early note text first, then anywhere)
+# Examples: "46 yo", "46 y.o.", "46-year-old", "Age: 46", "46-year old", "46 y/o"
+RX_AGE = re.compile(
+    r"\b(?:age\s*[:=]?\s*)?(\d{2})\s*"
+    r"(?:-?\s*(?:yo|y\/o|y\.o\.|year\s*old|years\s*old|yr\s*old|yrs\s*old))\b",
+    re.IGNORECASE,
+)
+RX_AGE2 = re.compile(r"\b(\d{2})\s*[- ]?\s*(?:year)\s*[- ]?\s*(?:old)\b", re.IGNORECASE)
+RX_AGE3 = re.compile(r"\b(\d{2})\s*[- ]?\s*(?:yo)\b", re.IGNORECASE)
+
+
+def extract_pmh_block(note_text: str):
+    """
+    Return PMH block string if found, else None.
+    Extract from PMH header until next section stop.
+    """
+    if not note_text:
+        return None
+
+    txt = normalize_spaces(note_text)
+    m = PMH_HDR.search(txt)
+    if not m:
+        return None
+
+    start = m.end()
+    tail = txt[start:]
+
+    s = SECTION_STOP.search(tail)
+    end = s.start() if s else len(tail)
+
+    block = tail[:end].strip()
+    if not block:
+        return None
+    return block
+
+
+def extract_age_from_note(note_text: str):
+    """
+    Search the first ~30 lines first (age is often at the top), then entire note.
+    """
+    if not note_text:
+        return None
+
+    txt = normalize_spaces(note_text)
+    lines = txt.split("\n")
+    head = "\n".join(lines[:30])
+
+    for pat in (RX_AGE, RX_AGE2, RX_AGE3):
+        age = get_first_match_int(head, pat)
+        if age is not None:
+            return age
+
+    # fallback: anywhere in note
+    for pat in (RX_AGE, RX_AGE2, RX_AGE3):
+        age = get_first_match_int(txt, pat)
+        if age is not None:
+            return age
+
     return None
 
 
-def parse_bmi(text):
-    if not text:
-        return None
-    m = RX_BMI.search(text)
-    if m:
-        try:
-            return float(m.group(1))
-        except Exception:
-            pass
-    m2 = RX_BMI2.search(text)
-    if m2:
-        try:
-            return float(m2.group(2))
-        except Exception:
-            pass
+def detect_text_column(df: pd.DataFrame):
+    """
+    Clinic notes file has NO DEID column. We try common raw text columns only.
+    """
+    candidates = [
+        "NOTE_TEXT",
+        "NOTE",
+        "TEXT",
+        "NOTE_BODY",
+        "NOTE_CONTENT",
+        "BODY",
+        "FullText",
+        "full_text",
+    ]
+    for c in candidates:
+        if c in df.columns:
+            return c
+
+    # fallback: any column containing 'text' but NOT deid
+    text_cols = [c for c in df.columns if "text" in c.lower() and "deid" not in c.lower()]
+    if text_cols:
+        return text_cols[0]
     return None
 
 
 # -----------------------------
-# Aggregation state per patient
+# Build pipeline
 # -----------------------------
 def init_patient_state():
     return {
@@ -287,282 +317,265 @@ def init_patient_state():
         "Chemo": 0,
         "_race_votes": Counter(),
         "_eth_votes": Counter(),
-        "_smoke_votes": Counter(),
         "_age_votes": Counter(),
         "_bmi_votes": Counter(),
-        "_pmh_hits": 0,
+        "_smoke_votes": Counter(),
+        "_pmh_seen": 0,
         "_med_hits": 0,
-        "_notes_seen": 0
+        "_clinic_notes_seen": 0,
+        "_lumpectomy_hits": 0,
     }
 
 
-def finalize_patient_state(st):
-    # choose most common categorical values (if any votes)
-    if st["_race_votes"]:
-        st["Race"] = st["_race_votes"].most_common(1)[0][0]
-    if st["_eth_votes"]:
-        st["Ethnicity"] = st["_eth_votes"].most_common(1)[0][0]
-    if st["_smoke_votes"]:
-        st["SmokingStatus"] = st["_smoke_votes"].most_common(1)[0][0]
-    if st["_age_votes"]:
-        st["Age"] = st["_age_votes"].most_common(1)[0][0]
-    if st["_bmi_votes"]:
-        st["BMI"] = st["_bmi_votes"].most_common(1)[0][0]
+def ingest_structured(structured: pd.DataFrame, patients: dict, audit: dict):
+    """
+    Take what we can from structured data FIRST.
+    If Age exists here, keep it (note age becomes fallback only).
+    """
+    if PID not in structured.columns:
+        raise ValueError(f"Structured file missing {PID}")
 
-    # cleanup internal fields
-    for k in list(st.keys()):
-        if k.startswith("_"):
-            del st[k]
-    return st
+    # Identify likely column names
+    col_race = "Race" if "Race" in structured.columns else None
+    col_eth = "Ethnicity" if "Ethnicity" in structured.columns else None
+    col_age = "Age" if "Age" in structured.columns else None
+    col_bmi = "BMI" if "BMI" in structured.columns else None
+    col_smoke = "SmokingStatus" if "SmokingStatus" in structured.columns else None
 
-
-# -----------------------------
-# Encounters: pick baseline demographics if available
-# -----------------------------
-def ingest_encounters(pstate, path):
-    if not os.path.exists(path):
-        print("WARNING: missing file:", path)
-        return
-
-    df = safe_read_csv(path)
-    if hasattr(df, "__iter__") and not isinstance(df, pd.DataFrame):
-        # chunks iterator not expected here
-        df = pd.concat(list(df), ignore_index=True)
-
-    cols = list(df.columns)
-    pidc = pick_col(cols, [PID_COL, "ENCRYPTED_PAT_ID", "ENCRYPTEDPATID"])
-    if not pidc:
-        print("WARNING: could not find patient id in encounters:", path)
-        return
-
-    race_c = pick_col(cols, ["Race", "RACE"])
-    eth_c  = pick_col(cols, ["Ethnicity", "ETHNICITY"])
-    age_c  = pick_col(cols, ["Age", "AGE"])
-    bmi_c  = pick_col(cols, ["BMI", "BodyMassIndex", "Body Mass Index"])
-
-    # iterate rows (vectorizing here is fine, but keep it simple)
-    for _, r in df.iterrows():
-        pid = r.get(pidc)
-        if pd.isna(pid):
+    # surgery / treatment flags if present
+    for idx, row in structured.iterrows():
+        pid = _safe_str(row.get(PID)).strip()
+        if not pid:
             continue
-        pid = str(pid).strip()
-        st = pstate[pid]
 
-        if race_c and not pd.isna(r.get(race_c)):
-            val = str(r.get(race_c)).strip()
-            if val:
-                st["_race_votes"][val] += 1
+        st = patients[pid]
 
-        if eth_c and not pd.isna(r.get(eth_c)):
-            val = str(r.get(eth_c)).strip()
-            if val:
-                st["_eth_votes"][val] += 1
+        if col_race:
+            v = normalize_race(row.get(col_race))
+            if v:
+                st["_race_votes"][v] += 1
+        if col_eth:
+            v = normalize_ethnicity(row.get(col_eth))
+            if v:
+                st["_eth_votes"][v] += 1
 
-        if age_c and not pd.isna(r.get(age_c)):
+        # Age: prefer structured
+        if col_age and not pd.isna(row.get(col_age)):
             try:
-                agev = int(float(r.get(age_c)))
-                if 0 < agev < 120:
-                    st["_age_votes"][agev] += 1
+                a = int(float(row.get(col_age)))
+                if 0 < a < 120:
+                    st["_age_votes"][a] += 1
             except Exception:
                 pass
 
-        if bmi_c and not pd.isna(r.get(bmi_c)):
+        if col_bmi and not pd.isna(row.get(col_bmi)):
             try:
-                bmiv = float(r.get(bmi_c))
-                if 10.0 <= bmiv <= 80.0:
-                    st["_bmi_votes"][bmiv] += 1
+                b = float(row.get(col_bmi))
+                if 5.0 < b < 100.0:
+                    st["_bmi_votes"][round(b, 1)] += 1
             except Exception:
                 pass
 
+        if col_smoke and not pd.isna(row.get(col_smoke)):
+            sv = str(row.get(col_smoke)).strip()
+            if sv:
+                st["_smoke_votes"][sv] += 1
 
-# -----------------------------
-# Notes ingestion (chunked for speed)
-# -----------------------------
-def ingest_clinic_notes_for_flags(pstate, path, chunksize=2000):
-    """
-    CLINIC NOTES drive:
-      - PMH comorbidities (primary)
-      - meds confirmation (secondary)
-      - smoking
-      - lumpectomy scar + other PBS
-      - fallback Age/BMI if needed
-      - radiation/chemo cues (many notes include onc history)
-    """
-    if not os.path.exists(path):
-        print("WARNING: missing file:", path)
-        return
+        # Pass-through for existing flags if present in structured
+        for flag in ["PBS_Lumpectomy", "PBS_Reduction", "PBS_Mastopexy", "PBS_Augmentation", "Radiation", "Chemo"]:
+            if flag in structured.columns and not pd.isna(row.get(flag)):
+                try:
+                    st[flag] = max(int(st[flag]), int(row.get(flag)))
+                except Exception:
+                    pass
 
-    # read just patient id + note text (auto-detected)
-    reader = safe_read_csv(path, chunksize=chunksize)
+    audit["structured_rows"] = len(structured)
 
-    # get columns by peeking first chunk
-    first = next(reader)
-    cols = list(first.columns)
 
-    pidc = pick_col(cols, [PID_COL, "ENCRYPTED_PAT_ID"])
-    textc = pick_col(cols, ["NOTE_TEXT_DEID", "NOTE_TEXT", "NOTE_TEXT_CLEAN",
-                            "NOTE_TEXT_RAW", "TEXT", "BODY", "NOTE"])
+def ingest_clinic_notes(notes: pd.DataFrame, patients: dict, audit: dict):
+    if PID not in notes.columns:
+        raise ValueError(f"Clinic notes file missing {PID}")
 
-    if not pidc:
-        raise RuntimeError("Could not find {} column in clinic notes.".format(PID_COL))
-    if not textc:
-        raise RuntimeError("Could not find note text column in clinic notes. "
-                           "Tried NOTE_TEXT*, TEXT, BODY, NOTE.")
+    text_col = detect_text_column(notes)
+    if not text_col:
+        raise ValueError(
+            "Could not find clinic note text column. "
+            "Expected something like NOTE_TEXT / NOTE / TEXT / NOTE_BODY."
+        )
 
-    def process_chunk(df):
-        for _, r in df.iterrows():
-            pid = r.get(pidc)
-            if pd.isna(pid):
-                continue
-            pid = str(pid).strip()
-            txt = r.get(textc)
-            if pd.isna(txt):
-                continue
-            text = str(txt)
+    audit["clinic_text_col"] = text_col
+    audit["clinic_rows"] = len(notes)
 
-            st = pstate[pid]
-            st["_notes_seen"] += 1
+    for _, row in notes.iterrows():
+        pid = _safe_str(row.get(PID)).strip()
+        if not pid:
+            continue
 
-            # PMH block (primary source)
-            pmh = extract_pmh_block(text)
-            if pmh:
-                st["_pmh_hits"] += 1
-                if st["Diabetes"] == 0 and has_positive(pmh, RX_DM):
-                    st["Diabetes"] = 1
-                if st["Hypertension"] == 0 and has_positive(pmh, RX_HTN):
-                    st["Hypertension"] = 1
-                if st["CardiacDisease"] == 0 and has_positive(pmh, RX_CARDIAC):
-                    st["CardiacDisease"] = 1
-                if st["VenousThromboembolism"] == 0 and has_positive(pmh, RX_VTE):
-                    st["VenousThromboembolism"] = 1
-                if st["Steroid"] == 0 and has_positive(pmh, RX_STEROID):
-                    st["Steroid"] = 1
+        text = _safe_str(row.get(text_col))
+        if not text:
+            continue
 
-            # Med confirmation layer (only if not found in PMH)
-            # We do a light scan on full note for meds; still negation-aware via has_positive()
-            if st["Diabetes"] == 0 and has_positive(text, RX_DM_MEDS):
-                st["_med_hits"] += 1
+        st = patients[pid]
+        st["_clinic_notes_seen"] += 1
+
+        txt = normalize_spaces(text)
+
+        # Lumpectomy from exam language
+        if st["PBS_Lumpectomy"] == 0 and has_positive(txt, RX_LUMPECTOMY):
+            st["PBS_Lumpectomy"] = 1
+            st["_lumpectomy_hits"] += 1
+
+        # Age fallback: only if no structured age vote exists
+        if len(st["_age_votes"]) == 0:
+            age = extract_age_from_note(txt)
+            if age is not None and 0 < age < 120:
+                st["_age_votes"][age] += 1
+
+        # Primary: PMH block
+        pmh = extract_pmh_block(txt)
+        if pmh:
+            st["_pmh_seen"] += 1
+
+            if st["Diabetes"] == 0 and has_positive(pmh, RX_DM):
                 st["Diabetes"] = 1
-            if st["Hypertension"] == 0 and has_positive(text, RX_HTN_MEDS):
-                st["_med_hits"] += 1
+            if st["Hypertension"] == 0 and has_positive(pmh, RX_HTN):
                 st["Hypertension"] = 1
-            if st["CardiacDisease"] == 0 and has_positive(text, RX_CARDIAC_MEDS):
-                st["_med_hits"] += 1
+            if st["CardiacDisease"] == 0 and has_positive(pmh, RX_CARDIAC):
                 st["CardiacDisease"] = 1
-            if st["VenousThromboembolism"] == 0 and has_positive(text, RX_ANTICOAG):
-                st["_med_hits"] += 1
+            if st["VenousThromboembolism"] == 0 and has_positive(pmh, RX_VTE):
                 st["VenousThromboembolism"] = 1
-            if st["Steroid"] == 0 and has_positive(text, RX_STEROID):
-                # steroids appear frequently; allow but negation-aware
-                st["_med_hits"] += 1
+            if st["Steroid"] == 0 and has_positive(pmh, RX_STEROID):
                 st["Steroid"] = 1
 
-            # Smoking
-            smk = parse_smoking_status(text)
-            if smk:
-                st["_smoke_votes"][smk] += 1
+        # Secondary: meds as trigger, then confirm by searching full note
+        dm_med = has_positive(txt, RX_DM_MEDS)
+        htn_med = has_positive(txt, RX_HTN_MEDS)
+        card_med = has_positive(txt, RX_CARDIAC_MEDS)
+        vte_med = has_positive(txt, RX_ANTICOAG)
+        steroid_med = has_positive(txt, RX_STEROID)
 
-            # PBS / lumpectomy scar logic
-            if st["PBS_Lumpectomy"] == 0 and has_positive(text, RX_LUMP):
-                st["PBS_Lumpectomy"] = 1
-            if st["PBS_Reduction"] == 0 and has_positive(text, RX_REDUCT):
-                st["PBS_Reduction"] = 1
-            if st["PBS_Mastopexy"] == 0 and has_positive(text, RX_MASTOPEXY):
-                st["PBS_Mastopexy"] = 1
-            if st["PBS_Augmentation"] == 0 and has_positive(text, RX_AUG):
-                st["PBS_Augmentation"] = 1
+        if dm_med or htn_med or card_med or vte_med or steroid_med:
+            st["_med_hits"] += 1
 
-            # Radiation / Chemo
-            if st["Radiation"] == 0 and has_positive(text, RX_RAD):
-                st["Radiation"] = 1
-            if st["Chemo"] == 0 and has_positive(text, RX_CHEMO):
-                st["Chemo"] = 1
-
-            # Fallback Age/BMI from notes if missing
-            if not st["_age_votes"]:
-                agev = parse_age(text)
-                if agev is not None:
-                    st["_age_votes"][agev] += 1
-            if not st["_bmi_votes"]:
-                bmiv = parse_bmi(text)
-                if bmiv is not None and 10.0 <= bmiv <= 80.0:
-                    st["_bmi_votes"][bmiv] += 1
-
-    # process first chunk + remaining chunks
-    process_chunk(first)
-    for chunk in reader:
-        process_chunk(chunk)
+        if st["Diabetes"] == 0 and dm_med and has_positive(txt, RX_DM):
+            st["Diabetes"] = 1
+        if st["Hypertension"] == 0 and htn_med and has_positive(txt, RX_HTN):
+            st["Hypertension"] = 1
+        if st["CardiacDisease"] == 0 and card_med and has_positive(txt, RX_CARDIAC):
+            st["CardiacDisease"] = 1
+        if st["VenousThromboembolism"] == 0 and vte_med and has_positive(txt, RX_VTE):
+            st["VenousThromboembolism"] = 1
+        if st["Steroid"] == 0 and steroid_med and has_positive(txt, RX_STEROID):
+            st["Steroid"] = 1
 
 
-# -----------------------------
-# Main
-# -----------------------------
-def main():
-    t0 = time.time()
-    ensure_outdir()
-
-    pstate = defaultdict(init_patient_state)
-
-    print("Loading encounters (demographics where available)...")
-    for p in [CLINIC_ENC, INPAT_ENC, OP_ENC]:
-        if os.path.exists(p):
-            print("  -", p)
-            ingest_encounters(pstate, p)
-
-    print("Processing CLINIC notes for PMH comorbidities + PBS + smoking...")
-    print("  -", CLINIC_NOTES)
-    ingest_clinic_notes_for_flags(pstate, CLINIC_NOTES, chunksize=2000)
-
-    # Build final dataframe
+def finalize(patients: dict) -> pd.DataFrame:
     rows = []
-    audit = {
-        "patients_total": 0,
-        "patients_with_any_note": 0,
-        "patients_with_pmh_block": 0,
-        "patients_with_med_hit": 0
-    }
+    for pid, st in patients.items():
+        out = {PID: pid}
 
-    for pid, st in pstate.items():
-        audit["patients_total"] += 1
-        if st["_notes_seen"] > 0:
-            audit["patients_with_any_note"] += 1
-        if st["_pmh_hits"] > 0:
-            audit["patients_with_pmh_block"] += 1
-        if st["_med_hits"] > 0:
-            audit["patients_with_med_hit"] += 1
+        out["Race"] = majority_vote(st["_race_votes"])
+        out["Ethnicity"] = majority_vote(st["_eth_votes"])
+        out["Age"] = majority_vote(st["_age_votes"])
+        out["BMI"] = majority_vote(st["_bmi_votes"])
+        out["SmokingStatus"] = majority_vote(st["_smoke_votes"])
 
-        out = {"ENCRYPTED_PAT_ID": pid}
-        out.update(finalize_patient_state(st))
+        # binary outputs + existing pass-through
+        for col in ["Diabetes", "Hypertension", "CardiacDisease", "VenousThromboembolism", "Steroid",
+                    "PBS_Lumpectomy", "PBS_Reduction", "PBS_Mastopexy", "PBS_Augmentation",
+                    "Radiation", "Chemo"]:
+            out[col] = int(st.get(col, 0))
+
         rows.append(out)
 
     df = pd.DataFrame(rows)
-
-    # Stable column order
-    col_order = [
-        "ENCRYPTED_PAT_ID",
-        "Race", "Ethnicity", "Age", "BMI", "SmokingStatus",
-        "Diabetes", "Hypertension", "CardiacDisease", "VenousThromboembolism", "Steroid",
-        "PBS_Lumpectomy", "PBS_Reduction", "PBS_Mastopexy", "PBS_Augmentation",
-        "Radiation", "Chemo"
-    ]
-    for c in col_order:
+    # ensure output columns exist
+    for c in OUTPUT_COLUMNS:
         if c not in df.columns:
-            df[c] = None
-    df = df[col_order]
+            df[c] = pd.NA
+    return df[OUTPUT_COLUMNS]
 
-    df.to_csv(MASTER_OUT, index=False)
-    pd.DataFrame([audit]).to_csv(AUDIT_OUT, index=False)
 
-    dt = time.time() - t0
-    print("\nWrote:", MASTER_OUT)
-    print("Wrote:", AUDIT_OUT)
-    print("Patients:", len(df))
-    print("Done in %.1f seconds." % dt)
+def build_audit(patients: dict, audit_meta: dict):
+    """
+    Write audit outputs to understand why fields are zero.
+    """
+    summary = {
+        "structured_rows": audit_meta.get("structured_rows", 0),
+        "clinic_rows": audit_meta.get("clinic_rows", 0),
+        "clinic_text_col": audit_meta.get("clinic_text_col", ""),
+        "patients_total": len(patients),
+        "patients_with_any_clinic_note": sum(1 for _, st in patients.items() if st["_clinic_notes_seen"] > 0),
+        "patients_with_pmh_block": sum(1 for _, st in patients.items() if st["_pmh_seen"] > 0),
+        "patients_with_med_trigger": sum(1 for _, st in patients.items() if st["_med_hits"] > 0),
+        "patients_with_lumpectomy_hit": sum(1 for _, st in patients.items() if st["_lumpectomy_hits"] > 0),
+        "patients_diabetes_1": sum(1 for _, st in patients.items() if st["Diabetes"] == 1),
+        "patients_htn_1": sum(1 for _, st in patients.items() if st["Hypertension"] == 1),
+        "patients_cardiac_1": sum(1 for _, st in patients.items() if st["CardiacDisease"] == 1),
+        "patients_vte_1": sum(1 for _, st in patients.items() if st["VenousThromboembolism"] == 1),
+        "patients_steroid_1": sum(1 for _, st in patients.items() if st["Steroid"] == 1),
+    }
+    df_sum = pd.DataFrame([summary])
+
+    df_pat = pd.DataFrame([
+        {
+            PID: pid,
+            "clinic_notes_seen": st["_clinic_notes_seen"],
+            "pmh_blocks_seen": st["_pmh_seen"],
+            "med_triggers_seen": st["_med_hits"],
+            "lumpectomy_hits": st["_lumpectomy_hits"],
+            "Diabetes": st["Diabetes"],
+            "Hypertension": st["Hypertension"],
+            "CardiacDisease": st["CardiacDisease"],
+            "VenousThromboembolism": st["VenousThromboembolism"],
+            "Steroid": st["Steroid"],
+            "Age_votes": len(st["_age_votes"]),
+        }
+        for pid, st in patients.items()
+    ])
+
+    ensure_dir(OUT_AUDIT_SUMMARY)
+    df_sum.to_csv(OUT_AUDIT_SUMMARY, index=False)
+    df_pat.to_csv(OUT_AUDIT_PATIENTS, index=False)
+
+
+def main():
+    print("Loading files...")
+    structured = read_csv_or_die(STRUCTURED_FILE)
+    clinic = read_csv_or_die(CLINIC_NOTES_FILE)
+
+    print(f"Structured rows: {len(structured)}")
+    print(f"Clinic note rows: {len(clinic)}")
+
+    # init patients from structured IDs (and also allow notes-only patients)
+    patients = defaultdict(init_patient_state)
+
+    audit_meta = {}
+
+    # Ingest structured first (Race/Ethnicity/Age/BMI/Smoking etc.)
+    ingest_structured(structured, patients, audit_meta)
+
+    # Ensure we also include patients appearing only in clinic notes
+    for pid in clinic[PID].dropna().astype(str).str.strip().unique().tolist():
+        _ = patients[pid]
+
+    # Ingest clinic notes
+    ingest_clinic_notes(clinic, patients, audit_meta)
+
+    # Finalize
+    master = finalize(patients)
+
+    ensure_dir(OUT_MASTER)
+    master.to_csv(OUT_MASTER, index=False)
+
+    # Audit
+    build_audit(patients, audit_meta)
+
+    print("Build complete.")
+    print(f"Wrote: {OUT_MASTER}")
+    print(f"Wrote: {OUT_AUDIT_SUMMARY}")
+    print(f"Wrote: {OUT_AUDIT_PATIENTS}")
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        print("\nERROR:", str(e))
-        sys.exit(1)
+    main()
