@@ -752,7 +752,7 @@ def choose_best_clinic_age_rows(struct_df):
         if has_preferred_cpt.get(mrn, False) and cpt_code in fallback_allowed_cpts:
             continue
 
-                is_anchor = False
+        is_anchor = False
 
         # Preferred reconstruction anchors
         if cpt_code in preferred_cpts:
