@@ -13,10 +13,7 @@ gold_age=pd.to_numeric(df["Age_gold"],errors="coerce")
 
 mask=gold_age.notna()
 
-matches=((gold_age==pred)|(gold_age==pred-1)|(gold_age==pred+1))
+mismatch=df[mask & ~( (gold_age==pred) | (gold_age==pred-1) | (gold_age==pred+1) )]
 
-matches=matches[mask]
-
-print("Total compared:",mask.sum())
-print("Matches with floor/round rule:",matches.sum())
-print("Accuracy:",matches.sum()/mask.sum())
+print(mismatch[["MRN","Age_gold","Age_pred"]])
+print("\nTotal mismatches:",len(mismatch))
