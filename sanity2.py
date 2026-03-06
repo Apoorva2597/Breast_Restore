@@ -1,3 +1,35 @@
 import pandas as pd
-def n(x): x=str(x).strip().lower(); return "White" if x in ["white","white or caucasian","caucasian"] else ("Black or African American" if x in ["black","black or african american","african american"] else ("Asian" if x in ["asian","filipino","other asian","asian indian","chinese","japanese","korean","vietnamese"] else ("American Indian or Alaska Native" if x=="american indian or alaska native" else ("Native Hawaiian or Other Pacific Islander" if x in ["native hawaiian","pacific islander","native hawaiian or other pacific islander"] else ("Other" if x=="other" else ("Unknown / Declined / Not Reported" if x in ["unknown","declined","refused","patient refused","choose not to disclose","unknown / declined / not reported"] else "")))))); c=lambda v: (lambda r: (pd.NA if len(r)==0 else (r[0] if len(r)==1 else "Multiracial")))(list(dict.fromkeys([y for y in [n(t.strip()) for t in str(v).replace(";",",").split(",")] if y and y!="Unknown / Declined / Not Reported"])) or (["Unknown / Declined / Not Reported"] if any(n(t.strip())=="Unknown / Declined / Not Reported" for t in str(v).replace(";",",").split(",")) else []))
-m=pd.read_csv("_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv",dtype=str); g=pd.read_csv("gold_cleaned_for_cedar.csv",dtype=str); x=m.merge(g,on="MRN",suffixes=("_pred","_gold")); x["Race_pred_n"]=x["Race_pred"].apply(c); x["Race_gold_n"]=x["Race_gold"].apply(c); print(x[(x["Race_gold"].notna())&(x["Race_gold"].astype(str).str.strip()!="")&(x["Race_pred_n"]!=x["Race_gold_n"])][["MRN","Race_gold","Race_pred","Race_gold_n","Race_pred_n"]])
+def norm_token(x):
+    s=str(x).strip().lower()
+    if s in ["", "nan", "none", "null", "na"]: return ""
+    if s in ["white","white or caucasian","caucasian"]: return "White"
+    if s in ["black","black or african american","african american"]: return "Black or African American"
+    if s in ["asian","filipino","other asian","asian indian","chinese","japanese","korean","vietnamese"]: return "Asian"
+    if s=="american indian or alaska native": return "American Indian or Alaska Native"
+    if s in ["native hawaiian","pacific islander","native hawaiian or other pacific islander"]: return "Native Hawaiian or Other Pacific Islander"
+    if s=="other": return "Other"
+    if s in ["unknown","declined","refused","patient refused","choose not to disclose","unknown / declined / not reported"]: return "Unknown / Declined / Not Reported"
+    return str(x).strip()
+def collapse(v):
+    raw=str(v).replace(";",",").split(",")
+    real=[]; unk=False
+    for p in raw:
+        n=norm_token(p)
+        if not n: continue
+        if n=="Unknown / Declined / Not Reported":
+            unk=True
+            continue
+        if n not in real:
+            real.append(n)
+    if len(real)==0:
+        return "Unknown / Declined / Not Reported" if unk else pd.NA
+    if len(real)==1:
+        return real[0]
+    return "Multiracial"
+m=pd.read_csv("_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv",dtype=str)
+g=pd.read_csv("gold_cleaned_for_cedar.csv",dtype=str)
+m["MRN"]=m["MRN"].astype(str).str.strip(); g["MRN"]=g["MRN"].astype(str).str.strip()
+x=m.merge(g,on="MRN",suffixes=("_pred","_gold"))
+x["Race_pred_n"]=x["Race_pred"].apply(collapse)
+x["Race_gold_n"]=x["Race_gold"].apply(collapse)
+print(x[(x["Race_gold"].notna())&(x["Race_gold"].astype(str).str.strip()!="")&(x["Race_pred_n"]!=x["Race_gold_n"])][["MRN","Race_gold","Race_pred","Race_gold_n","Race_pred_n"]])
