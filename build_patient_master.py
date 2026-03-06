@@ -680,9 +680,12 @@ def choose_best_clinic_age_rows(struct_df):
     if len(struct_df) == 0:
         return age_best
 
-    clinic_df = struct_df[struct_df["STRUCT_SOURCE"] == "clinic"].copy()
-    if len(clinic_df) == 0:
-        return age_best
+    # source priority: clinic first, then operation, then inpatient
+    source_priority = {
+        "clinic": 1,
+        "operation": 2,
+        "inpatient": 3
+    }
 
     preferred_cpts = set([
         "19357",  # tissue expander placement
@@ -701,9 +704,13 @@ def choose_best_clinic_age_rows(struct_df):
         "19330"   # implant replacement / removal-related
     ])
 
-    for _, row in clinic_df.iterrows():
+    for _, row in struct_df.iterrows():
         mrn = clean_cell(row.get(MERGE_KEY, ""))
         if not mrn:
+            continue
+
+        source = clean_cell(row.get("STRUCT_SOURCE", "")).lower()
+        if source not in source_priority:
             continue
 
         age_raw = clean_cell(row.get("AGE_AT_ENCOUNTER_STRUCT", ""))
@@ -749,8 +756,12 @@ def choose_best_clinic_age_rows(struct_df):
         age_floor = int(math.floor(adjusted_age))
         age_round = int(math.floor(adjusted_age + 0.5))
 
-        # choose earliest valid reconstruction anchor row
-        score = (recon_date, admit_date)
+        # source priority first, then earliest reconstruction date, then earliest admit date
+        score = (
+            source_priority[source],
+            recon_date,
+            admit_date
+        )
 
         current_best = age_best.get(mrn)
 
@@ -763,14 +774,13 @@ def choose_best_clinic_age_rows(struct_df):
                 "value_floor": age_floor,
                 "value_round": age_round,
                 "score": score,
-                "source": row.get("STRUCT_SOURCE", ""),
+                "source": source,
                 "cpt_code": cpt_code,
                 "procedure": clean_cell(row.get("PROCEDURE_STRUCT", "")),
                 "reason_for_visit": clean_cell(row.get("REASON_FOR_VISIT_STRUCT", ""))
             }
 
     return age_best
-
 
 def enrich_master_with_structured_demo(master, notes_df, evidence_rows):
     print("Loading structured encounters for Race / Ethnicity / Age...")
