@@ -6,6 +6,7 @@
 # - Loads ORIGINAL HPI11526 note CSVs (Clinic/Inpatient/Operation Notes)
 # - Reconstructs full note text by NOTE_ID + LINE ordering
 # - Lightweight sectionizer
+# - Enriches Race / Ethnicity / Age from structured encounters
 # - Runs rule-based extractors from ./extractors
 # - Writes:
 #   1) /home/apokol/Breast_Restore/_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv
@@ -13,8 +14,10 @@
 
 import os
 import re
+import math
 from glob import glob
-from typing import Dict, List, Optional, Tuple, Any
+from datetime import datetime
+from typing import Dict, List, Optional, Any
 
 import pandas as pd
 
@@ -23,7 +26,6 @@ import pandas as pd
 # -----------------------
 BASE_DIR = "/home/apokol/Breast_Restore"
 
-# Structured encounter files (use these to seed MRNs without touching gold)
 STRUCT_GLOBS = [
     f"{BASE_DIR}/**/HPI11526*Clinic Encounters.csv",
     f"{BASE_DIR}/**/HPI11526*Inpatient Encounters.csv",
@@ -67,18 +69,31 @@ def read_csv_robust(path):
         return pd.read_csv(path, **common_kwargs, on_bad_lines="skip")
     except TypeError:
         try:
-            return pd.read_csv(path, **common_kwargs,
-                               error_bad_lines=False, warn_bad_lines=True)
+            return pd.read_csv(
+                path,
+                **common_kwargs,
+                error_bad_lines=False,
+                warn_bad_lines=True
+            )
         except UnicodeDecodeError:
-            return pd.read_csv(path, **common_kwargs, encoding="latin-1",
-                               error_bad_lines=False, warn_bad_lines=True)
+            return pd.read_csv(
+                path,
+                **common_kwargs,
+                encoding="latin-1",
+                error_bad_lines=False,
+                warn_bad_lines=True
+            )
     except UnicodeDecodeError:
         try:
-            return pd.read_csv(path, **common_kwargs, encoding="latin-1",
-                               on_bad_lines="skip")
+            return pd.read_csv(path, **common_kwargs, encoding="latin-1", on_bad_lines="skip")
         except TypeError:
-            return pd.read_csv(path, **common_kwargs, encoding="latin-1",
-                               error_bad_lines=False, warn_bad_lines=True)
+            return pd.read_csv(
+                path,
+                **common_kwargs,
+                encoding="latin-1",
+                error_bad_lines=False,
+                warn_bad_lines=True
+            )
 
 
 def clean_cols(df):
@@ -113,6 +128,53 @@ def pick_col(df, options, required=True):
 def to_int_safe(x):
     try:
         return int(float(str(x).strip()))
+    except Exception:
+        return None
+
+
+def to_float_safe(x):
+    try:
+        return float(str(x).strip())
+    except Exception:
+        return None
+
+
+def clean_cell(x):
+    if x is None:
+        return ""
+    s = str(x).strip()
+    if s.lower() in {"", "nan", "none", "null", "na"}:
+        return ""
+    return s
+
+
+def parse_date_safe(x):
+    s = clean_cell(x)
+    if not s:
+        return None
+
+    fmts = [
+        "%Y-%m-%d",
+        "%Y-%m-%d %H:%M:%S",
+        "%m/%d/%Y",
+        "%m/%d/%Y %H:%M",
+        "%m/%d/%Y %H:%M:%S",
+        "%Y/%m/%d",
+        "%d-%b-%Y",
+        "%d-%b-%Y %H:%M:%S",
+    ]
+
+    for fmt in fmts:
+        try:
+            return datetime.strptime(s, fmt)
+        except Exception:
+            pass
+
+    try:
+        ts = pd.to_datetime(s, errors="coerce")
+        if pd.isna(ts):
+            return None
+        return ts.to_pydatetime()
     except Exception:
         return None
 
@@ -193,7 +255,6 @@ def merge_boolean(existing, new):
 # -----------------------
 # Field mapping to your FINAL columns
 # -----------------------
-# Candidate.field -> final logical column name (matches your gold header set)
 FIELD_MAP = {
     "Age": "Age",
     "Age_DOS": "Age",
@@ -226,7 +287,6 @@ BOOLEAN_FIELDS = {
     "Radiation", "Chemo"
 }
 
-# Your presentation master header (subset we fill now; rest remain blank)
 MASTER_COLUMNS = [
     "MRN",
     "ENCRYPTED_PAT_ID",
@@ -295,7 +355,6 @@ def seed_master_from_structured():
             df = normalize_mrn(df)
             mrns.update(df[MERGE_KEY].dropna().astype(str).str.strip().tolist())
     else:
-        # fallback: seed MRNs from notes if no encounter files found
         note_files = []
         for g in NOTE_GLOBS:
             note_files.extend(glob(g, recursive=True))
@@ -311,16 +370,12 @@ def seed_master_from_structured():
 
     mrns = sorted([m for m in mrns if m])
     master = pd.DataFrame({MERGE_KEY: mrns})
-
-    # also include ENCRYPTED_PAT_ID column for validation/debugging
     master["ENCRYPTED_PAT_ID"] = master[MERGE_KEY]
 
-    # build full template columns (blank)
     for c in MASTER_COLUMNS:
         if c not in master.columns:
             master[c] = pd.NA
 
-    # ensure exact output order
     master = master[MASTER_COLUMNS]
     return master
 
@@ -344,8 +399,6 @@ def load_and_reconstruct_notes():
         note_id_col = pick_col(df, ["NOTE_ID", "NOTE ID"])
         line_col = pick_col(df, ["LINE"], required=False)
         note_type_col = pick_col(df, ["NOTE_TYPE", "NOTE TYPE"], required=False)
-
-        # For your real schema this will exist:
         date_col = pick_col(
             df,
             ["NOTE_DATE_OF_SERVICE", "NOTE DATE OF SERVICE", "OPERATION_DATE",
@@ -439,12 +492,321 @@ def load_and_reconstruct_notes():
     return pd.DataFrame(reconstructed)
 
 
+# -----------------------
+# Structured enrichment: Race / Ethnicity / Age
+# -----------------------
+def load_structured_encounters():
+    rows = []
+    for fp in sorted(set(sum([glob(g, recursive=True) for g in STRUCT_GLOBS], []))):
+        df = clean_cols(read_csv_robust(fp))
+        df = normalize_mrn(df)
+
+        source_name = os.path.basename(fp).lower()
+        if "operation encounters" in source_name:
+            encounter_source = "operation"
+            priority = 1
+        elif "clinic encounters" in source_name:
+            encounter_source = "clinic"
+            priority = 2
+        elif "inpatient encounters" in source_name:
+            encounter_source = "inpatient"
+            priority = 3
+        else:
+            encounter_source = "other"
+            priority = 9
+
+        race_col = pick_col(df, ["RACE", "Race"], required=False)
+        eth_col = pick_col(df, ["ETHNICITY", "Ethnicity"], required=False)
+        age_col = pick_col(df, ["AGE_AT_ENCOUNTER", "Age_at_encounter", "AGE"], required=False)
+        date_col = pick_col(
+            df,
+            ["OPERATION_DATE", "ENCOUNTER_DATE", "ADMIT_DATE", "DISCHARGE_DATE_DT"],
+            required=False
+        )
+
+        out = pd.DataFrame()
+        out[MERGE_KEY] = df[MERGE_KEY].astype(str).str.strip()
+        out["STRUCT_SOURCE"] = encounter_source
+        out["STRUCT_PRIORITY"] = priority
+        out["STRUCT_DATE_RAW"] = df[date_col].astype(str) if date_col else ""
+        out["RACE_STRUCT"] = df[race_col].astype(str) if race_col else ""
+        out["ETHNICITY_STRUCT"] = df[eth_col].astype(str) if eth_col else ""
+        out["AGE_AT_ENCOUNTER_STRUCT"] = df[age_col].astype(str) if age_col else ""
+        rows.append(out)
+
+    if not rows:
+        return pd.DataFrame(columns=[
+            MERGE_KEY, "STRUCT_SOURCE", "STRUCT_PRIORITY", "STRUCT_DATE_RAW",
+            "RACE_STRUCT", "ETHNICITY_STRUCT", "AGE_AT_ENCOUNTER_STRUCT"
+        ])
+
+    struct_df = pd.concat(rows, ignore_index=True)
+    return struct_df
+
+
+def build_target_dates(notes_df, struct_df):
+    target_dates = {}
+
+    # 1) operation note date preferred
+    if len(notes_df) > 0:
+        for _, row in notes_df.iterrows():
+            mrn = clean_cell(row.get(MERGE_KEY, ""))
+            if not mrn:
+                continue
+
+            note_type = clean_cell(row.get("NOTE_TYPE", "")).lower()
+            source_file = clean_cell(row.get("SOURCE_FILE", "")).lower()
+            note_date = parse_date_safe(row.get("NOTE_DATE", ""))
+
+            is_operation_note = (
+                ("operation" in note_type) or
+                ("operative" in note_type) or
+                ("operation" in source_file) or
+                ("operative" in source_file)
+            )
+
+            if is_operation_note and note_date is not None:
+                prev = target_dates.get(mrn)
+                if prev is None or note_date < prev:
+                    target_dates[mrn] = note_date
+
+    # 2) fallback to operation encounter date
+    if len(struct_df) > 0:
+        op_df = struct_df[struct_df["STRUCT_SOURCE"] == "operation"].copy()
+        if len(op_df) > 0:
+            for _, row in op_df.iterrows():
+                mrn = clean_cell(row.get(MERGE_KEY, ""))
+                if not mrn or mrn in target_dates:
+                    continue
+                dt = parse_date_safe(row.get("STRUCT_DATE_RAW", ""))
+                if dt is not None:
+                    target_dates[mrn] = dt
+
+    # 3) fallback to any earliest note date
+    if len(notes_df) > 0:
+        for _, row in notes_df.iterrows():
+            mrn = clean_cell(row.get(MERGE_KEY, ""))
+            if not mrn or mrn in target_dates:
+                continue
+            note_date = parse_date_safe(row.get("NOTE_DATE", ""))
+            if note_date is not None:
+                prev = target_dates.get(mrn)
+                if prev is None or note_date < prev:
+                    target_dates[mrn] = note_date
+
+    return target_dates
+
+
+def normalize_race_value(x):
+    s = clean_cell(x)
+    if not s:
+        return ""
+    return s
+
+
+def normalize_ethnicity_value(x):
+    s = clean_cell(x)
+    if not s:
+        return ""
+    return s
+
+
+def round_half_up(x):
+    try:
+        return int(math.floor(float(x) + 0.5))
+    except Exception:
+        return None
+
+
+def choose_structured_demo_values(struct_df, target_dates):
+    best = {}
+
+    if len(struct_df) == 0:
+        return best
+
+    for _, row in struct_df.iterrows():
+        mrn = clean_cell(row.get(MERGE_KEY, ""))
+        if not mrn:
+            continue
+
+        race_val = normalize_race_value(row.get("RACE_STRUCT", ""))
+        eth_val = normalize_ethnicity_value(row.get("ETHNICITY_STRUCT", ""))
+        age_raw = clean_cell(row.get("AGE_AT_ENCOUNTER_STRUCT", ""))
+        age_base = to_float_safe(age_raw)
+        struct_date = parse_date_safe(row.get("STRUCT_DATE_RAW", ""))
+        priority = to_int_safe(row.get("STRUCT_PRIORITY", 9))
+        if priority is None:
+            priority = 9
+
+        if mrn not in best:
+            best[mrn] = {
+                "race": None,
+                "ethnicity": None,
+                "age": None
+            }
+
+        target_date = target_dates.get(mrn)
+
+        # -------- Race --------
+        if race_val:
+            score = (priority, 999999999)
+            if target_date is not None and struct_date is not None:
+                score = (priority, abs((target_date - struct_date).days))
+
+            cur = best[mrn]["race"]
+            if cur is None or score < cur["score"]:
+                best[mrn]["race"] = {
+                    "value": race_val,
+                    "score": score,
+                    "source": row.get("STRUCT_SOURCE", ""),
+                    "date_raw": row.get("STRUCT_DATE_RAW", "")
+                }
+
+        # -------- Ethnicity --------
+        if eth_val:
+            score = (priority, 999999999)
+            if target_date is not None and struct_date is not None:
+                score = (priority, abs((target_date - struct_date).days))
+
+            cur = best[mrn]["ethnicity"]
+            if cur is None or score < cur["score"]:
+                best[mrn]["ethnicity"] = {
+                    "value": eth_val,
+                    "score": score,
+                    "source": row.get("STRUCT_SOURCE", ""),
+                    "date_raw": row.get("STRUCT_DATE_RAW", "")
+                }
+
+        # -------- Age --------
+        if age_base is not None:
+            age_floor = None
+            age_round = None
+
+            if target_date is not None and struct_date is not None:
+                day_diff = (target_date - struct_date).days
+                age_adjusted = float(age_base) + (float(day_diff) / 365.25)
+                age_floor = int(math.floor(age_adjusted))
+                age_round = round_half_up(age_adjusted)
+            else:
+                age_floor = int(math.floor(float(age_base)))
+                age_round = round_half_up(float(age_base))
+
+            score = (priority, 999999999)
+            if target_date is not None and struct_date is not None:
+                score = (priority, abs((target_date - struct_date).days))
+
+            cur = best[mrn]["age"]
+            if cur is None or score < cur["score"]:
+                best[mrn]["age"] = {
+                    "value_floor": age_floor,
+                    "value_round": age_round,
+                    "score": score,
+                    "source": row.get("STRUCT_SOURCE", ""),
+                    "date_raw": row.get("STRUCT_DATE_RAW", ""),
+                    "target_date": target_date.strftime("%Y-%m-%d") if target_date else "",
+                    "struct_date": struct_date.strftime("%Y-%m-%d") if struct_date else "",
+                    "age_at_encounter": age_raw
+                }
+
+    return best
+
+
+def enrich_master_with_structured_demo(master, notes_df, evidence_rows):
+    print("Loading structured encounters for Race / Ethnicity / Age...")
+    struct_df = load_structured_encounters()
+    print("Structured encounter rows: {0}".format(len(struct_df)))
+
+    target_dates = build_target_dates(notes_df, struct_df)
+    best_struct = choose_structured_demo_values(struct_df, target_dates)
+
+    print("Structured demo values found for MRNs: {0}".format(len(best_struct)))
+
+    for mrn, info in best_struct.items():
+        mask = (master[MERGE_KEY].astype(str).str.strip() == mrn)
+        if not mask.any():
+            continue
+
+        # Race
+        race_info = info.get("race")
+        if race_info is not None and clean_cell(race_info.get("value")):
+            master.loc[mask, "Race"] = race_info["value"]
+            evidence_rows.append({
+                MERGE_KEY: mrn,
+                "NOTE_ID": "",
+                "NOTE_DATE": race_info.get("date_raw", ""),
+                "NOTE_TYPE": "STRUCTURED_{0}".format(race_info.get("source", "")).upper(),
+                "FIELD": "Race",
+                "VALUE": race_info.get("value", ""),
+                "STATUS": "structured_fill",
+                "CONFIDENCE": "1.0",
+                "SECTION": "STRUCTURED_ENCOUNTER",
+                "EVIDENCE": "Race from structured encounter"
+            })
+
+        # Ethnicity
+        eth_info = info.get("ethnicity")
+        if eth_info is not None and clean_cell(eth_info.get("value")):
+            master.loc[mask, "Ethnicity"] = eth_info["value"]
+            evidence_rows.append({
+                MERGE_KEY: mrn,
+                "NOTE_ID": "",
+                "NOTE_DATE": eth_info.get("date_raw", ""),
+                "NOTE_TYPE": "STRUCTURED_{0}".format(eth_info.get("source", "")).upper(),
+                "FIELD": "Ethnicity",
+                "VALUE": eth_info.get("value", ""),
+                "STATUS": "structured_fill",
+                "CONFIDENCE": "1.0",
+                "SECTION": "STRUCTURED_ENCOUNTER",
+                "EVIDENCE": "Ethnicity from structured encounter"
+            })
+
+        # Age
+        age_info = info.get("age")
+        if age_info is not None:
+            age_floor = age_info.get("value_floor")
+            age_round = age_info.get("value_round")
+
+            # keep both calculations internally; use round for final Age if available,
+            # otherwise fall back to floor
+            final_age = age_round if age_round is not None else age_floor
+
+            if final_age is not None:
+                master.loc[mask, "Age"] = final_age
+
+                ev = (
+                    "Age from structured encounter | "
+                    "AGE_AT_ENCOUNTER={0} | STRUCT_DATE={1} | TARGET_DATE={2} | "
+                    "AGE_FLOOR={3} | AGE_ROUND={4} | FINAL_USED={5}"
+                ).format(
+                    age_info.get("age_at_encounter", ""),
+                    age_info.get("struct_date", ""),
+                    age_info.get("target_date", ""),
+                    age_floor,
+                    age_round,
+                    final_age
+                )
+
+                evidence_rows.append({
+                    MERGE_KEY: mrn,
+                    "NOTE_ID": "",
+                    "NOTE_DATE": age_info.get("date_raw", ""),
+                    "NOTE_TYPE": "STRUCTURED_{0}".format(age_info.get("source", "")).upper(),
+                    "FIELD": "Age",
+                    "VALUE": final_age,
+                    "STATUS": "structured_fill",
+                    "CONFIDENCE": "1.0",
+                    "SECTION": "STRUCTURED_ENCOUNTER",
+                    "EVIDENCE": ev
+                })
+
+    return master, evidence_rows
+
+
 def main():
     print("Seeding clean master WITHOUT gold...")
     master = seed_master_from_structured()
     master = normalize_mrn(master)
 
-    # keep ENCRYPTED_PAT_ID populated with MRN for validation/debugging
     if "ENCRYPTED_PAT_ID" in master.columns:
         master["ENCRYPTED_PAT_ID"] = master["MRN"].astype(str).str.strip()
 
@@ -453,6 +815,13 @@ def main():
     print("Loading & reconstructing notes...")
     notes_df = load_and_reconstruct_notes()
     print("Reconstructed notes: {0}".format(len(notes_df)))
+
+    evidence_rows = []
+
+    # -----------------------
+    # Structured fill first: Race / Ethnicity / Age
+    # -----------------------
+    master, evidence_rows = enrich_master_with_structured_demo(master, notes_df, evidence_rows)
 
     print("Running rule-based extractors...")
     extractor_fns = [
@@ -466,7 +835,6 @@ def main():
     ]
 
     best_by_mrn = {}
-    evidence_rows = []
 
     for _, row in notes_df.iterrows():
         mrn = str(row[MERGE_KEY]).strip()
@@ -527,15 +895,19 @@ def main():
             else:
                 best_by_mrn[mrn][logical] = choose_best(existing, c)
 
-    print("Aggregated predictions for {0} MRNs".format(len(best_by_mrn)))
+    print("Aggregated note-based predictions for {0} MRNs".format(len(best_by_mrn)))
 
-    # Apply predictions to master
+    # Apply note-based predictions to master,
+    # but DO NOT overwrite structured Race / Ethnicity / Age
     for mrn, fields in best_by_mrn.items():
         mask = (master[MERGE_KEY].astype(str).str.strip() == mrn)
         if not mask.any():
             continue
 
         for logical, cand in fields.items():
+            if logical in {"Race", "Ethnicity", "Age"}:
+                continue
+
             val = getattr(cand, "value", pd.NA)
 
             if logical in BOOLEAN_FIELDS:
@@ -544,7 +916,6 @@ def main():
                 except Exception:
                     val = pd.NA
 
-            # obesity derived if BMI >= 30
             if logical == "BMI" and not pd.isna(val):
                 try:
                     master.loc[mask, "BMI"] = float(val)
@@ -553,11 +924,9 @@ def main():
                     master.loc[mask, "BMI"] = pd.NA
                 continue
 
-            # map to exact column names (they match)
             if logical in master.columns:
                 master.loc[mask, logical] = val
             else:
-                # should not happen, but safe
                 master[logical] = pd.NA
                 master.loc[mask, logical] = val
 
