@@ -4,7 +4,7 @@
 """
 validate_abstraction.py
 
-Validates abstraction output against gold labels using MRN→ENCRYPTED_PAT_ID mapping.
+Validates abstraction output against gold labels using direct MRN merge.
 
 Compatible with Python 3.6.8.
 """
@@ -13,18 +13,9 @@ import pandas as pd
 import os
 import sys
 
-MASTER_FILE = "_outputs/patient_master.csv"
+MASTER_FILE = "_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv"
 GOLD_FILE = "gold_cleaned_for_cedar.csv"
 
-DATA_DIR = "/home/apokol/my_data_Breast/HPI-11526/HPI11256"
-
-ENCOUNTER_FILES = [
-    os.path.join(DATA_DIR, "HPI11526 Clinic Encounters.csv"),
-    os.path.join(DATA_DIR, "HPI11526 Inpatient Encounters.csv"),
-    os.path.join(DATA_DIR, "HPI11526 Operation Encounters.csv")
-]
-
-PID = "ENCRYPTED_PAT_ID"
 MRN = "MRN"
 
 VARIABLES = [
@@ -52,10 +43,9 @@ VARIABLES = [
 # ---------------------------------------------------
 
 def safe_read_csv(path):
-
     try:
         return pd.read_csv(path, encoding="utf-8")
-    except:
+    except Exception:
         return pd.read_csv(path, encoding="latin1")
 
 
@@ -64,11 +54,9 @@ def safe_read_csv(path):
 # ---------------------------------------------------
 
 def normalize(series):
-
     series = series.fillna("NA")
     series = series.astype(str)
     series = series.str.strip().str.lower()
-
     return series
 
 
@@ -77,7 +65,6 @@ def normalize(series):
 # ---------------------------------------------------
 
 def compute_metrics(pred, gold):
-
     pred = normalize(pred)
     gold = normalize(gold)
 
@@ -87,38 +74,9 @@ def compute_metrics(pred, gold):
         return 0, 0, 0
 
     matches = (pred == gold).sum()
-
     accuracy = float(matches) / float(total)
 
     return accuracy, matches, total
-
-
-# ---------------------------------------------------
-# Build MRN → ENCRYPTED_PAT_ID mapping
-# ---------------------------------------------------
-
-def build_mapping():
-
-    frames = []
-
-    for f in ENCOUNTER_FILES:
-        df = safe_read_csv(f)
-
-        if MRN in df.columns and PID in df.columns:
-            frames.append(df[[MRN, PID]])
-
-    if len(frames) == 0:
-        print("ERROR: Could not find MRN ↔ ENCRYPTED_PAT_ID mapping in encounter files.")
-        sys.exit(1)
-
-    mapping = pd.concat(frames)
-
-    mapping = mapping.drop_duplicates()
-
-    mapping[MRN] = mapping[MRN].astype(str)
-    mapping[PID] = mapping[PID].astype(str)
-
-    return mapping
 
 
 # ---------------------------------------------------
@@ -126,7 +84,6 @@ def build_mapping():
 # ---------------------------------------------------
 
 def main():
-
     print("Loading files...")
 
     master = safe_read_csv(MASTER_FILE)
@@ -135,42 +92,37 @@ def main():
     print("Master rows:", len(master))
     print("Gold rows:", len(gold))
 
-    master[PID] = master[PID].astype(str)
+    if MRN not in master.columns:
+        print("ERROR: master file missing MRN column")
+        sys.exit(1)
 
     if MRN not in gold.columns:
         print("ERROR: gold file missing MRN column")
         sys.exit(1)
 
-    gold[MRN] = gold[MRN].astype(str)
+    master[MRN] = master[MRN].astype(str).str.strip()
+    gold[MRN] = gold[MRN].astype(str).str.strip()
+
+    # drop blank MRNs before merge
+    master = master[master[MRN] != ""].copy()
+    gold = gold[gold[MRN] != ""].copy()
+
+    # optional: deduplicate by MRN to avoid unexpected row multiplication
+    master = master.drop_duplicates(subset=[MRN])
+    gold = gold.drop_duplicates(subset=[MRN])
 
     # ---------------------------------------------------
-    # Build mapping
+    # Merge directly on MRN
     # ---------------------------------------------------
 
-    print("Building MRN → ENCRYPTED_PAT_ID mapping...")
+    print("Merging directly on MRN...")
 
-    mapping = build_mapping()
-
-    print("Mapping rows:", len(mapping))
-
-    # ---------------------------------------------------
-    # Attach ENCRYPTED_PAT_ID to gold
-    # ---------------------------------------------------
-
-    gold = pd.merge(gold, mapping, on=MRN, how="left")
-
-    print("Gold rows after mapping:", len(gold))
-
-    # ---------------------------------------------------
-    # Merge with master abstraction
-    # ---------------------------------------------------
-
-    merged = pd.merge(master, gold, on=PID, suffixes=("_pred", "_gold"))
+    merged = pd.merge(master, gold, on=MRN, how="inner", suffixes=("_pred", "_gold"))
 
     print("Merged rows:", len(merged))
 
     if len(merged) == 0:
-        print("ERROR: No rows matched after mapping.")
+        print("ERROR: No rows matched on MRN.")
         sys.exit(1)
 
     results = []
@@ -180,7 +132,6 @@ def main():
     # ---------------------------------------------------
 
     for v in VARIABLES:
-
         pred_col = v + "_pred"
         gold_col = v + "_gold"
 
