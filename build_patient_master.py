@@ -778,7 +778,7 @@ def enrich_master_with_structured_demo(master, notes_df, evidence_rows):
             age_round = age_info.get("value_round")
 
             # final stored value: round
-            final_age = age_round if age_round is not None else age_floor
+            final_age = age_floor if age_floor is not None else age_round
 
             if final_age is not None:
                 master.loc[mask, "Age"] = final_age
