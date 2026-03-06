@@ -1,6 +1,6 @@
 import pandas as pd
 
-gold = pd.read_csv("/home/apokol/Breast_Restore/_outputs/patient_master.csv", dtype=str)
+gold = pd.read_csv("/home/apokol/Breast_Restore/_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv", dtype=str)
 pred = pd.read_csv("/home/apokol/Breast_Restore/gold_cleaned_for_cedar.csv", dtype=str)
 
 print("GOLD COLUMNS:")
