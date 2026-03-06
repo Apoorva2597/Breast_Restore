@@ -1,427 +1,576 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-build_patient_master.py (Python 3.6.8 compatible)
+# build_master_rule_FINAL_NO_GOLD.py
+#
+# RULE-BASED ONLY builder that DOES NOT use the gold sheet as a base.
+# - Builds a clean master dataframe from STRUCTURED encounter files (or MRNs in notes as fallback)
+# - Loads ORIGINAL HPI11526 note CSVs (Clinic/Inpatient/Operation Notes)
+# - Reconstructs full note text by NOTE_ID + LINE ordering
+# - Lightweight sectionizer
+# - Runs rule-based extractors from ./extractors
+# - Writes:
+#   1) /home/apokol/Breast_Restore/_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv
+#   2) /home/apokol/Breast_Restore/_outputs/rule_hit_evidence_FINAL_NO_GOLD.csv
 
-Fixes:
-- UnicodeDecodeError handling for clinic notes
-- No CLI args (hard-coded paths)
-- No "de-id" column assumptions
-- Correct note text column selection (by avg length)
-- Normalize Race/Ethnicity to gold-style labels
-- Age written as clean integer string (no 47.0)
-- BMI extraction handles kg/m2 and kg/m² variants
-- PMH extraction robust (block + table-ish)
-"""
-
-from __future__ import print_function
 import os
 import re
+from glob import glob
+from typing import Dict, List, Optional, Tuple, Any
+
 import pandas as pd
 
+# -----------------------
+# CONFIG (NO USER INPUTS)
+# -----------------------
+BASE_DIR = "/home/apokol/Breast_Restore"
 
-# ---------------------------------------------------------------------
-# HARD-CODED PATHS
-# ---------------------------------------------------------------------
-ENCOUNTERS_CSV = "/home/apokol/Breast_Restore/_staging_inputs/HPI11526 Operation Encounters.csv"
-CLINIC_NOTES_CSV = "/home/apokol/Breast_Restore/_staging_inputs/HPI11526 Clinic Notes.csv"
-OUT_CSV = "/home/apokol/Breast_Restore/_outputs/patient_master.csv"
-
-# ---------------------------------------------------------------------
-# Robust CSV loader
-# ---------------------------------------------------------------------
-def read_csv_robust(path, dtype=str, low_memory=False):
-    encodings_to_try = ["utf-8", "cp1252", "latin1"]
-    last_err = None
-    for enc in encodings_to_try:
-        try:
-            return pd.read_csv(path, dtype=dtype, low_memory=low_memory, encoding=enc)
-        except Exception as e:
-            last_err = e
-
-    # Final fallback: do not crash on bad bytes
-    try:
-        return pd.read_csv(path, dtype=dtype, low_memory=low_memory, encoding="latin1")
-    except Exception:
-        raise last_err
-
-
-# ---------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------
-def norm(x):
-    if x is None:
-        return ""
-    try:
-        if isinstance(x, float) and x != x:
-            return ""
-    except Exception:
-        pass
-    return str(x).strip()
-
-def safe_int_str(x):
-    s = norm(x)
-    if not s:
-        return ""
-    try:
-        i = int(float(s))
-        return str(i)
-    except Exception:
-        return ""
-
-def safe_float(x):
-    try:
-        return float(x)
-    except Exception:
-        return None
-
-def collapse_ws(text):
-    return re.sub(r"\s+", " ", text).strip()
-
-def find_first_existing_col(df, candidates):
-    cols_upper = set([c.upper() for c in df.columns])
-    for c in candidates:
-        cu = c.upper()
-        if cu in cols_upper:
-            for real in df.columns:
-                if real.upper() == cu:
-                    return real
-    return None
-
-def pick_note_text_col(notes_df):
-    candidates = []
-    for c in notes_df.columns:
-        cu = c.upper()
-        if ("NOTE" in cu and "TEXT" in cu) or cu in ("TEXT", "NOTE", "BODY"):
-            candidates.append(c)
-
-    if not candidates:
-        return None
-
-    best_col = None
-    best_avg = -1.0
-    for c in candidates:
-        series = notes_df[c].fillna("").astype(str)
-        samp = series.head(5000)
-        lengths = samp.map(lambda s: len(s) if s else 0)
-        avg_len = float(lengths.mean()) if len(lengths) else 0.0
-        if avg_len > best_avg:
-            best_avg = avg_len
-            best_col = c
-
-    return best_col
-
-
-# ---------------------------------------------------------------------
-# Normalization to match GOLD labels
-# ---------------------------------------------------------------------
-def normalize_race(val):
-    v = norm(val).lower()
-    if not v:
-        return ""
-
-    if "white" in v or "caucasian" in v:
-        return "Caucasian"
-    if "black" in v or "african" in v:
-        return "Black"
-    if "asian" in v:
-        return "Asian"
-    if "american indian" in v or "alaska" in v:
-        return "American Indian/Alaska Native"
-    if "native hawaiian" in v or "pacific" in v:
-        return "Native Hawaiian/Pacific Islander"
-
-    if "unknown" in v or "declined" in v or "refused" in v:
-        return "Unknown"
-    return "Other"
-
-def normalize_ethnicity(val):
-    v = norm(val).lower()
-    if not v:
-        return ""
-    if "non" in v and "hisp" in v:
-        return "Non-hispanic"
-    if "hisp" in v or "latin" in v:
-        return "Hispanic"
-    if "unknown" in v or "declined" in v or "refused" in v:
-        return "Unknown"
-    return collapse_ws(norm(val))
-
-
-# ---------------------------------------------------------------------
-# Section extraction
-# ---------------------------------------------------------------------
-def extract_block(text, start_regex, max_chars=8000):
-    if not text:
-        return ""
-
-    m = re.search(start_regex, text, flags=re.IGNORECASE | re.MULTILINE)
-    if not m:
-        return ""
-
-    start = m.start()
-    chunk = text[start:start + max_chars]
-
-    header_pat = re.compile(r"\n[A-Z][A-Z \-/]{2,}:\s*", re.MULTILINE)
-    stop = None
-    for hm in header_pat.finditer(chunk):
-        if hm.start() == 0:
-            continue
-        stop = hm.start()
-        break
-
-    return chunk if stop is None else chunk[:stop]
-
-def extract_pmh_chunks(note_text):
-    if not note_text:
-        return []
-
-    chunks = []
-
-    chunk_a = extract_block(note_text, r"\bPAST\s+MEDICAL\s+HIST(?:ORY)?\s*:?\s*")
-    if chunk_a:
-        chunks.append(chunk_a)
-
-    m = re.search(r"\bPast\s+Medical\s+History\b", note_text, flags=re.IGNORECASE)
-    if m:
-        window = note_text[m.start():m.start() + 4000]
-        chunks.append(window)
-
-    cleaned = []
-    for c in chunks:
-        fh = re.search(r"\bFAMILY\s+HIST(?:ORY)?\b", c, flags=re.IGNORECASE)
-        if fh:
-            c = c[:fh.start()]
-        cleaned.append(c)
-
-    out = []
-    seen = set()
-    for c in cleaned:
-        key = c[:200].lower()
-        if key not in seen and len(c.strip()) > 20:
-            out.append(c)
-            seen.add(key)
-
-    return out
-
-
-# ---------------------------------------------------------------------
-# BMI / Smoking extraction
-# ---------------------------------------------------------------------
-BMI_PATTERNS = [
-    re.compile(r"\bBMI\s*[:=]?\s*([0-9]{1,2}\.?[0-9]{0,2})\s*(kg\s*/\s*m2|kg\s*/\s*m\^2|kg\s*/\s*m²|kg\s*/\s*m\u00b2|kg/m2|kg/m\^2|kg/m²)?\b", re.IGNORECASE),
-    re.compile(r"\bbody\s+mass\s+index\s+(is\s+)?([0-9]{1,2}\.?[0-9]{0,2})\b", re.IGNORECASE),
+# Structured encounter files (use these to seed MRNs without touching gold)
+STRUCT_GLOBS = [
+    f"{BASE_DIR}/**/HPI11526*Clinic Encounters.csv",
+    f"{BASE_DIR}/**/HPI11526*Inpatient Encounters.csv",
+    f"{BASE_DIR}/**/HPI11526*Operation Encounters.csv",
+    f"{BASE_DIR}/**/HPI11526*clinic encounters.csv",
+    f"{BASE_DIR}/**/HPI11526*inpatient encounters.csv",
+    f"{BASE_DIR}/**/HPI11526*operation encounters.csv",
 ]
 
-def extract_bmi(note_text):
-    if not note_text:
-        return ""
+NOTE_GLOBS = [
+    f"{BASE_DIR}/**/HPI11526*Clinic Notes.csv",
+    f"{BASE_DIR}/**/HPI11526*Inpatient Notes.csv",
+    f"{BASE_DIR}/**/HPI11526*Operation Notes.csv",
+    f"{BASE_DIR}/**/HPI11526*clinic notes.csv",
+    f"{BASE_DIR}/**/HPI11526*inpatient notes.csv",
+    f"{BASE_DIR}/**/HPI11526*operation notes.csv",
+]
 
-    head = note_text[:10000]
-    pe = extract_block(note_text, r"\bPHYSICAL\s+EXAM\s*:?\s*", max_chars=5000)
-    texts = [pe, head] if pe else [head]
+OUTPUT_MASTER = f"{BASE_DIR}/_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv"
+OUTPUT_EVID = f"{BASE_DIR}/_outputs/rule_hit_evidence_FINAL_NO_GOLD.csv"
+MERGE_KEY = "MRN"
 
-    for t in texts:
-        if not t:
-            continue
-        for pat in BMI_PATTERNS:
-            m = pat.search(t)
-            if not m:
-                continue
-            if "body" in pat.pattern.lower():
-                val = safe_float(m.group(2))
-            else:
-                val = safe_float(m.group(1))
-            if val is not None and 10.0 <= val <= 80.0:
-                return ("%.2f" % val).rstrip("0").rstrip(".")
-    return ""
+# -----------------------
+# Imports from your repo
+# -----------------------
+from models import SectionedNote, Candidate  # noqa: E402
+from extractors.age import extract_age  # noqa: E402
+from extractors.bmi import extract_bmi  # noqa: E402
+from extractors.smoking import extract_smoking  # noqa: E402
+from extractors.comorbidities import extract_comorbidities  # noqa: E402
+from extractors.pbs import extract_pbs  # noqa: E402
+from extractors.mastectomy import extract_mastectomy  # noqa: E402
+from extractors.cancer_treatment import extract_cancer_treatment  # noqa: E402
 
-def extract_smoking_status(note_text):
-    if not note_text:
-        return ""
+# -----------------------
+# Robust CSV read
+# -----------------------
+def read_csv_robust(path):
+    common_kwargs = dict(dtype=str, engine="python")
+    try:
+        return pd.read_csv(path, **common_kwargs, on_bad_lines="skip")
+    except TypeError:
+        try:
+            return pd.read_csv(path, **common_kwargs,
+                               error_bad_lines=False, warn_bad_lines=True)
+        except UnicodeDecodeError:
+            return pd.read_csv(path, **common_kwargs, encoding="latin-1",
+                               error_bad_lines=False, warn_bad_lines=True)
+    except UnicodeDecodeError:
+        try:
+            return pd.read_csv(path, **common_kwargs, encoding="latin-1",
+                               on_bad_lines="skip")
+        except TypeError:
+            return pd.read_csv(path, **common_kwargs, encoding="latin-1",
+                               error_bad_lines=False, warn_bad_lines=True)
 
-    sh = extract_block(note_text, r"\bSOCIAL\s+HISTORY\s*:?\s*", max_chars=5000)
-    head = note_text[:12000]
-    texts = [sh, head] if sh else [head]
 
-    for t in texts:
-        if not t:
-            continue
+def clean_cols(df):
+    df.columns = [str(c).strip().replace("\ufeff", "") for c in df.columns]
+    return df
 
-        m = re.search(r"\bSmoking\s+status\s*[:=]\s*([A-Za-z \-]+)", t, flags=re.IGNORECASE)
+
+def normalize_mrn(df):
+    key_variants = ["MRN", "mrn", "Patient_MRN", "PAT_MRN", "PATIENT_MRN"]
+    for k in key_variants:
+        if k in df.columns:
+            if k != MERGE_KEY:
+                df = df.rename(columns={k: MERGE_KEY})
+            break
+    if MERGE_KEY not in df.columns:
+        raise RuntimeError("MRN column not found. Columns seen: {0}".format(list(df.columns)[:40]))
+    df[MERGE_KEY] = df[MERGE_KEY].astype(str).str.strip()
+    return df
+
+
+def pick_col(df, options, required=True):
+    for c in options:
+        if c in df.columns:
+            return c
+    if required:
+        raise RuntimeError("Required column missing. Tried={0}. Seen={1}".format(
+            options, list(df.columns)[:60]
+        ))
+    return None
+
+
+def to_int_safe(x):
+    try:
+        return int(float(str(x).strip()))
+    except Exception:
+        return None
+
+
+# -----------------------
+# Lightweight sectionizer
+# -----------------------
+HEADER_RX = re.compile(r"^\s*([A-Z][A-Z0-9 /&\-]{2,60})\s*:\s*$")
+
+
+def sectionize(text):
+    if not text:
+        return {"FULL": ""}
+    lines = text.splitlines()
+    sections = {}
+    current = "FULL"
+    sections[current] = []
+
+    for line in lines:
+        m = HEADER_RX.match(line)
         if m:
-            cand = m.group(1).strip().lower()
-            if "former" in cand:
-                return "Former"
-            if "never" in cand:
-                return "Never"
-            if "current" in cand:
-                return "Current"
+            hdr = m.group(1).strip().upper()
+            current = hdr
+            if current not in sections:
+                sections[current] = []
+            continue
+        sections[current].append(line)
 
-        if re.search(r"\bnever\s+smok", t, flags=re.IGNORECASE):
-            return "Never"
-        if re.search(r"\bformer\s+smok|\bquit\s+smok", t, flags=re.IGNORECASE):
-            return "Former"
-        if re.search(r"\bcurrent\s+smok|\bsmokes\b", t, flags=re.IGNORECASE):
-            return "Current"
-
-    return ""
+    out = {}
+    for k, v in sections.items():
+        joined = "\n".join(v).strip()
+        if joined:
+            out[k] = joined
+    return out if out else {"FULL": text}
 
 
-# ---------------------------------------------------------------------
-# Comorbidities detection (ONLY inside PMH chunks)
-# ---------------------------------------------------------------------
-COMORBIDITY_MAP = {
-    "Diabetes": [r"\bdiabetes\b", r"\btype\s*2\s*diabetes\b", r"\bt2dm\b", r"\bdm\b"],
-    "Hypertension": [r"\bhypertension\b", r"\bhtn\b", r"\bhigh blood pressure\b"],
-    "CardiacDisease": [
-        r"\bcoronary artery disease\b", r"\bcad\b", r"\bchf\b", r"\bheart failure\b",
-        r"\bmyocardial infarction\b", r"\bafib\b", r"\batrial fibrillation\b"
-    ],
-    "VenousThromboembolism": [r"\bdeep vein thrombosis\b", r"\bdvt\b", r"\bpulmonary embolism\b", r"\bpe\b", r"\bvte\b"],
-    "Steroid": [r"\bprednisone\b", r"\bdexamethasone\b", r"\bmethylprednisolone\b", r"\bsteroid\b"],
+def build_sectioned_note(note_text, note_type, note_id, note_date):
+    return SectionedNote(
+        sections=sectionize(note_text),
+        note_type=note_type or "",
+        note_id=note_id or "",
+        note_date=note_date or ""
+    )
+
+
+# -----------------------
+# Aggregation logic
+# -----------------------
+def cand_score(c):
+    conf = float(getattr(c, "confidence", 0.0) or 0.0)
+    nt = str(getattr(c, "note_type", "") or "").lower()
+    op_bonus = 0.05 if ("op" in nt or "operative" in nt or "operation" in nt) else 0.0
+    date_bonus = 0.01 if (getattr(c, "note_date", "") or "").strip() else 0.0
+    return conf + op_bonus + date_bonus
+
+
+def choose_best(existing, new):
+    if existing is None:
+        return new
+    return new if cand_score(new) > cand_score(existing) else existing
+
+
+def merge_boolean(existing, new):
+    if existing is None:
+        return new
+    try:
+        exv = bool(existing.value)
+        nwv = bool(new.value)
+    except Exception:
+        return choose_best(existing, new)
+    if nwv and not exv:
+        return new
+    if exv and not nwv:
+        return existing
+    return choose_best(existing, new)
+
+
+# -----------------------
+# Field mapping to your FINAL columns
+# -----------------------
+# Candidate.field -> final logical column name (matches your gold header set)
+FIELD_MAP = {
+    "Age": "Age",
+    "Age_DOS": "Age",
+    "BMI": "BMI",
+    "SmokingStatus": "SmokingStatus",
+    "Diabetes": "Diabetes",
+    "DiabetesMellitus": "Diabetes",
+    "Hypertension": "Hypertension",
+    "CardiacDisease": "CardiacDisease",
+    "VTE": "VenousThromboembolism",
+    "VenousThromboembolism": "VenousThromboembolism",
+    "SteroidUse": "Steroid",
+    "Steroid": "Steroid",
+    "PastBreastSurgery": "PastBreastSurgery",
+    "PBS_Lumpectomy": "PBS_Lumpectomy",
+    "PBS_Breast Reduction": "PBS_Breast Reduction",
+    "PBS_Mastopexy": "PBS_Mastopexy",
+    "PBS_Augmentation": "PBS_Augmentation",
+    "PBS_Other": "PBS_Other",
+    "Mastectomy_Laterality": "Mastectomy_Laterality",
+    "Radiation": "Radiation",
+    "Chemo": "Chemo",
 }
 
-def detect_comorbidities(note_text):
-    out = {k: "0" for k in COMORBIDITY_MAP.keys()}
-    chunks = extract_pmh_chunks(note_text)
-    if not chunks:
-        return out
+BOOLEAN_FIELDS = {
+    "Diabetes", "Hypertension", "CardiacDisease",
+    "VenousThromboembolism", "Steroid",
+    "PastBreastSurgery", "PBS_Lumpectomy", "PBS_Breast Reduction",
+    "PBS_Mastopexy", "PBS_Augmentation", "PBS_Other",
+    "Radiation", "Chemo"
+}
 
-    pmh_text = "\n\n".join(chunks).lower()
+# Your presentation master header (subset we fill now; rest remain blank)
+MASTER_COLUMNS = [
+    "MRN",
+    "ENCRYPTED_PAT_ID",
+    "Last name",
+    "DOB",
+    "PatientID",
+    "Race",
+    "Ethnicity",
+    "Age",
+    "BMI",
+    "CCI",
+    "SmokingStatus",
+    "Diabetes",
+    "Obesity",
+    "Hypertension",
+    "CardiacDisease",
+    "VenousThromboembolism",
+    "Steroid",
+    "PastBreastSurgery",
+    "PBS_Lumpectomy",
+    "PBS_Breast Reduction",
+    "PBS_Mastopexy",
+    "PBS_Augmentation",
+    "PBS_Other",
+    "Mastectomy_Laterality",
+    "Indication_Left",
+    "Indication_Right",
+    "LymphNode",
+    "Radiation",
+    "Radiation_Before",
+    "Radiation_After",
+    "Chemo",
+    "Chemo_Before",
+    "Chemo_After",
+    "Recon_Laterality",
+    "Recon_Type",
+    "Recon_Classification",
+    "Recon_Timing",
+    "Stage1_MinorComp",
+    "Stage1_Reoperation",
+    "Stage1_Rehospitalization",
+    "Stage1_MajorComp",
+    "Stage1_Failure",
+    "Stage1_Revision",
+    "Stage2_MinorComp",
+    "Stage2_Reoperation",
+    "Stage2_Rehospitalization",
+    "Stage2_MajorComp",
+    "Stage2_Failure",
+    "Stage2_Revision",
+    "Stage2_Applicable",
+]
 
-    for var, pats in COMORBIDITY_MAP.items():
-        found = False
-        for p in pats:
-            if re.search(p, pmh_text, flags=re.IGNORECASE):
-                found = True
-                break
-        out[var] = "1" if found else "0"
 
-    return out
+def seed_master_from_structured():
+    struct_files = []
+    for g in STRUCT_GLOBS:
+        struct_files.extend(glob(g, recursive=True))
+    struct_files = sorted(set(struct_files))
+
+    mrns = set()
+
+    if struct_files:
+        for fp in struct_files:
+            df = clean_cols(read_csv_robust(fp))
+            df = normalize_mrn(df)
+            mrns.update(df[MERGE_KEY].dropna().astype(str).str.strip().tolist())
+    else:
+        # fallback: seed MRNs from notes if no encounter files found
+        note_files = []
+        for g in NOTE_GLOBS:
+            note_files.extend(glob(g, recursive=True))
+        note_files = sorted(set(note_files))
+
+        if not note_files:
+            raise FileNotFoundError("No structured encounters OR notes found to seed MRNs.")
+
+        for fp in note_files:
+            df = clean_cols(read_csv_robust(fp))
+            df = normalize_mrn(df)
+            mrns.update(df[MERGE_KEY].dropna().astype(str).str.strip().tolist())
+
+    mrns = sorted([m for m in mrns if m])
+    master = pd.DataFrame({MERGE_KEY: mrns})
+
+    # also include ENCRYPTED_PAT_ID column for validation/debugging
+    master["ENCRYPTED_PAT_ID"] = master[MERGE_KEY]
+
+    # build full template columns (blank)
+    for c in MASTER_COLUMNS:
+        if c not in master.columns:
+            master[c] = pd.NA
+
+    # ensure exact output order
+    master = master[MASTER_COLUMNS]
+    return master
 
 
-# ---------------------------------------------------------------------
-# Main build
-# ---------------------------------------------------------------------
-def build_patient_master(encounters_csv, clinic_notes_csv, out_csv):
-    if not os.path.exists(encounters_csv):
-        raise RuntimeError("Encounters CSV not found: %s" % encounters_csv)
-    if not os.path.exists(clinic_notes_csv):
-        raise RuntimeError("Clinic Notes CSV not found: %s" % clinic_notes_csv)
+def load_and_reconstruct_notes():
+    note_files = []
+    for g in NOTE_GLOBS:
+        note_files.extend(glob(g, recursive=True))
+    note_files = sorted(set(note_files))
 
-    print("Loading encounters: %s" % encounters_csv)
-    enc = read_csv_robust(encounters_csv, dtype=str, low_memory=False)
+    if not note_files:
+        raise FileNotFoundError("No HPI11526 * Notes.csv files found via NOTE_GLOBS.")
 
-    print("Loading clinic notes: %s" % clinic_notes_csv)
-    notes = read_csv_robust(clinic_notes_csv, dtype=str, low_memory=False)
+    all_notes_rows = []
 
-    enc_pid_col = find_first_existing_col(enc, ["ENCRYPTED_PAT_ID", "PAT_ID"])
-    notes_pid_col = find_first_existing_col(notes, ["ENCRYPTED_PAT_ID", "PAT_ID"])
-    if not enc_pid_col:
-        raise RuntimeError("Encounters missing patient id (ENCRYPTED_PAT_ID/PAT_ID). Columns: %s" % list(enc.columns))
-    if not notes_pid_col:
-        raise RuntimeError("Clinic notes missing patient id (ENCRYPTED_PAT_ID/PAT_ID). Columns: %s" % list(notes.columns))
+    for fp in note_files:
+        df = clean_cols(read_csv_robust(fp))
+        df = normalize_mrn(df)
 
-    age_col = find_first_existing_col(enc, ["AGE_AT_ENCOUNTER", "AGE"])
-    race_col = find_first_existing_col(enc, ["RACE"])
-    eth_col = find_first_existing_col(enc, ["ETHNICITY"])
+        note_text_col = pick_col(df, ["NOTE_TEXT", "NOTE TEXT", "NOTE_TEXT_FULL", "TEXT", "NOTE"])
+        note_id_col = pick_col(df, ["NOTE_ID", "NOTE ID"])
+        line_col = pick_col(df, ["LINE"], required=False)
+        note_type_col = pick_col(df, ["NOTE_TYPE", "NOTE TYPE"], required=False)
 
-    note_text_col = pick_note_text_col(notes)
-    if not note_text_col:
-        raise RuntimeError("Could not determine note text column from clinic notes. Columns: %s" % list(notes.columns))
+        # For your real schema this will exist:
+        date_col = pick_col(
+            df,
+            ["NOTE_DATE_OF_SERVICE", "NOTE DATE OF SERVICE", "OPERATION_DATE",
+             "ADMIT_DATE", "HOSP_ADMSN_TIME"],
+            required=False
+        )
 
-    samp = notes[note_text_col].fillna("").astype(str).head(2000)
-    avg_len = float(samp.map(len).mean()) if len(samp) else 0.0
-    print("Selected note text column: %s (avg length first 2000 rows = %.1f)" % (note_text_col, avg_len))
+        df[note_text_col] = df[note_text_col].fillna("").astype(str)
+        df[note_id_col] = df[note_id_col].fillna("").astype(str)
 
-    enc["__pid__"] = enc[enc_pid_col].map(norm)
-    notes["__pid__"] = notes[notes_pid_col].map(norm)
+        if line_col:
+            df[line_col] = df[line_col].fillna("").astype(str)
+        if note_type_col:
+            df[note_type_col] = df[note_type_col].fillna("").astype(str)
+        if date_col:
+            df[date_col] = df[date_col].fillna("").astype(str)
 
-    date_col = find_first_existing_col(enc, ["OPERATION_DATE", "DISCHARGE_DATE_DT", "ADMISSION_DATE", "ENC_DATE"])
-    enc_sort = enc.sort_values(by=[date_col]) if date_col else enc
-    enc_first = enc_sort.groupby("__pid__", as_index=False).first()
+        df["_SOURCE_FILE_"] = os.path.basename(fp)
 
-    master = pd.DataFrame()
-    master["ENCRYPTED_PAT_ID"] = enc_first["__pid__"]
+        keep_cols = [MERGE_KEY, note_id_col, note_text_col, "_SOURCE_FILE_"]
+        if line_col:
+            keep_cols.append(line_col)
+        if note_type_col:
+            keep_cols.append(note_type_col)
+        if date_col:
+            keep_cols.append(date_col)
 
-    master["Race"] = enc_first[race_col].map(normalize_race) if race_col else ""
-    master["Ethnicity"] = enc_first[eth_col].map(normalize_ethnicity) if eth_col else ""
-    master["Age"] = enc_first[age_col].map(safe_int_str) if age_col else ""
+        tmp = df[keep_cols].copy()
+        tmp = tmp.rename(columns={
+            note_id_col: "NOTE_ID",
+            note_text_col: "NOTE_TEXT",
+        })
 
-    notes["__text__"] = notes[note_text_col].fillna("").astype(str)
+        if line_col and line_col != "LINE":
+            tmp = tmp.rename(columns={line_col: "LINE"})
+        if note_type_col and note_type_col != "NOTE_TYPE":
+            tmp = tmp.rename(columns={note_type_col: "NOTE_TYPE"})
+        if date_col and date_col != "NOTE_DATE_OF_SERVICE":
+            tmp = tmp.rename(columns={date_col: "NOTE_DATE_OF_SERVICE"})
 
-    grouped_rows = []
-    for pid, g in notes.groupby("__pid__"):
-        texts = g["__text__"].tolist()
-        joined = "\n\n".join(texts[:8])
-        joined = joined[:60000]
-        grouped_rows.append((pid, joined))
+        if "LINE" not in tmp.columns:
+            tmp["LINE"] = ""
+        if "NOTE_TYPE" not in tmp.columns:
+            tmp["NOTE_TYPE"] = ""
+        if "NOTE_DATE_OF_SERVICE" not in tmp.columns:
+            tmp["NOTE_DATE_OF_SERVICE"] = ""
 
-    note_agg = pd.DataFrame(grouped_rows, columns=["ENCRYPTED_PAT_ID", "NOTE_TEXT_ALL"])
-    master = master.merge(note_agg, on="ENCRYPTED_PAT_ID", how="left")
-    master["NOTE_TEXT_ALL"] = master["NOTE_TEXT_ALL"].fillna("")
+        all_notes_rows.append(tmp)
 
-    bmi_list = []
-    smoke_list = []
-    has_pmh = []
+    notes_raw = pd.concat(all_notes_rows, ignore_index=True)
 
-    dm_list = []
-    htn_list = []
-    cardiac_list = []
-    vte_list = []
-    steroid_list = []
+    def join_note(group):
+        tmp = group.copy()
+        tmp["_LINE_NUM_"] = tmp["LINE"].apply(to_int_safe)
+        tmp = tmp.sort_values(by=["_LINE_NUM_"], na_position="last")
+        return "\n".join(tmp["NOTE_TEXT"].tolist()).strip()
 
-    for txt in master["NOTE_TEXT_ALL"].tolist():
-        bmi_list.append(extract_bmi(txt))
-        smoke_list.append(extract_smoking_status(txt))
+    reconstructed = []
+    grouped = notes_raw.groupby([MERGE_KEY, "NOTE_ID"], dropna=False)
 
-        com = detect_comorbidities(txt)
-        dm_list.append(com.get("Diabetes", "0"))
-        htn_list.append(com.get("Hypertension", "0"))
-        cardiac_list.append(com.get("CardiacDisease", "0"))
-        vte_list.append(com.get("VenousThromboembolism", "0"))
-        steroid_list.append(com.get("Steroid", "0"))
+    for (mrn, nid), g in grouped:
+        mrn = str(mrn).strip()
+        nid = str(nid).strip()
 
-        pmh_chunks = extract_pmh_chunks(txt)
-        has_pmh.append("1" if pmh_chunks else "0")
+        if not nid:
+            continue
 
-    master["BMI"] = bmi_list
-    master["SmokingStatus"] = smoke_list
+        full_text = join_note(g)
+        if not full_text:
+            continue
 
-    master["Diabetes"] = dm_list
-    master["Hypertension"] = htn_list
-    master["CardiacDisease"] = cardiac_list
-    master["VenousThromboembolism"] = vte_list
-    master["Steroid"] = steroid_list
-    master["HAS_NOTE_PMH"] = has_pmh
+        if g["NOTE_TYPE"].astype(str).str.strip().any():
+            note_type = g["NOTE_TYPE"].astype(str).iloc[0]
+        else:
+            note_type = g["_SOURCE_FILE_"].astype(str).iloc[0]
 
-    def pct_nonempty(series):
-        vals = series.map(norm)
-        non = sum([1 for v in vals.tolist() if v != ""])
-        return 100.0 * float(non) / float(len(vals)) if len(vals) else 0.0
+        if g["NOTE_DATE_OF_SERVICE"].astype(str).str.strip().any():
+            note_date = g["NOTE_DATE_OF_SERVICE"].astype(str).iloc[0]
+        else:
+            note_date = ""
 
-    # FIX: escape the literal percent sign as %%
-    print("Non-empty %%: Age=%.1f  BMI=%.1f  SmokingStatus=%.1f  PMH=%.1f" % (
-        pct_nonempty(master["Age"]),
-        pct_nonempty(master["BMI"]),
-        pct_nonempty(master["SmokingStatus"]),
-        pct_nonempty(master["HAS_NOTE_PMH"])
-    ))
+        reconstructed.append({
+            MERGE_KEY: mrn,
+            "NOTE_ID": nid,
+            "NOTE_TYPE": note_type,
+            "NOTE_DATE": note_date,
+            "SOURCE_FILE": g["_SOURCE_FILE_"].astype(str).iloc[0],
+            "NOTE_TEXT": full_text
+        })
 
-    out_dir = os.path.dirname(out_csv)
-    if out_dir and (not os.path.exists(out_dir)):
-        os.makedirs(out_dir)
-
-    print("Writing: %s" % out_csv)
-    master.to_csv(out_csv, index=False)
-    print("Done.")
-    print("Rows: %d" % len(master))
-    print("Patients with any note-derived PMH: %d" % sum([1 for x in master["HAS_NOTE_PMH"].tolist() if x == "1"]))
+    return pd.DataFrame(reconstructed)
 
 
 def main():
-    build_patient_master(ENCOUNTERS_CSV, CLINIC_NOTES_CSV, OUT_CSV)
+    print("Seeding clean master WITHOUT gold...")
+    master = seed_master_from_structured()
+    master = normalize_mrn(master)
+
+    # keep ENCRYPTED_PAT_ID populated with MRN for validation/debugging
+    if "ENCRYPTED_PAT_ID" in master.columns:
+        master["ENCRYPTED_PAT_ID"] = master["MRN"].astype(str).str.strip()
+
+    print("Master seeded: {0} MRNs".format(len(master)))
+
+    print("Loading & reconstructing notes...")
+    notes_df = load_and_reconstruct_notes()
+    print("Reconstructed notes: {0}".format(len(notes_df)))
+
+    print("Running rule-based extractors...")
+    extractor_fns = [
+        extract_age,
+        extract_bmi,
+        extract_smoking,
+        extract_comorbidities,
+        extract_pbs,
+        extract_mastectomy,
+        extract_cancer_treatment,
+    ]
+
+    best_by_mrn = {}
+    evidence_rows = []
+
+    for _, row in notes_df.iterrows():
+        mrn = str(row[MERGE_KEY]).strip()
+
+        snote = build_sectioned_note(
+            note_text=row["NOTE_TEXT"],
+            note_type=row["NOTE_TYPE"],
+            note_id=row["NOTE_ID"],
+            note_date=row["NOTE_DATE"]
+        )
+
+        all_cands = []
+
+        for fn in extractor_fns:
+            try:
+                all_cands.extend(fn(snote))
+            except Exception as e:
+                evidence_rows.append({
+                    MERGE_KEY: mrn,
+                    "NOTE_ID": row["NOTE_ID"],
+                    "NOTE_DATE": row["NOTE_DATE"],
+                    "NOTE_TYPE": row["NOTE_TYPE"],
+                    "FIELD": "EXTRACTOR_ERROR",
+                    "VALUE": "",
+                    "STATUS": "",
+                    "CONFIDENCE": "",
+                    "SECTION": "",
+                    "EVIDENCE": "{0} failed: {1}".format(fn.__name__, repr(e))
+                })
+
+        if not all_cands:
+            continue
+
+        if mrn not in best_by_mrn:
+            best_by_mrn[mrn] = {}
+
+        for c in all_cands:
+            logical = FIELD_MAP.get(str(c.field))
+            if not logical:
+                continue
+
+            evidence_rows.append({
+                MERGE_KEY: mrn,
+                "NOTE_ID": getattr(c, "note_id", row["NOTE_ID"]),
+                "NOTE_DATE": getattr(c, "note_date", row["NOTE_DATE"]),
+                "NOTE_TYPE": getattr(c, "note_type", row["NOTE_TYPE"]),
+                "FIELD": logical,
+                "VALUE": getattr(c, "value", ""),
+                "STATUS": getattr(c, "status", ""),
+                "CONFIDENCE": getattr(c, "confidence", ""),
+                "SECTION": getattr(c, "section", ""),
+                "EVIDENCE": getattr(c, "evidence", "")
+            })
+
+            existing = best_by_mrn[mrn].get(logical)
+            if logical in BOOLEAN_FIELDS:
+                best_by_mrn[mrn][logical] = merge_boolean(existing, c)
+            else:
+                best_by_mrn[mrn][logical] = choose_best(existing, c)
+
+    print("Aggregated predictions for {0} MRNs".format(len(best_by_mrn)))
+
+    # Apply predictions to master
+    for mrn, fields in best_by_mrn.items():
+        mask = (master[MERGE_KEY].astype(str).str.strip() == mrn)
+        if not mask.any():
+            continue
+
+        for logical, cand in fields.items():
+            val = getattr(cand, "value", pd.NA)
+
+            if logical in BOOLEAN_FIELDS:
+                try:
+                    val = 1 if bool(val) else 0
+                except Exception:
+                    val = pd.NA
+
+            # obesity derived if BMI >= 30
+            if logical == "BMI" and not pd.isna(val):
+                try:
+                    master.loc[mask, "BMI"] = float(val)
+                    master.loc[mask, "Obesity"] = 1 if float(val) >= 30.0 else 0
+                except Exception:
+                    master.loc[mask, "BMI"] = pd.NA
+                continue
+
+            # map to exact column names (they match)
+            if logical in master.columns:
+                master.loc[mask, logical] = val
+            else:
+                # should not happen, but safe
+                master[logical] = pd.NA
+                master.loc[mask, logical] = val
+
+    os.makedirs(os.path.dirname(OUTPUT_MASTER), exist_ok=True)
+    master.to_csv(OUTPUT_MASTER, index=False)
+    pd.DataFrame(evidence_rows).to_csv(OUTPUT_EVID, index=False)
+
+    print("\nDONE.")
+    print("- Master (NO GOLD): {0}".format(OUTPUT_MASTER))
+    print("- Evidence: {0}".format(OUTPUT_EVID))
+    print("\nRun:")
+    print(" python build_master_rule_FINAL_NO_GOLD.py")
+
 
 if __name__ == "__main__":
     main()
