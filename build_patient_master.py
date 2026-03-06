@@ -523,15 +523,12 @@ def load_structured_encounters():
         race_col = pick_col(df, ["RACE", "Race"], required=False)
         eth_col = pick_col(df, ["ETHNICITY", "Ethnicity"], required=False)
         age_col = pick_col(df, ["AGE_AT_ENCOUNTER", "Age_at_encounter", "AGE"], required=False)
-        # clinic-specific useful dates
         admit_col = pick_col(df, ["ADMIT_DATE", "Admit_Date"], required=False)
         recon_col = pick_col(df, ["RECONSTRUCTION_DATE", "RECONSTRUCTION DATE"], required=False)
-        # fallback / other useful fields
-        date_col = pick_col(
-            df,
-            ["OPERATION_DATE", "CHECKOUT_TIME", "DISCHARGE_DATE_DT"],
-            required=False
-        )
+        cpt_col = pick_col(df, ["CPT_CODE", "CPT CODE", "CPT"], required=False)
+        proc_col = pick_col(df, ["PROCEDURE", "Procedure"], required=False)
+        reason_col = pick_col(df, ["REASON_FOR_VISIT", "REASON FOR VISIT"], required=False)
+        date_col = pick_col(df, ["OPERATION_DATE", "CHECKOUT_TIME", "DISCHARGE_DATE_DT"], required=False)
 
         out = pd.DataFrame()
         out[MERGE_KEY] = df[MERGE_KEY].astype(str).str.strip()
@@ -543,13 +540,17 @@ def load_structured_encounters():
         out["AGE_AT_ENCOUNTER_STRUCT"] = df[age_col].astype(str) if age_col else ""
         out["ADMIT_DATE_STRUCT"] = df[admit_col].astype(str) if admit_col else ""
         out["RECONSTRUCTION_DATE_STRUCT"] = df[recon_col].astype(str) if recon_col else ""
+        out["CPT_CODE_STRUCT"] = df[cpt_col].astype(str) if cpt_col else ""
+        out["PROCEDURE_STRUCT"] = df[proc_col].astype(str) if proc_col else ""
+        out["REASON_FOR_VISIT_STRUCT"] = df[reason_col].astype(str) if reason_col else ""
         rows.append(out)
 
     if not rows:
         return pd.DataFrame(columns=[
             MERGE_KEY, "STRUCT_SOURCE", "STRUCT_PRIORITY", "STRUCT_DATE_RAW",
             "RACE_STRUCT", "ETHNICITY_STRUCT", "AGE_AT_ENCOUNTER_STRUCT",
-            "ADMIT_DATE_STRUCT", "RECONSTRUCTION_DATE_STRUCT"
+            "ADMIT_DATE_STRUCT", "RECONSTRUCTION_DATE_STRUCT",
+            "CPT_CODE_STRUCT", "PROCEDURE_STRUCT", "REASON_FOR_VISIT_STRUCT"
         ])
 
     struct_df = pd.concat(rows, ignore_index=True)
@@ -672,7 +673,7 @@ def choose_race_us_categories(struct_df):
     return out
 
 
-# ---------- Age logic from clinic encounter row ----------
+# ---------- Age logic from clinic encounter row with correct CPT selection ----------
 def choose_best_clinic_age_rows(struct_df):
     age_best = {}
 
@@ -683,23 +684,21 @@ def choose_best_clinic_age_rows(struct_df):
     if len(clinic_df) == 0:
         return age_best
 
-    # Preferred reconstruction anchor CPTs
     preferred_cpts = set([
         "19357",  # tissue expander placement
         "19340",  # immediate implant
         "19342",  # delayed implant
         "19361",  # latissimus flap
-        "19364",  # free flap / DIEP / TRAM
+        "19364",  # free flap
         "19367",  # TRAM flap
         "S2068"   # DIEP / SIEA flap
     ])
 
-    # CPTs we do NOT want as the primary age anchor
     exclude_cpts = set([
         "19350",  # nipple / areola reconstruction
-        "19380",  # revision of reconstructed breast
+        "19380",  # revision
         "19325",  # augmentation
-        "19330"   # implant replacement / removal-related anchor not preferred here
+        "19330"   # implant replacement / removal-related
     ])
 
     for _, row in clinic_df.iterrows():
@@ -712,6 +711,7 @@ def choose_best_clinic_age_rows(struct_df):
 
         admit_date = parse_date_safe(row.get("ADMIT_DATE_STRUCT", ""))
         recon_date = parse_date_safe(row.get("RECONSTRUCTION_DATE_STRUCT", ""))
+
         cpt_code = clean_cell(row.get("CPT_CODE_STRUCT", "")).upper()
         procedure = clean_cell(row.get("PROCEDURE_STRUCT", "")).lower()
         reason_for_visit = clean_cell(row.get("REASON_FOR_VISIT_STRUCT", "")).lower()
@@ -719,16 +719,14 @@ def choose_best_clinic_age_rows(struct_df):
         if age_base is None or admit_date is None or recon_date is None:
             continue
 
-        # Skip rows that are clearly not the primary reconstruction anchor
         if cpt_code in exclude_cpts:
             continue
 
-        # Prefer true reconstruction anchor procedures
         is_preferred = False
+
         if cpt_code in preferred_cpts:
             is_preferred = True
 
-        # Small backup in case CPT is messy but procedure text is clearly reconstructive
         if not is_preferred:
             if (
                 ("tissue expander" in procedure) or
@@ -751,12 +749,8 @@ def choose_best_clinic_age_rows(struct_df):
         age_floor = int(math.floor(adjusted_age))
         age_round = int(math.floor(adjusted_age + 0.5))
 
-        # Choose earliest valid reconstruction anchor row for that MRN
-        # If recon dates tie, use earliest admit date
-        score = (
-            recon_date,
-            admit_date
-        )
+        # choose earliest valid reconstruction anchor row
+        score = (recon_date, admit_date)
 
         current_best = age_best.get(mrn)
 
@@ -776,17 +770,11 @@ def choose_best_clinic_age_rows(struct_df):
             }
 
     return age_best
+
+
 def enrich_master_with_structured_demo(master, notes_df, evidence_rows):
     print("Loading structured encounters for Race / Ethnicity / Age...")
-    struct_df = load_structured_encounters(
-        cpt_col = pick_col(df, ["CPT_CODE", "CPT CODE", "CPT"], required=False)
-        proc_col = pick_col(df, ["PROCEDURE", "Procedure"], required=False)
-        reason_col = pick_col(df, ["REASON_FOR_VISIT", "REASON FOR VISIT"], required=False)
-
-        out["CPT_CODE_STRUCT"] = df[cpt_col].astype(str) if cpt_col else ""
-        out["PROCEDURE_STRUCT"] = df[proc_col].astype(str) if proc_col else ""
-        out["REASON_FOR_VISIT_STRUCT"] = df[reason_col].astype(str) if reason_col else ""
-    )
+    struct_df = load_structured_encounters()
     print("Structured encounter rows: {0}".format(len(struct_df)))
 
     race_map = choose_race_us_categories(struct_df)
@@ -840,15 +828,15 @@ def enrich_master_with_structured_demo(master, notes_df, evidence_rows):
             age_round = age_info.get("value_round")
 
             # final stored value: round
-            final_age = age_floor if age_floor is not None else age_round
+            final_age = age_round if age_round is not None else age_floor
 
             if final_age is not None:
                 master.loc[mask, "Age"] = final_age
 
                 ev = (
-                    "Age from clinic encounter row using AGE_AT_ENCOUNTER + ADMIT_DATE + RECONSTRUCTION_DATE | "
+                    "Age from clinic encounter row using AGE_AT_ENCOUNTER + ADMIT_DATE + RECONSTRUCTION_DATE with preferred reconstruction CPT selection | "
                     "AGE_AT_ENCOUNTER={0} | ADMIT_DATE={1} | RECONSTRUCTION_DATE={2} | DAY_DIFF={3} | "
-                    "AGE_FLOOR={4} | AGE_ROUND={5} | FINAL_USED={6}"
+                    "AGE_FLOOR={4} | AGE_ROUND={5} | FINAL_USED={6} | CPT_CODE={7} | PROCEDURE={8} | REASON_FOR_VISIT={9}"
                 ).format(
                     age_info.get("age_at_encounter", ""),
                     age_info.get("admit_date", ""),
@@ -856,7 +844,10 @@ def enrich_master_with_structured_demo(master, notes_df, evidence_rows):
                     age_info.get("day_diff", ""),
                     age_floor,
                     age_round,
-                    final_age
+                    final_age,
+                    age_info.get("cpt_code", ""),
+                    age_info.get("procedure", ""),
+                    age_info.get("reason_for_visit", "")
                 )
 
                 evidence_rows.append({
