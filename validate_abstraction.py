@@ -282,6 +282,24 @@ def compute_numeric_metrics(pred, gold, tolerance=None):
     accuracy = float(matches) / float(total)
     return accuracy, int(matches), int(total)
 
+def compute_age_floor_round_metrics(pred, gold):
+    pred = normalize_numeric(pred)
+    gold = normalize_numeric(gold)
+
+    mask = gold.notna()
+    pred = pred[mask]
+    gold = gold[mask]
+
+    total = len(gold)
+    if total == 0:
+        return 0.0, 0, 0
+
+    matches = ((gold == pred) | (gold == pred - 1) | (gold == pred + 1)).sum()
+    accuracy = float(matches) / float(total)
+
+    return accuracy, int(matches), int(total)
+
+
 
 # ---------------------------------------------------
 # Main
@@ -345,8 +363,8 @@ def main():
             acc, matches, total = compute_binary_metrics(pred, goldv)
 
         elif v == "Age":
-            acc, matches, total = compute_numeric_metrics(pred, goldv, tolerance=0)
-
+            acc, matches, total = compute_age_floor_round_metrics(pred, goldv)
+            
         elif v == "BMI":
             acc, matches, total = compute_numeric_metrics(pred, goldv, tolerance=0.2)
 
