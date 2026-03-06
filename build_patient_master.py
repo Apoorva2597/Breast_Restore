@@ -683,6 +683,25 @@ def choose_best_clinic_age_rows(struct_df):
     if len(clinic_df) == 0:
         return age_best
 
+    # Preferred reconstruction anchor CPTs
+    preferred_cpts = set([
+        "19357",  # tissue expander placement
+        "19340",  # immediate implant
+        "19342",  # delayed implant
+        "19361",  # latissimus flap
+        "19364",  # free flap / DIEP / TRAM
+        "19367",  # TRAM flap
+        "S2068"   # DIEP / SIEA flap
+    ])
+
+    # CPTs we do NOT want as the primary age anchor
+    exclude_cpts = set([
+        "19350",  # nipple / areola reconstruction
+        "19380",  # revision of reconstructed breast
+        "19325",  # augmentation
+        "19330"   # implant replacement / removal-related anchor not preferred here
+    ])
+
     for _, row in clinic_df.iterrows():
         mrn = clean_cell(row.get(MERGE_KEY, ""))
         if not mrn:
@@ -693,8 +712,37 @@ def choose_best_clinic_age_rows(struct_df):
 
         admit_date = parse_date_safe(row.get("ADMIT_DATE_STRUCT", ""))
         recon_date = parse_date_safe(row.get("RECONSTRUCTION_DATE_STRUCT", ""))
+        cpt_code = clean_cell(row.get("CPT_CODE_STRUCT", "")).upper()
+        procedure = clean_cell(row.get("PROCEDURE_STRUCT", "")).lower()
+        reason_for_visit = clean_cell(row.get("REASON_FOR_VISIT_STRUCT", "")).lower()
 
         if age_base is None or admit_date is None or recon_date is None:
+            continue
+
+        # Skip rows that are clearly not the primary reconstruction anchor
+        if cpt_code in exclude_cpts:
+            continue
+
+        # Prefer true reconstruction anchor procedures
+        is_preferred = False
+        if cpt_code in preferred_cpts:
+            is_preferred = True
+
+        # Small backup in case CPT is messy but procedure text is clearly reconstructive
+        if not is_preferred:
+            if (
+                ("tissue expander" in procedure) or
+                ("breast recon" in procedure) or
+                ("implant on same day of mastectomy" in procedure) or
+                ("insert or replcmnt breast implnt on sep day from mastectomy" in procedure) or
+                ("latissimus" in procedure) or
+                ("diep" in procedure) or
+                ("tram" in procedure) or
+                ("flap" in procedure)
+            ):
+                is_preferred = True
+
+        if not is_preferred:
             continue
 
         day_diff = (recon_date - admit_date).days
@@ -703,9 +751,12 @@ def choose_best_clinic_age_rows(struct_df):
         age_floor = int(math.floor(adjusted_age))
         age_round = int(math.floor(adjusted_age + 0.5))
 
-        # choose the clinic encounter row closest to reconstruction date
-        # smaller absolute day difference = better row
-        score = abs(day_diff)
+        # Choose earliest valid reconstruction anchor row for that MRN
+        # If recon dates tie, use earliest admit date
+        score = (
+            recon_date,
+            admit_date
+        )
 
         current_best = age_best.get(mrn)
 
@@ -718,14 +769,24 @@ def choose_best_clinic_age_rows(struct_df):
                 "value_floor": age_floor,
                 "value_round": age_round,
                 "score": score,
-                "source": row.get("STRUCT_SOURCE", "")
+                "source": row.get("STRUCT_SOURCE", ""),
+                "cpt_code": cpt_code,
+                "procedure": clean_cell(row.get("PROCEDURE_STRUCT", "")),
+                "reason_for_visit": clean_cell(row.get("REASON_FOR_VISIT_STRUCT", ""))
             }
 
     return age_best
-
 def enrich_master_with_structured_demo(master, notes_df, evidence_rows):
     print("Loading structured encounters for Race / Ethnicity / Age...")
-    struct_df = load_structured_encounters()
+    struct_df = load_structured_encounters(
+        cpt_col = pick_col(df, ["CPT_CODE", "CPT CODE", "CPT"], required=False)
+        proc_col = pick_col(df, ["PROCEDURE", "Procedure"], required=False)
+        reason_col = pick_col(df, ["REASON_FOR_VISIT", "REASON FOR VISIT"], required=False)
+
+        out["CPT_CODE_STRUCT"] = df[cpt_col].astype(str) if cpt_col else ""
+        out["PROCEDURE_STRUCT"] = df[proc_col].astype(str) if proc_col else ""
+        out["REASON_FOR_VISIT_STRUCT"] = df[reason_col].astype(str) if reason_col else ""
+    )
     print("Structured encounter rows: {0}".format(len(struct_df)))
 
     race_map = choose_race_us_categories(struct_df)
