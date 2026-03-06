@@ -557,7 +557,6 @@ def load_structured_encounters():
     return struct_df
 
 
-# ---------- Race normalization to US-style categories ----------
 def normalize_race_token(x):
     s = clean_cell(x).lower()
     if not s:
@@ -673,14 +672,13 @@ def choose_race_us_categories(struct_df):
     return out
 
 
-# ---------- Age logic from clinic encounter row with correct CPT selection ----------
+# ---------- Age logic with clinic->operation->inpatient priority and fallback CPTs ----------
 def choose_best_clinic_age_rows(struct_df):
     age_best = {}
 
     if len(struct_df) == 0:
         return age_best
 
-    # source priority: clinic first, then operation, then inpatient
     source_priority = {
         "clinic": 1,
         "operation": 2,
@@ -706,13 +704,14 @@ def choose_best_clinic_age_rows(struct_df):
         "19350",  # nipple / areola reconstruction
         "19380"   # revision
     ])
-    
-        # For each MRN, check whether any preferred reconstruction CPT exists.
-    # If yes, use only preferred anchors.
-    # If no, allow fallback CPTs (19350 / 19380).
+
+    eligible_sources = struct_df[struct_df["STRUCT_SOURCE"].isin(["clinic", "operation", "inpatient"])].copy()
+    if len(eligible_sources) == 0:
+        return age_best
+
     has_preferred_cpt = {}
 
-    for mrn, g in clinic_df.groupby(MERGE_KEY):
+    for mrn, g in eligible_sources.groupby(MERGE_KEY):
         found = False
         for val in g["CPT_CODE_STRUCT"].fillna("").astype(str).tolist():
             cpt = clean_cell(val).upper()
@@ -720,8 +719,8 @@ def choose_best_clinic_age_rows(struct_df):
                 found = True
                 break
         has_preferred_cpt[mrn] = found
-        
-    for _, row in struct_df.iterrows():
+
+    for _, row in eligible_sources.iterrows():
         mrn = clean_cell(row.get(MERGE_KEY, ""))
         if not mrn:
             continue
@@ -743,26 +742,20 @@ def choose_best_clinic_age_rows(struct_df):
         if age_base is None or admit_date is None or recon_date is None:
             continue
 
-                # Always exclude truly non-anchor CPTs
         if cpt_code in primary_exclude_cpts:
             continue
 
-        # If this patient has a preferred reconstruction CPT anywhere,
-        # do not use fallback-only CPTs like 19350 / 19380
         if has_preferred_cpt.get(mrn, False) and cpt_code in fallback_allowed_cpts:
             continue
 
         is_anchor = False
 
-        # Preferred reconstruction anchors
         if cpt_code in preferred_cpts:
             is_anchor = True
 
-        # Fallback-only anchors, used only when no preferred CPT exists for the patient
         if (not has_preferred_cpt.get(mrn, False)) and (cpt_code in fallback_allowed_cpts):
             is_anchor = True
 
-        # Backup procedure-text matching for preferred anchors
         if not is_anchor:
             if (
                 ("tissue expander" in procedure) or
@@ -785,7 +778,6 @@ def choose_best_clinic_age_rows(struct_df):
         age_floor = int(math.floor(adjusted_age))
         age_round = int(math.floor(adjusted_age + 0.5))
 
-        # source priority first, then earliest reconstruction date, then earliest admit date
         score = (
             source_priority[source],
             recon_date,
@@ -811,6 +803,7 @@ def choose_best_clinic_age_rows(struct_df):
 
     return age_best
 
+
 def enrich_master_with_structured_demo(master, notes_df, evidence_rows):
     print("Loading structured encounters for Race / Ethnicity / Age...")
     struct_df = load_structured_encounters()
@@ -822,7 +815,7 @@ def enrich_master_with_structured_demo(master, notes_df, evidence_rows):
 
     print("Structured race values found for MRNs: {0}".format(len(race_map)))
     print("Structured ethnicity values found for MRNs: {0}".format(len(eth_map)))
-    print("Structured clinic-based age rows found for MRNs: {0}".format(len(age_map)))
+    print("Structured encounter-based age rows found for MRNs: {0}".format(len(age_map)))
 
     for mrn in master[MERGE_KEY].astype(str).str.strip().tolist():
         mask = (master[MERGE_KEY].astype(str).str.strip() == mrn)
@@ -866,16 +859,15 @@ def enrich_master_with_structured_demo(master, notes_df, evidence_rows):
             age_floor = age_info.get("value_floor")
             age_round = age_info.get("value_round")
 
-            # final stored value: round
             final_age = age_round if age_round is not None else age_floor
 
             if final_age is not None:
                 master.loc[mask, "Age"] = final_age
 
                 ev = (
-                    "Age from clinic encounter row using AGE_AT_ENCOUNTER + ADMIT_DATE + RECONSTRUCTION_DATE with preferred reconstruction CPT selection | "
+                    "Age from structured encounter row using AGE_AT_ENCOUNTER + ADMIT_DATE + RECONSTRUCTION_DATE with source priority and fallback CPT logic | "
                     "AGE_AT_ENCOUNTER={0} | ADMIT_DATE={1} | RECONSTRUCTION_DATE={2} | DAY_DIFF={3} | "
-                    "AGE_FLOOR={4} | AGE_ROUND={5} | FINAL_USED={6} | CPT_CODE={7} | PROCEDURE={8} | REASON_FOR_VISIT={9}"
+                    "AGE_FLOOR={4} | AGE_ROUND={5} | FINAL_USED={6} | SOURCE={7} | CPT_CODE={8} | PROCEDURE={9} | REASON_FOR_VISIT={10}"
                 ).format(
                     age_info.get("age_at_encounter", ""),
                     age_info.get("admit_date", ""),
@@ -884,6 +876,7 @@ def enrich_master_with_structured_demo(master, notes_df, evidence_rows):
                     age_floor,
                     age_round,
                     final_age,
+                    age_info.get("source", ""),
                     age_info.get("cpt_code", ""),
                     age_info.get("procedure", ""),
                     age_info.get("reason_for_visit", "")
@@ -893,7 +886,7 @@ def enrich_master_with_structured_demo(master, notes_df, evidence_rows):
                     MERGE_KEY: mrn,
                     "NOTE_ID": "",
                     "NOTE_DATE": age_info.get("admit_date", ""),
-                    "NOTE_TYPE": "STRUCTURED_CLINIC_RECON_ROW",
+                    "NOTE_TYPE": "STRUCTURED_ENCOUNTER_RECON_ROW",
                     "FIELD": "Age",
                     "VALUE": final_age,
                     "STATUS": "structured_fill",
@@ -921,7 +914,6 @@ def main():
 
     evidence_rows = []
 
-    # Structured fill first: Race / Ethnicity / Age
     master, evidence_rows = enrich_master_with_structured_demo(master, notes_df, evidence_rows)
 
     print("Running rule-based extractors...")
