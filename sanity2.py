@@ -1,18 +1,35 @@
 import pandas as pd
 
-master = pd.read_csv("_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv", dtype=str)
-gold = pd.read_csv("gold_cleaned_for_cedar.csv", dtype=str)
+mrn = input("Enter MRN: ").strip()
 
-master["MRN"] = master["MRN"].astype(str).str.strip()
-gold["MRN"] = gold["MRN"].astype(str).str.strip()
+def read_csv_safe(path):
+    try:
+        return pd.read_csv(path, dtype=str)
+    except:
+        return pd.read_csv(path, dtype=str, encoding="latin1")
 
-df = master.merge(gold, on="MRN", suffixes=("_pred", "_gold"))
+clinic = read_csv_safe("/home/apokol/Breast_Restore/_staging_inputs/HPI11526 Clinic Encounters.csv")
+opnotes = read_csv_safe("/home/apokol/Breast_Restore/_staging_inputs/HPI11526 Operation Notes.csv")
 
-pred = pd.to_numeric(df["Age_pred"], errors="coerce")
-gold_age = pd.to_numeric(df["Age_gold"], errors="coerce")
+clinic.columns=[str(c).strip() for c in clinic.columns]
+opnotes.columns=[str(c).strip() for c in opnotes.columns]
 
-mask = gold_age.notna()
-mismatch = df[mask & ~((gold_age == pred) | (gold_age == pred - 1) | (gold_age == pred + 1))].copy()
+clinic["MRN"]=clinic["MRN"].astype(str).str.strip()
+opnotes["MRN"]=opnotes["MRN"].astype(str).str.strip()
 
-print(mismatch[["MRN", "Age_gold", "Age_pred"]].to_string(index=False))
-print("\nTotal remaining mismatches:", len(mismatch))
+c=clinic[clinic["MRN"]==mrn]
+o=opnotes[opnotes["MRN"]==mrn]
+
+print("\n=== CLINIC ENCOUNTERS ===")
+if len(c)==0:
+    print("No clinic rows found")
+else:
+    cols=[x for x in ["MRN","AGE_AT_ENCOUNTER","ADMIT_DATE","RECONSTRUCTION_DATE","CPT_CODE","PROCEDURE","REASON_FOR_VISIT"] if x in c.columns]
+    print(c[cols].fillna("").to_string(index=False))
+
+print("\n=== OPERATION NOTES ===")
+if len(o)==0:
+    print("No operation notes found")
+else:
+    cols=[x for x in ["MRN","NOTE_ID","NOTE_TYPE","NOTE_DATE_OF_SERVICE"] if x in o.columns]
+    print(o[cols].drop_duplicates().fillna("").to_string(index=False))
