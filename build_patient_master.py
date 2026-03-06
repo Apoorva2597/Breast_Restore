@@ -703,11 +703,13 @@ def choose_best_clinic_age_rows(struct_df):
         age_floor = int(math.floor(adjusted_age))
         age_round = int(math.floor(adjusted_age + 0.5))
 
-        # choose row whose admit date is closest to reconstruction date
+        # choose the clinic encounter row closest to reconstruction date
+        # smaller absolute day difference = better row
         score = abs(day_diff)
 
-        cur = age_best.get(mrn)
-        if cur is None or score < cur["score"]:
+        current_best = age_best.get(mrn)
+
+        if current_best is None or score < current_best["score"]:
             age_best[mrn] = {
                 "age_at_encounter": age_raw,
                 "admit_date": admit_date.strftime("%Y-%m-%d"),
@@ -720,7 +722,6 @@ def choose_best_clinic_age_rows(struct_df):
             }
 
     return age_best
-
 
 def enrich_master_with_structured_demo(master, notes_df, evidence_rows):
     print("Loading structured encounters for Race / Ethnicity / Age...")
