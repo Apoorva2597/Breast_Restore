@@ -697,13 +697,30 @@ def choose_best_clinic_age_rows(struct_df):
         "S2068"   # DIEP / SIEA flap
     ])
 
-    exclude_cpts = set([
-        "19350",  # nipple / areola reconstruction
-        "19380",  # revision
+    primary_exclude_cpts = set([
         "19325",  # augmentation
         "19330"   # implant replacement / removal-related
     ])
 
+    fallback_allowed_cpts = set([
+        "19350",  # nipple / areola reconstruction
+        "19380"   # revision
+    ])
+    
+        # For each MRN, check whether any preferred reconstruction CPT exists.
+    # If yes, use only preferred anchors.
+    # If no, allow fallback CPTs (19350 / 19380).
+    has_preferred_cpt = {}
+
+    for mrn, g in clinic_df.groupby(MERGE_KEY):
+        found = False
+        for val in g["CPT_CODE_STRUCT"].fillna("").astype(str).tolist():
+            cpt = clean_cell(val).upper()
+            if cpt in preferred_cpts:
+                found = True
+                break
+        has_preferred_cpt[mrn] = found
+        
     for _, row in struct_df.iterrows():
         mrn = clean_cell(row.get(MERGE_KEY, ""))
         if not mrn:
@@ -726,15 +743,27 @@ def choose_best_clinic_age_rows(struct_df):
         if age_base is None or admit_date is None or recon_date is None:
             continue
 
-        if cpt_code in exclude_cpts:
+                # Always exclude truly non-anchor CPTs
+        if cpt_code in primary_exclude_cpts:
             continue
 
-        is_preferred = False
+        # If this patient has a preferred reconstruction CPT anywhere,
+        # do not use fallback-only CPTs like 19350 / 19380
+        if has_preferred_cpt.get(mrn, False) and cpt_code in fallback_allowed_cpts:
+            continue
 
+                is_anchor = False
+
+        # Preferred reconstruction anchors
         if cpt_code in preferred_cpts:
-            is_preferred = True
+            is_anchor = True
 
-        if not is_preferred:
+        # Fallback-only anchors, used only when no preferred CPT exists for the patient
+        if (not has_preferred_cpt.get(mrn, False)) and (cpt_code in fallback_allowed_cpts):
+            is_anchor = True
+
+        # Backup procedure-text matching for preferred anchors
+        if not is_anchor:
             if (
                 ("tissue expander" in procedure) or
                 ("breast recon" in procedure) or
@@ -745,9 +774,9 @@ def choose_best_clinic_age_rows(struct_df):
                 ("tram" in procedure) or
                 ("flap" in procedure)
             ):
-                is_preferred = True
+                is_anchor = True
 
-        if not is_preferred:
+        if not is_anchor:
             continue
 
         day_diff = (recon_date - admit_date).days
