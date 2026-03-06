@@ -2,12 +2,14 @@
 # -*- coding: utf-8 -*-
 
 """
-qa_age_mismatches.py
+qa_age_remaining_mismatches.py
 
-Builds a QA file for patients whose predicted Age does not match gold Age.
+Find age mismatches that remain even after allowing:
+gold_age == pred_age OR pred_age-1 OR pred_age+1
+
 Outputs:
-1) _outputs/qa_age_mismatches_summary.csv
-2) _outputs/qa_age_mismatches_notes.csv
+1) _outputs/qa_age_remaining_mismatches_summary.csv
+2) _outputs/qa_age_remaining_mismatches_notes.csv
 
 Python 3.6.8 compatible
 """
@@ -19,16 +21,15 @@ BASE_DIR = "/home/apokol/Breast_Restore"
 
 MASTER_FILE = os.path.join(BASE_DIR, "_outputs", "master_abstraction_rule_FINAL_NO_GOLD.csv")
 GOLD_FILE = os.path.join(BASE_DIR, "gold_cleaned_for_cedar.csv")
-EVID_FILE = os.path.join(BASE_DIR, "_outputs", "rule_hit_evidence_FINAL_NO_GOLD.csv")
-
 NOTE_FILES = [
     os.path.join(BASE_DIR, "_staging_inputs", "HPI11526 Clinic Notes.csv"),
     os.path.join(BASE_DIR, "_staging_inputs", "HPI11526 Inpatient Notes.csv"),
     os.path.join(BASE_DIR, "_staging_inputs", "HPI11526 Operation Notes.csv"),
 ]
+CLINIC_ENC_FILE = os.path.join(BASE_DIR, "_staging_inputs", "HPI11526 Clinic Encounters.csv")
 
-OUT_SUMMARY = os.path.join(BASE_DIR, "_outputs", "qa_age_mismatches_summary.csv")
-OUT_NOTES = os.path.join(BASE_DIR, "_outputs", "qa_age_mismatches_notes.csv")
+OUT_SUMMARY = os.path.join(BASE_DIR, "_outputs", "qa_age_remaining_mismatches_summary.csv")
+OUT_NOTES = os.path.join(BASE_DIR, "_outputs", "qa_age_remaining_mismatches_notes.csv")
 
 MRN = "MRN"
 
@@ -45,15 +46,6 @@ def clean_cols(df):
     return df
 
 
-def clean_cell(x):
-    if x is None:
-        return ""
-    s = str(x).strip()
-    if s.lower() in ["", "nan", "none", "null", "na"]:
-        return ""
-    return s
-
-
 def normalize_mrn(df):
     key_variants = ["MRN", "mrn", "Patient_MRN", "PAT_MRN", "PATIENT_MRN"]
     for k in key_variants:
@@ -65,6 +57,15 @@ def normalize_mrn(df):
         raise RuntimeError("MRN column not found. Columns seen: {0}".format(list(df.columns)[:40]))
     df[MRN] = df[MRN].astype(str).str.strip()
     return df
+
+
+def clean_cell(x):
+    if x is None:
+        return ""
+    s = str(x).strip()
+    if s.lower() in ["", "nan", "none", "null", "na"]:
+        return ""
+    return s
 
 
 def reconstruct_notes():
@@ -185,14 +186,12 @@ def reconstruct_notes():
 
 
 def main():
-    print("Loading files...")
+    print("Loading master and gold...")
     master = clean_cols(safe_read_csv(MASTER_FILE))
     gold = clean_cols(safe_read_csv(GOLD_FILE))
-    evid = clean_cols(safe_read_csv(EVID_FILE))
 
     master = normalize_mrn(master)
     gold = normalize_mrn(gold)
-    evid = normalize_mrn(evid)
 
     master = master.drop_duplicates(subset=[MRN]).copy()
     gold = gold.drop_duplicates(subset=[MRN]).copy()
@@ -205,69 +204,48 @@ def main():
         suffixes=("_pred", "_gold")
     )
 
-    merged["Age_pred"] = merged["Age_pred"].astype(str).str.strip()
-    merged["Age_gold"] = merged["Age_gold"].astype(str).str.strip()
+    pred = pd.to_numeric(merged["Age_pred"], errors="coerce")
+    gold_age = pd.to_numeric(merged["Age_gold"], errors="coerce")
 
-    mism = merged[
-        (merged["Age_gold"] != "") &
-        (merged["Age_gold"].str.lower() != "nan") &
-        (merged["Age_pred"] != merged["Age_gold"])
+    mask = gold_age.notna()
+
+    mismatch = merged[
+        mask & ~((gold_age == pred) | (gold_age == pred - 1) | (gold_age == pred + 1))
     ].copy()
 
-    print("Age mismatches:", len(mism))
+    print("Remaining age mismatches after floor/round rule:", len(mismatch))
 
-    age_evid = evid[evid["FIELD"].astype(str).str.strip() == "Age"].copy()
+    mismatch_mrns = mismatch[MRN].astype(str).str.strip().tolist()
 
-    # Pull structured age evidence fields out of EVIDENCE text
-    def extract_piece(text, key):
-        text = clean_cell(text)
-        if not text:
-            return ""
-        marker = key + "="
-        if marker not in text:
-            return ""
-        rhs = text.split(marker, 1)[1]
-        return rhs.split("|", 1)[0].strip()
+    print("Loading clinic encounters...")
+    clinic = clean_cols(safe_read_csv(CLINIC_ENC_FILE))
+    clinic = normalize_mrn(clinic)
 
-    if len(age_evid) > 0:
-        age_evid["AGE_AT_ENCOUNTER_USED"] = age_evid["EVIDENCE"].apply(lambda x: extract_piece(x, "AGE_AT_ENCOUNTER"))
-        age_evid["STRUCT_DATE_USED"] = age_evid["EVIDENCE"].apply(lambda x: extract_piece(x, "STRUCT_DATE"))
-        age_evid["TARGET_DATE_USED"] = age_evid["EVIDENCE"].apply(lambda x: extract_piece(x, "TARGET_DATE"))
-        age_evid["AGE_FLOOR"] = age_evid["EVIDENCE"].apply(lambda x: extract_piece(x, "AGE_FLOOR"))
-        age_evid["AGE_ROUND"] = age_evid["EVIDENCE"].apply(lambda x: extract_piece(x, "AGE_ROUND"))
-        age_evid["FINAL_USED"] = age_evid["EVIDENCE"].apply(lambda x: extract_piece(x, "FINAL_USED"))
+    keep_cols = [MRN]
+    for c in ["AGE_AT_ENCOUNTER", "ADMIT_DATE", "RECONSTRUCTION_DATE", "CPT_CODE", "PROCEDURE", "REASON_FOR_VISIT"]:
+        if c in clinic.columns:
+            keep_cols.append(c)
 
-    age_evid = age_evid.sort_values([MRN, "NOTE_DATE"]).drop_duplicates(subset=[MRN], keep="last")
+    clinic_small = clinic[keep_cols].copy()
+    clinic_for_mismatch = clinic_small[clinic_small[MRN].isin(mismatch_mrns)].copy()
 
     summary = pd.merge(
-        mism,
-        age_evid[[
-            MRN, "NOTE_TYPE", "NOTE_DATE", "AGE_AT_ENCOUNTER_USED",
-            "STRUCT_DATE_USED", "TARGET_DATE_USED",
-            "AGE_FLOOR", "AGE_ROUND", "FINAL_USED", "EVIDENCE"
-        ]],
+        mismatch,
+        clinic_for_mismatch,
         on=MRN,
         how="left"
     )
 
-    summary = summary.rename(columns={
-        "NOTE_TYPE": "AGE_EVID_NOTE_TYPE",
-        "NOTE_DATE": "AGE_EVID_NOTE_DATE",
-        "EVIDENCE": "AGE_EVIDENCE_TEXT"
-    })
-
     print("Reconstructing notes...")
     notes_df = reconstruct_notes()
 
-    if len(notes_df) > 0 and len(mism) > 0:
+    if len(notes_df) > 0 and len(mismatch) > 0:
         qa_notes = pd.merge(
-            mism[[MRN, "Age_pred", "Age_gold"]],
+            mismatch[[MRN, "Age_pred", "Age_gold"]],
             notes_df,
             on=MRN,
             how="left"
         )
-
-        # helpful short snippet preview
         qa_notes["NOTE_SNIPPET_PREVIEW"] = qa_notes["NOTE_TEXT"].fillna("").astype(str).str.slice(0, 500)
     else:
         qa_notes = pd.DataFrame(columns=[
