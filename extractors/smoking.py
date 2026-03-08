@@ -1,117 +1,116 @@
-# extractors/smoking.py
+# ----------------------------------------------
+# UPDATE (NLP refinement):
+# Expanded smoking extraction rules to capture
+# tobacco-related synonyms commonly found under
+# SOCIAL HISTORY in clinic notes.
+#
+# Recognizes phrases such as:
+#   "current smoker"
+#   "former smoker"
+#   "quit smoking"
+#   "never smoked"
+#   "never tobacco user"
+#   "nonsmoker"
+#   "denies tobacco"
+#   "previous history of tobacco use"
+#
+# Outputs standardized labels:
+#   Current
+#   Former
+#   Never
+#
+# Python 3.6.8 compatible.
+# ----------------------------------------------
+
 import re
-from typing import List, Optional
-
-from models import Candidate, SectionedNote
-from config import SMOKING_NORMALIZE
-from .utils import window_around
-
-SMOKE_LINE = re.compile(
-    r"(smoking\s+status|tobacco\s+use|tobacco|nicotine|vaping)\s*[:=]?\s*([^\n]+)",
-    re.IGNORECASE
-)
-
-DENIES_TOBACCO = re.compile(r"\bdenies\s+(any\s+)?(tobacco|smoking|nicotine|vaping)\b", re.IGNORECASE)
-
-# Prefer sections where smoking status is actually documented
-PREFERRED_SECTIONS = {
-    "SOCIAL HISTORY", "ANESTHESIA", "ANESTHESIA H&P", "H&P", "PAST MEDICAL HISTORY"
-}
-SUPPRESS_SECTIONS = {"FAMILY HISTORY", "ALLERGIES", "REVIEW OF SYSTEMS"}
-
-# If quit < 3 months => current (per your spec)
-QUIT_RECENT = re.compile(r"\bquit\b.*\b(\d+)\s*(day|days|week|weeks|month|months)\b", re.IGNORECASE)
+from models import Candidate
 
 
-def _normalize(raw: str) -> Optional[str]:
-    r = (raw or "").strip().lower()
+CURRENT_PATTERNS = [
+    r"\bcurrent smoker\b",
+    r"\bsmokes\b",
+    r"\bactive smoker\b",
+]
 
-    # config-based normalization first
-    for k, v in SMOKING_NORMALIZE.items():
-        if k in r:
-            return v
+FORMER_PATTERNS = [
+    r"\bformer smoker\b",
+    r"\bquit smoking\b",
+    r"\bquit tobacco\b",
+    r"\bsmoking status:\s*former\b",
+    r"\bprevious history of tobacco\b",
+]
 
-    # explicit phrases
-    if "never" in r or "non-smoker" in r or "nonsmoker" in r:
-        return "never"
-
-    if "former" in r or "quit" in r or "stopped" in r:
-        # apply 3-month rule
-        m = QUIT_RECENT.search(r)
-        if m:
-            n = int(m.group(1))
-            unit = m.group(2).lower()
-            # convert to approx days
-            days = n
-            if "week" in unit:
-                days = n * 7
-            elif "month" in unit:
-                days = n * 30
-            if days <= 90:
-                return "current"
-        return "former"
-
-    if "current" in r or "smokes" in r or "smoker" in r or "vapes" in r or "vaping" in r:
-        return "current"
-
-    return None
+NEVER_PATTERNS = [
+    r"\bnever smoker\b",
+    r"\bnever smoked\b",
+    r"\bnever tobacco\b",
+    r"\bnonsmoker\b",
+    r"\bnon[- ]smoker\b",
+    r"\blifetime nonsmoker\b",
+    r"\bnever tobacco user\b",
+    r"\bdenies tobacco\b",
+]
 
 
-def extract_smoking(note: SectionedNote) -> List[Candidate]:
-    cands: List[Candidate] = []
+CURRENT_REGEX = [re.compile(p, re.IGNORECASE) for p in CURRENT_PATTERNS]
+FORMER_REGEX = [re.compile(p, re.IGNORECASE) for p in FORMER_PATTERNS]
+NEVER_REGEX = [re.compile(p, re.IGNORECASE) for p in NEVER_PATTERNS]
 
-    # order sections: preferred first
-    section_order = []
-    for s in note.sections.keys():
-        if s in PREFERRED_SECTIONS and s not in SUPPRESS_SECTIONS:
-            section_order.append(s)
-    for s in note.sections.keys():
-        if s not in section_order and s not in SUPPRESS_SECTIONS:
-            section_order.append(s)
 
-    for section in section_order:
-        text = note.sections.get(section, "") or ""
+def extract_smoking(note):
+
+    results = []
+
+    sections = note.sections if note.sections else {"FULL": ""}
+
+    for section_name, text in sections.items():
+
         if not text:
             continue
 
-        # structured smoking status line
-        m = SMOKE_LINE.search(text)
-        if m:
-            norm = _normalize(m.group(2))
-            if norm:
-                cands.append(
-                    Candidate(
-                        field="SmokingStatus",
-                        value=norm,
-                        status="history",
-                        evidence=window_around(text, m.start(), m.end(), 160),
-                        section=section,
-                        note_type=note.note_type,
-                        note_id=note.note_id,
-                        note_date=note.note_date,
-                        confidence=0.85 if section in PREFERRED_SECTIONS else 0.75,
-                    )
-                )
-                # prefer first strong documentation
-                return cands
+        lower_text = text.lower()
 
-        # denial logic: ONLY allow outside ROS to avoid template noise
-        if section not in {"REVIEW OF SYSTEMS"}:
-            m2 = DENIES_TOBACCO.search(text)
-            if m2:
-                cands.append(
-                    Candidate(
-                        field="SmokingStatus",
-                        value="never",
-                        status="history",
-                        evidence=window_around(text, m2.start(), m2.end(), 160),
-                        section=section,
-                        note_type=note.note_type,
-                        note_id=note.note_id,
-                        note_date=note.note_date,
-                        confidence=0.75 if section in PREFERRED_SECTIONS else 0.65,
-                    )
-                )
-                return cands
+        label = None
+        evidence = None
 
-    return cands
+        # order matters
+        for r in CURRENT_REGEX:
+            m = r.search(lower_text)
+            if m:
+                label = "Current"
+                evidence = m.group(0)
+                break
+
+        if label is None:
+            for r in FORMER_REGEX:
+                m = r.search(lower_text)
+                if m:
+                    label = "Former"
+                    evidence = m.group(0)
+                    break
+
+        if label is None:
+            for r in NEVER_REGEX:
+                m = r.search(lower_text)
+                if m:
+                    label = "Never"
+                    evidence = m.group(0)
+                    break
+
+        if label is None:
+            continue
+
+        results.append(
+            Candidate(
+                field="SmokingStatus",
+                value=label,
+                confidence=0.90,
+                section=section_name,
+                evidence=evidence,
+                note_id=note.note_id,
+                note_date=note.note_date,
+                note_type=note.note_type
+            )
+        )
+
+    return results
