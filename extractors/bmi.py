@@ -7,9 +7,10 @@ from .utils import window_around
 
 # ----------------------------------------------
 # UPDATE:
-# Restrict BMI extraction to operative / operation
-# notes only, because gold BMI should reflect BMI
-# at reconstruction rather than any clinic BMI.
+# BMI extraction is no longer restricted to OP notes only.
+# It can now extract from peri-reconstruction notes selected
+# by the build script (op note, brief op note, anesthesia,
+# pre-op, progress note, clinic, H&P, etc.).
 #
 # Captures:
 #   BMI 30.12
@@ -24,7 +25,6 @@ from .utils import window_around
 #   BMI < 30
 #   if BMI ...
 #
-# BMI rounded to ONE decimal to match gold file.
 # Python 3.6.8 compatible.
 # ----------------------------------------------
 
@@ -33,6 +33,8 @@ BMI_PATTERNS = [
     re.compile(r"\bBMI\s+of\s+(\d{2,3}(?:\.\d+)?)\b", re.IGNORECASE),
     re.compile(r"\bbody\s+mass\s+index\s*[:=]?\s*(\d{2,3}(?:\.\d+)?)\b", re.IGNORECASE),
     re.compile(r"\bbody\s+mass\s+index\s+of\s+(\d{2,3}(?:\.\d+)?)\b", re.IGNORECASE),
+    re.compile(r"\bmorbid obesity\s*[-(]?\s*BMI\s*(\d{2,3}(?:\.\d+)?)\b", re.IGNORECASE),
+    re.compile(r"\bobesity\s*,?\s*BMI\s*(\d{2,3}(?:\.\d+)?)\b", re.IGNORECASE),
 ]
 
 THRESHOLD_FALSE_POS = re.compile(
@@ -88,36 +90,27 @@ def _section_order(note):
     return order
 
 
-def _is_operation_note(note_type):
-    nt = str(note_type or "").lower().strip()
-    return (
-        "op" in nt or
-        "operation" in nt or
-        "operative" in nt
-    )
-
-
 def _confidence_for_note_type(note_type):
     nt = str(note_type or "").lower().strip()
-    if nt in {"op note", "operation notes", "brief op notes", "operative note", "operation note"}:
+
+    if ("op note" in nt) or ("brief op note" in nt) or ("operative" in nt) or ("operation" in nt):
         return 0.95
-    if "op" in nt or "operative" in nt or "operation" in nt:
-        return 0.93
-    return 0.90
+    if ("anesthesia" in nt) or ("pre-op" in nt) or ("pre op" in nt):
+        return 0.92
+    if ("progress" in nt) or ("clinic" in nt) or ("h&p" in nt) or ("history and physical" in nt):
+        return 0.88
+
+    return 0.82
 
 
 def extract_bmi(note: SectionedNote) -> List[Candidate]:
     """
     High-precision BMI extraction:
-      - only from operative / operation notes
       - requires explicit numeric BMI mention
       - rejects threshold/comparison language
-      - rounds to 1 decimal
+      - can extract from any note type passed in by build script
     Returns at most one candidate per note.
     """
-
-    if not _is_operation_note(note.note_type):
-        return []
 
     section_order = _section_order(note)
 
@@ -145,8 +138,6 @@ def extract_bmi(note: SectionedNote) -> List[Candidate]:
 
                 if CONDITIONAL_FALSE_POS.search(ctx) and "bmi of" not in ctx.lower():
                     continue
-
-                bmi_val = round(bmi_val, 1)
 
                 return [
                     Candidate(
