@@ -14,17 +14,15 @@
 #
 # UPDATE:
 # - BMI anchoring widened to peri-reconstruction notes.
-# - BMI is now searched across ALL notes in the best available date window
+# - BMI is searched across ALL notes in the best available date window
 #   around the structured reconstruction date:
 #     (1) same day
 #     (2) +/- 1 day
 #     (3) +/- 3 days
-# - Within that window, note types are prioritized as:
-#     OP NOTE / BRIEF OP NOTE / operative / operation
-#     then anesthesia / pre-op
-#     then progress / clinic / H&P / physical exam style notes
-# - This keeps BMI reconstruction-timed while no longer assuming the BMI
-#   must be written inside the OP NOTE text itself.
+# - Within that window, ALL eligible BMI note types are now kept
+#   instead of filtering down to only the single best note-type priority.
+# - This avoids dropping same-day progress/anesthesia/pre-op notes that
+#   often contain BMI when OP NOTE text does not.
 #
 # Python 3.6.8 compatible
 
@@ -970,7 +968,9 @@ def choose_bmi_candidate_note_ids_by_mrn(notes_df, bmi_anchor_map):
     note NOTE_IDs in the best available date window:
       same day > +/-1 day > +/-3 days
 
-    Within that best window, keep notes with the best note-type priority.
+    IMPORTANT:
+    We KEEP ALL eligible note types in that best date window.
+    We DO NOT collapse to only the single best note-type priority.
     """
     out = {}
 
@@ -1033,9 +1033,6 @@ def choose_bmi_candidate_note_ids_by_mrn(notes_df, bmi_anchor_map):
             match_tier = "within_3_days"
 
         if chosen_rows:
-            best_pri = min([r["NOTE_TYPE_PRIORITY"] for r in chosen_rows])
-            chosen_rows = [r for r in chosen_rows if r["NOTE_TYPE_PRIORITY"] == best_pri]
-
             out[mrn] = {
                 "note_ids": set([r["NOTE_ID"] for r in chosen_rows]),
                 "match_tier": match_tier,
@@ -1120,9 +1117,10 @@ def main():
                             "STATUS": "targeted_selection",
                             "CONFIDENCE": "",
                             "SECTION": "STRUCTURED_PLUS_NOTE_DATE_WINDOW",
-                            "EVIDENCE": "BMI note eligible by reconstruction-date anchoring | RECON_DATE={0} | MATCH_TIER={1}".format(
+                            "EVIDENCE": "BMI note eligible by reconstruction-date anchoring | RECON_DATE={0} | MATCH_TIER={1} | NOTE_TYPE_PRIORITY={2}".format(
                                 bmi_anchor_map.get(mrn, {}).get("recon_date", ""),
-                                target.get("match_tier", "")
+                                target.get("match_tier", ""),
+                                bmi_note_type_priority(row["NOTE_TYPE"])
                             )
                         })
 
