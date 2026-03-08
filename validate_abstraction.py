@@ -10,6 +10,12 @@ Uses type-aware comparison for categorical, numeric, and binary fields.
 Includes race normalization so builder-standardized race values can be
 compared fairly against gold race labels.
 
+UPDATE:
+- BMI is now evaluated by rounding BOTH gold and predicted BMI values
+  to the nearest integer before comparison.
+- This is intended for narrative-vs-structured BMI comparison, where
+  operative note BMI is often rounded while structured vitals are more precise.
+
 Compatible with Python 3.6.8.
 """
 
@@ -118,15 +124,12 @@ def normalize_race_token(token):
     if s in ["", "nan", "none", "null", "na"]:
         return ""
 
-    # white / caucasian
     if s in ["white", "white or caucasian", "caucasian"]:
         return "White"
 
-    # black / african american
     if s in ["black", "black or african american", "african american"]:
         return "Black or African American"
 
-    # asian and common subgroups
     if s in [
         "asian", "filipino", "other asian", "asian indian",
         "chinese", "japanese", "korean", "vietnamese"
@@ -167,7 +170,6 @@ def collapse_race_value(x):
     if raw == "":
         return pd.NA
 
-    # split on comma or semicolon
     pieces = []
     tmp = raw.replace(";", ",")
     for part in tmp.split(","):
@@ -282,6 +284,7 @@ def compute_numeric_metrics(pred, gold, tolerance=None):
     accuracy = float(matches) / float(total)
     return accuracy, int(matches), int(total)
 
+
 def compute_age_floor_round_metrics(pred, gold):
     pred = normalize_numeric(pred)
     gold = normalize_numeric(gold)
@@ -299,6 +302,26 @@ def compute_age_floor_round_metrics(pred, gold):
 
     return accuracy, int(matches), int(total)
 
+
+def compute_bmi_integer_metrics(pred, gold):
+    pred = normalize_numeric(pred)
+    gold = normalize_numeric(gold)
+
+    mask = gold.notna()
+    pred = pred[mask]
+    gold = gold[mask]
+
+    total = len(gold)
+    if total == 0:
+        return 0.0, 0, 0
+
+    pred_round = pred.round(0)
+    gold_round = gold.round(0)
+
+    matches = (pred_round == gold_round).sum()
+    accuracy = float(matches) / float(total)
+
+    return accuracy, int(matches), int(total)
 
 
 # ---------------------------------------------------
@@ -364,9 +387,9 @@ def main():
 
         elif v == "Age":
             acc, matches, total = compute_age_floor_round_metrics(pred, goldv)
-            
+
         elif v == "BMI":
-            acc, matches, total = compute_numeric_metrics(pred, goldv, tolerance=0.2)
+            acc, matches, total = compute_bmi_integer_metrics(pred, goldv)
 
         else:
             acc, matches, total = 0.0, 0, 0
