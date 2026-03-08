@@ -4,53 +4,85 @@ import re
 from models import Candidate
 
 # ----------------------------------------------
-# UPDATE:
-# Rewritten BMI extractor for reconstruction workflow.
+# BMI extractor
 #
-# Key changes:
-# - Scans the whole note and collects ALL valid BMI mentions.
-# - Keeps explicit measured BMI values from operative / peri-op notes.
-# - Rejects threshold / policy / eligibility statements such as:
-#     "BMI >= 35"
-#     "BMI greater than or equal to 35"
-#     "patients with BMI 30-35"
-# - Supports common real note patterns:
-#     "BMI 37.59"
-#     "BMI: 37.59"
-#     "BMI=37.59"
-#     "BMI is 37.59"
-#     "BMI was 37.59"
-#     "BMI of 37.59"
-#     "body mass index is 23.72 kg/m2"
-#     "Obesity, BMI 35.9"
-#     "(BMI 37.28)"
-# - Returns multiple candidates per note so build/ranking logic
-#   can choose the best reconstruction-linked value.
-# - NEW FALLBACK:
-#   If explicit BMI is absent, compute BMI from height + weight found
-#   in the same note.
+# What this version does:
+# 1) Scans the whole note and collects ALL valid BMI mentions
+# 2) Keeps explicit measured BMI values from operative / peri-op notes
+# 3) Rejects threshold / policy / eligibility statements such as:
+#       "BMI >= 35"
+#       "BMI 30 - 34.99"
+#       "patients with BMI > 30"
+# 4) Supports common real note patterns:
+#       "BMI 37.59"
+#       "BMI: 37.59"
+#       "BMI=37.59"
+#       "BMI is 37.59"
+#       "BMI was 37.59"
+#       "BMI of 37.59"
+#       "BMI approx 37"
+#       "BMI approximately 37"
+#       "BMI ~37"
+#       "body mass index is 23.72 kg/m2"
+#       "Obesity, BMI 35.9"
+#       "morbid obesity (BMI 46)"
+#       "obesity with BMI 42.7"
+# 5) If explicit BMI is absent, computes BMI from height + weight
+# 6) Returns multiple candidates per note so builder/ranking logic
+#    can choose the best reconstruction-linked value
 #
-# Python 3.6.8 compatible.
+# Python 3.6.8 compatible
 # ----------------------------------------------
 
 # -----------------------
 # Explicit BMI patterns
 # -----------------------
 BMI_PATTERNS = [
+    # BMI 37.5 / BMI: 37.5 / BMI=37.5 / BMI is 37.5 / BMI was 37.5 / BMI of 37.5
     re.compile(
         r"\bBMI\s*(?:[:=]|\bis\b|\bwas\b|\bof\b)?\s*\(?\s*(\d{2,3}(?:\.\d+)?)\s*\)?\b",
         re.IGNORECASE
     ),
+
+    # BMI approx 37 / BMI approximately 37 / BMI ~37
+    re.compile(
+        r"\bBMI\s*(?:approx(?:\.|imately)?|approximately|~)\s*\(?\s*(\d{2,3}(?:\.\d+)?)\s*\)?\b",
+        re.IGNORECASE
+    ),
+
+    # body mass index 23.7 / is 23.7 / was 23.7 / of 23.7
     re.compile(
         r"\bbody\s+mass\s+index\s*(?:[:=]|\bis\b|\bwas\b|\bof\b)?\s*\(?\s*(\d{2,3}(?:\.\d+)?)\s*\)?\b",
         re.IGNORECASE
     ),
+
+    # obesity, BMI 35.9
     re.compile(
         r"\bobesity\s*,?\s*BMI\s*\(?\s*(\d{2,3}(?:\.\d+)?)\s*\)?\b",
         re.IGNORECASE
     ),
+
+    # obesity with BMI 42.7
+    re.compile(
+        r"\bobesity\s+with\s+BMI\s*\(?\s*(\d{2,3}(?:\.\d+)?)\s*\)?\b",
+        re.IGNORECASE
+    ),
+
+    # morbid obesity, BMI 46
     re.compile(
         r"\bmorbid\s+obesity\s*,?\s*BMI\s*\(?\s*(\d{2,3}(?:\.\d+)?)\s*\)?\b",
+        re.IGNORECASE
+    ),
+
+    # morbid obesity (BMI 46)
+    re.compile(
+        r"\bmorbid\s+obesity\s*\(\s*BMI\s*(\d{2,3}(?:\.\d+)?)\s*\)",
+        re.IGNORECASE
+    ),
+
+    # obesity (BMI 42.7)
+    re.compile(
+        r"\bobesity\s*\(\s*BMI\s*(\d{2,3}(?:\.\d+)?)\s*\)",
         re.IGNORECASE
     ),
 ]
@@ -96,27 +128,23 @@ CONDITIONAL_FALSE_POS = re.compile(
 # Height / Weight fallback patterns
 # -----------------------
 
-# Height in meters: Ht 1.753 m / Height 1.626 m
+# Height in meters
 HEIGHT_M_PATTERNS = [
     re.compile(r"\bHt\s*(?:is|=|:)?\s*(\d(?:\.\d+)?)\s*m\b", re.IGNORECASE),
     re.compile(r"\bHeight\s*(?:is|=|:)?\s*(\d(?:\.\d+)?)\s*m\b", re.IGNORECASE),
     re.compile(r"\bheight\s*(?:is|=|:)?\s*(\d(?:\.\d+)?)\s*m\b", re.IGNORECASE),
 ]
 
-# Height in centimeters: Height 168 cm / Ht 170 cm
+# Height in centimeters
 HEIGHT_CM_PATTERNS = [
     re.compile(r"\bHt\s*(?:is|=|:)?\s*(\d{2,3}(?:\.\d+)?)\s*cm\b", re.IGNORECASE),
     re.compile(r"\bHeight\s*(?:is|=|:)?\s*(\d{2,3}(?:\.\d+)?)\s*cm\b", re.IGNORECASE),
     re.compile(r"\bheight\s*(?:is|=|:)?\s*(\d{2,3}(?:\.\d+)?)\s*cm\b", re.IGNORECASE),
 ]
 
-# Height in feet/inches:
-# 5' 8"
-# 5'8"
-# 5 ft 8 in
-# 5 ft 8
+# Height in feet / inches
 HEIGHT_FT_IN_PATTERNS = [
-    # 5'1 or 5' 1 or 5'1"
+    # 5'1 / 5' 1 / 5'1"
     re.compile(r"\b(\d)\s*'\s*(\d{1,2})\s*(?:\"|in\b|inches\b)?", re.IGNORECASE),
 
     # 5 ft 1 in / 5 ft 1 inch / 5 ft 1 inches
@@ -132,25 +160,17 @@ HEIGHT_FT_IN_PATTERNS = [
     re.compile(r"\bheight\s*(?:is|=|:)?\s*(\d)\s*ft\.?\s*(\d{1,2})\s*(?:in|inch|inches)?\b", re.IGNORECASE),
 ]
 
-# Weight in kg: Wt 73.2 kg / Weight 130 kg
+# Weight in kg
 WEIGHT_KG_PATTERNS = [
     re.compile(r"\bWt\s*(?:is|=|:)?\s*(\d{2,3}(?:\.\d+)?)\s*kg\b", re.IGNORECASE),
     re.compile(r"\bWeight\s*(?:is|=|:)?\s*(\d{2,3}(?:\.\d+)?)\s*kg\b", re.IGNORECASE),
     re.compile(r"\bweight\s*(?:is|=|:)?\s*(\d{2,3}(?:\.\d+)?)\s*kg\b", re.IGNORECASE),
 ]
 
-# Weight in lb:
-# Wt 161 lb
-# Weight 220 lb
-# Weight: (!) 130 kg handled by kg regex above, so okay
+# Weight in pounds
 WEIGHT_LB_PATTERNS = [
-    # Wt 139 lb / Wt: 139 lbs
     re.compile(r"\bWt\s*(?:is|=|:)?\s*(\d{2,3}(?:\.\d+)?)\s*(?:lb|lbs|pound|pounds)\b", re.IGNORECASE),
-
-    # Weight 139 lb / Weight: 139 lbs / Weight is 139 pounds
     re.compile(r"\bWeight\s*(?:is|=|:)?\s*(\d{2,3}(?:\.\d+)?)\s*(?:lb|lbs|pound|pounds)\b", re.IGNORECASE),
-
-    # generic lower-case phrasing often seen in prose
     re.compile(r"\bweight\s*(?:is|=|:)?\s*(\d{2,3}(?:\.\d+)?)\s*(?:lb|lbs|pound|pounds)\b", re.IGNORECASE),
 ]
 
@@ -347,9 +367,13 @@ def _has_explicit_bmi_in_text(text):
 def extract_bmi(note):
     """
     Extract measured BMI values from a note.
+
     Priority:
     1) Explicit BMI mentions
     2) If none found in the note, compute BMI from height + weight
+
+    Returns:
+        list[Candidate]
     """
     candidates = []
     seen = set()
@@ -391,6 +415,9 @@ def extract_bmi(note):
                         ("bmi is " in ctx_low) or
                         ("bmi was " in ctx_low) or
                         ("bmi of " in ctx_low) or
+                        ("bmi approx" in ctx_low) or
+                        ("bmi approximately" in ctx_low) or
+                        ("bmi ~" in ctx_low) or
                         ("body mass index is " in ctx_low) or
                         ("body mass index was " in ctx_low) or
                         ("body mass index of " in ctx_low)
@@ -443,7 +470,6 @@ def extract_bmi(note):
         if not text:
             continue
 
-        # extra safety
         if _has_explicit_bmi_in_text(text):
             continue
 
@@ -473,7 +499,6 @@ def extract_bmi(note):
             end = max(h_end, w_end)
             ctx = window_around(text, start, end, 180)
 
-            # avoid computing from clearly non-current or junk contexts
             if THRESHOLD_FALSE_POS.search(ctx):
                 continue
 
