@@ -7,8 +7,8 @@
 #   "BMI=30.12"
 #   "BMI 30 kg/m2"
 #
-# These frequently appear in clinic progress notes
-# in the vitals block.
+# BMI values are rounded to ONE decimal to match
+# the gold dataset formatting.
 #
 # Python 3.6.8 compatible.
 # ----------------------------------------------
@@ -46,9 +46,11 @@ def extract_bmi(note):
             except Exception:
                 continue
 
-            # sanity bounds
             if bmi_val < 10 or bmi_val > 80:
                 continue
+
+            # round to ONE decimal to match gold dataset
+            bmi_val = round(bmi_val, 1)
 
             results.append(
                 Candidate(
