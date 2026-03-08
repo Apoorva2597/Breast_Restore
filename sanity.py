@@ -4,7 +4,7 @@ import pandas as pd
 import numpy as np
 
 MASTER_FILE = "/home/apokol/Breast_Restore/_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv"
-GOLD_FILE = "/home/apokol/Breast_Restore/_gold/gold_labels.csv"
+GOLD_FILE = "/home/apokol/Breast_Restore/gold_cleaned_for_cedar.csv"
 OUTPUT_FILE = "/home/apokol/Breast_Restore/_outputs/bmi_gold_vs_pred.csv"
 
 MRN_COL = "MRN"
