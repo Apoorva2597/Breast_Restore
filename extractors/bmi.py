@@ -98,14 +98,16 @@ CONDITIONAL_FALSE_POS = re.compile(
 
 # Height in meters: Ht 1.753 m / Height 1.626 m
 HEIGHT_M_PATTERNS = [
-    re.compile(r"\bHt\s*[:=]?\s*(\d(?:\.\d+)?)\s*m\b", re.IGNORECASE),
-    re.compile(r"\bHeight\s*[:=]?\s*(\d(?:\.\d+)?)\s*m\b", re.IGNORECASE),
+    re.compile(r"\bHt\s*(?:is|=|:)?\s*(\d(?:\.\d+)?)\s*m\b", re.IGNORECASE),
+    re.compile(r"\bHeight\s*(?:is|=|:)?\s*(\d(?:\.\d+)?)\s*m\b", re.IGNORECASE),
+    re.compile(r"\bheight\s*(?:is|=|:)?\s*(\d(?:\.\d+)?)\s*m\b", re.IGNORECASE),
 ]
 
 # Height in centimeters: Height 168 cm / Ht 170 cm
 HEIGHT_CM_PATTERNS = [
-    re.compile(r"\bHt\s*[:=]?\s*(\d{2,3}(?:\.\d+)?)\s*cm\b", re.IGNORECASE),
-    re.compile(r"\bHeight\s*[:=]?\s*(\d{2,3}(?:\.\d+)?)\s*cm\b", re.IGNORECASE),
+    re.compile(r"\bHt\s*(?:is|=|:)?\s*(\d{2,3}(?:\.\d+)?)\s*cm\b", re.IGNORECASE),
+    re.compile(r"\bHeight\s*(?:is|=|:)?\s*(\d{2,3}(?:\.\d+)?)\s*cm\b", re.IGNORECASE),
+    re.compile(r"\bheight\s*(?:is|=|:)?\s*(\d{2,3}(?:\.\d+)?)\s*cm\b", re.IGNORECASE),
 ]
 
 # Height in feet/inches:
@@ -114,14 +116,27 @@ HEIGHT_CM_PATTERNS = [
 # 5 ft 8 in
 # 5 ft 8
 HEIGHT_FT_IN_PATTERNS = [
-    re.compile(r"\b(\d)\s*'\s*(\d{1,2})\s*(?:\"|in\b)?", re.IGNORECASE),
-    re.compile(r"\b(\d)\s*ft\.?\s*(\d{1,2})\s*(?:in|inches|\" )?\b", re.IGNORECASE),
+    # 5'1 or 5' 1 or 5'1"
+    re.compile(r"\b(\d)\s*'\s*(\d{1,2})\s*(?:\"|in\b|inches\b)?", re.IGNORECASE),
+
+    # 5 ft 1 in / 5 ft 1 inch / 5 ft 1 inches
+    re.compile(r"\b(\d)\s*ft\.?\s*(\d{1,2})\s*(?:in|inch|inches|\" )?\b", re.IGNORECASE),
+
+    # 5 feet 1 inch / 5 feet 1 inches
+    re.compile(r"\b(\d)\s*feet\s*(\d{1,2})\s*(?:in|inch|inches)?\b", re.IGNORECASE),
+
+    # height is 5 feet 1 inch
+    re.compile(r"\bheight\s*(?:is|=|:)?\s*(\d)\s*feet\s*(\d{1,2})\s*(?:in|inch|inches)?\b", re.IGNORECASE),
+
+    # height is 5 ft 1 in
+    re.compile(r"\bheight\s*(?:is|=|:)?\s*(\d)\s*ft\.?\s*(\d{1,2})\s*(?:in|inch|inches)?\b", re.IGNORECASE),
 ]
 
 # Weight in kg: Wt 73.2 kg / Weight 130 kg
 WEIGHT_KG_PATTERNS = [
-    re.compile(r"\bWt\s*[:=]?\s*(\d{2,3}(?:\.\d+)?)\s*kg\b", re.IGNORECASE),
-    re.compile(r"\bWeight\s*[:=]?\s*(\d{2,3}(?:\.\d+)?)\s*kg\b", re.IGNORECASE),
+    re.compile(r"\bWt\s*(?:is|=|:)?\s*(\d{2,3}(?:\.\d+)?)\s*kg\b", re.IGNORECASE),
+    re.compile(r"\bWeight\s*(?:is|=|:)?\s*(\d{2,3}(?:\.\d+)?)\s*kg\b", re.IGNORECASE),
+    re.compile(r"\bweight\s*(?:is|=|:)?\s*(\d{2,3}(?:\.\d+)?)\s*kg\b", re.IGNORECASE),
 ]
 
 # Weight in lb:
@@ -129,8 +144,14 @@ WEIGHT_KG_PATTERNS = [
 # Weight 220 lb
 # Weight: (!) 130 kg handled by kg regex above, so okay
 WEIGHT_LB_PATTERNS = [
-    re.compile(r"\bWt\s*[:=]?\s*(\d{2,3}(?:\.\d+)?)\s*lb\b", re.IGNORECASE),
-    re.compile(r"\bWeight\s*[:=]?\s*(\d{2,3}(?:\.\d+)?)\s*lb\b", re.IGNORECASE),
+    # Wt 139 lb / Wt: 139 lbs
+    re.compile(r"\bWt\s*(?:is|=|:)?\s*(\d{2,3}(?:\.\d+)?)\s*(?:lb|lbs|pound|pounds)\b", re.IGNORECASE),
+
+    # Weight 139 lb / Weight: 139 lbs / Weight is 139 pounds
+    re.compile(r"\bWeight\s*(?:is|=|:)?\s*(\d{2,3}(?:\.\d+)?)\s*(?:lb|lbs|pound|pounds)\b", re.IGNORECASE),
+
+    # generic lower-case phrasing often seen in prose
+    re.compile(r"\bweight\s*(?:is|=|:)?\s*(\d{2,3}(?:\.\d+)?)\s*(?:lb|lbs|pound|pounds)\b", re.IGNORECASE),
 ]
 
 PREFERRED_SECTIONS = set([
