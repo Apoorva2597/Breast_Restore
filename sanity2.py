@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
-# qa_bmi_recon_window.py
-#
-# QA script for BMI near reconstruction date
+# qa_bmi_missing_with_snippets.py
 #
 # Purpose:
-# - For each MRN in the gold/master merge with non-missing gold BMI,
-#   find the reconstruction anchor date using the SAME structured logic
-#   as the build script.
-# - Pull the nearest notes within +/- 14 days of reconstruction.
-# - Show which notes contain BMI mentions.
-# - Show raw BMI snippet(s) and extracted BMI value(s).
-# - Show final BMI written in master, so we can compare:
-#     gold BMI vs final chosen BMI vs nearby note evidence.
+# - Focus only on gold MRNs where BMI_pred is missing
+# - Pull nearby notes around reconstruction date
+# - Show snippets containing:
+#     * BMI / body mass index
+#     * height / ht
+#     * weight / wt
+# - Helps quickly determine whether the miss is:
+#     1) true missing documentation
+#     2) regex miss
+#     3) computable from height/weight
 #
 # Output:
-#   /home/apokol/Breast_Restore/_outputs/qa_bmi_recon_window_14d.csv
+#   /home/apokol/Breast_Restore/_outputs/qa_bmi_missing_snippets.csv
 #
 # Python 3.6.8 compatible
 
@@ -25,6 +25,15 @@ from datetime import datetime
 import pandas as pd
 
 BASE_DIR = "/home/apokol/Breast_Restore"
+
+MASTER_FILE = "{0}/_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv".format(BASE_DIR)
+GOLD_FILE = "{0}/gold_cleaned_for_cedar.csv".format(BASE_DIR)
+OUTPUT_FILE = "{0}/_outputs/qa_bmi_missing_snippets.csv".format(BASE_DIR)
+
+MERGE_KEY = "MRN"
+WINDOW_BEFORE = 45
+WINDOW_AFTER = 14
+MAX_NOTES_PER_MRN = 12
 
 STRUCT_GLOBS = [
     "{0}/**/HPI11526*Clinic Encounters.csv".format(BASE_DIR),
@@ -44,25 +53,9 @@ NOTE_GLOBS = [
     "{0}/**/HPI11526*operation notes.csv".format(BASE_DIR),
 ]
 
-MASTER_FILE = "{0}/_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv".format(BASE_DIR)
-GOLD_FILE = "{0}/gold_cleaned_for_cedar.csv".format(BASE_DIR)
-OUTPUT_QA = "{0}/_outputs/qa_bmi_recon_window_14d.csv".format(BASE_DIR)
-
-MERGE_KEY = "MRN"
-WINDOW_DAYS_BEFORE = 14
-WINDOW_DAYS_AFTER = 14
-MAX_NOTES_PER_MRN = 8
-
-BMI_PATTERNS = [
-    re.compile(r"\bBMI\s*[:=]?\s*(\d{2,3}(?:\.\d+)?)\b", re.IGNORECASE),
-    re.compile(r"\bBMI\s+of\s+(\d{2,3}(?:\.\d+)?)\b", re.IGNORECASE),
-    re.compile(r"\bbody\s+mass\s+index\s*[:=]?\s*(\d{2,3}(?:\.\d+)?)\b", re.IGNORECASE),
-    re.compile(r"\bbody\s+mass\s+index\s+of\s+(\d{2,3}(?:\.\d+)?)\b", re.IGNORECASE),
-    re.compile(r"\bmorbid obesity\s*[-(]?\s*BMI\s*(\d{2,3}(?:\.\d+)?)\b", re.IGNORECASE),
-    re.compile(r"\bobesity\s*,?\s*BMI\s*(\d{2,3}(?:\.\d+)?)\b", re.IGNORECASE),
-]
-
-BMI_MENTION_RX = re.compile(r"\b(?:BMI|body\s+mass\s+index)\b", re.IGNORECASE)
+BMI_RX = re.compile(r"\b(?:BMI|body\s+mass\s+index)\b", re.IGNORECASE)
+HT_RX = re.compile(r"\b(?:Ht|Height)\b", re.IGNORECASE)
+WT_RX = re.compile(r"\b(?:Wt|Weight)\b", re.IGNORECASE)
 
 def read_csv_robust(path):
     common_kwargs = dict(dtype=str, engine="python")
@@ -247,25 +240,9 @@ def choose_best_bmi_anchor_rows(struct_df):
         "inpatient": 3
     }
 
-    preferred_cpts = set([
-        "19357",
-        "19340",
-        "19342",
-        "19361",
-        "19364",
-        "19367",
-        "S2068"
-    ])
-
-    primary_exclude_cpts = set([
-        "19325",
-        "19330"
-    ])
-
-    fallback_allowed_cpts = set([
-        "19350",
-        "19380"
-    ])
+    preferred_cpts = set(["19357", "19340", "19342", "19361", "19364", "19367", "S2068"])
+    primary_exclude_cpts = set(["19325", "19330"])
+    fallback_allowed_cpts = set(["19350", "19380"])
 
     eligible_sources = struct_df[struct_df["STRUCT_SOURCE"].isin(["clinic", "operation", "inpatient"])].copy()
     if len(eligible_sources) == 0:
@@ -294,7 +271,6 @@ def choose_best_bmi_anchor_rows(struct_df):
         recon_date = parse_date_safe(row.get("RECONSTRUCTION_DATE_STRUCT", ""))
         cpt_code = clean_cell(row.get("CPT_CODE_STRUCT", "")).upper()
         procedure = clean_cell(row.get("PROCEDURE_STRUCT", "")).lower()
-        reason_for_visit = clean_cell(row.get("REASON_FOR_VISIT_STRUCT", "")).lower()
 
         if admit_date is None or recon_date is None:
             continue
@@ -457,18 +433,18 @@ def note_type_bucket(note_type, source_file):
 
     if "brief op" in s:
         return "brief_op"
-    if "operative" in s or "operation" in s or "op note" in s:
+    if "operative" in s or "operation" in s or "op note" in s or "oper report" in s:
         return "operation"
     if "anesthesia" in s:
         return "anesthesia"
     if "pre-op" in s or "preop" in s:
         return "preop"
+    if "h&p" in s or "history and physical" in s:
+        return "hp"
     if "progress" in s:
         return "progress"
     if "clinic" in s or "office" in s:
         return "clinic"
-    if "h&p" in s or "history and physical" in s:
-        return "hp"
     if "consult" in s:
         return "consult"
     return "other"
@@ -489,25 +465,21 @@ def rank_note(note_type, source_file, day_diff):
         return (4, abs_dd, bucket)
     return (5, abs_dd, bucket)
 
-def extract_bmi_mentions(text):
+def find_snippets(text):
     text_norm = normalize_text(text)
-    out = []
-    for rx in BMI_PATTERNS:
+    snippets = []
+
+    for rx in [BMI_RX, HT_RX, WT_RX]:
         for m in rx.finditer(text_norm):
-            val = m.group(1)
-            try:
-                fval = round(float(val), 1)
-            except Exception:
-                continue
-            snippet = window_around(text_norm, m.start(), m.end(), 120)
-            out.append((fval, snippet))
+            snippets.append(window_around(text_norm, m.start(), m.end(), 140))
+
     dedup = []
     seen = set()
-    for fval, snippet in out:
-        key = "{0}|{1}".format(fval, snippet)
-        if key not in seen:
-            seen.add(key)
-            dedup.append((fval, snippet))
+    for s in snippets:
+        if s not in seen:
+            seen.add(s)
+            dedup.append(s)
+
     return dedup
 
 def main():
@@ -528,64 +500,59 @@ def main():
     notes_df = load_and_reconstruct_notes()
     print("Reconstructed notes: {0}".format(len(notes_df)))
 
-    master_sub = master[[MERGE_KEY, "BMI"]].copy() if "BMI" in master.columns else master[[MERGE_KEY]].copy()
-    if "BMI" not in master_sub.columns:
-        master_sub["BMI"] = ""
-
-    gold_bmi_col = "BMI"
-    if gold_bmi_col not in gold.columns:
+    if "BMI" not in gold.columns:
         raise RuntimeError("Gold file missing BMI column.")
 
+    if "BMI" not in master.columns:
+        master["BMI"] = ""
+
     gold["BMI"] = gold["BMI"].astype(str).str.strip()
-    gold_nonmissing = gold[(gold["BMI"] != "") & (~gold["BMI"].isin(["nan", "None", "NA", "null"]))].copy()
+    gold_nonmissing = gold[
+        (gold["BMI"] != "") &
+        (~gold["BMI"].isin(["nan", "None", "NA", "null"]))
+    ].copy()
 
     merged = pd.merge(
         gold_nonmissing[[MERGE_KEY, "BMI"]],
-        master_sub[[MERGE_KEY, "BMI"]],
+        master[[MERGE_KEY, "BMI"]],
         on=MERGE_KEY,
         how="left",
         suffixes=("_gold", "_pred")
     )
 
-    target_mrns = set(merged[MERGE_KEY].astype(str).str.strip().tolist())
-    print("MRNs with non-missing gold BMI: {0}".format(len(target_mrns)))
+    missing_df = merged[
+        merged["BMI_gold"].notna() &
+        (
+            merged["BMI_pred"].isna() |
+            (merged["BMI_pred"].astype(str).str.strip() == "") |
+            (merged["BMI_pred"].astype(str).str.lower().isin(["nan", "none", "null", "na"]))
+        )
+    ].copy()
+
+    target_mrns = set(missing_df[MERGE_KEY].astype(str).str.strip().tolist())
+    print("Gold BMI present but pred missing MRNs: {0}".format(len(target_mrns)))
 
     notes_df = notes_df[notes_df[MERGE_KEY].astype(str).isin(target_mrns)].copy()
 
     rows = []
-    seen_note_keys = set()
-
-    merged_map = {}
-    for _, r in merged.iterrows():
-        mrn = str(r[MERGE_KEY]).strip()
-        merged_map[mrn] = {
-            "BMI_gold": clean_cell(r.get("BMI_gold", "")),
-            "BMI_pred_final": clean_cell(r.get("BMI_pred", ""))
-        }
 
     for mrn in sorted(target_mrns):
+        gold_bmi = clean_cell(missing_df[missing_df[MERGE_KEY] == mrn]["BMI_gold"].iloc[0])
+
         anchor = anchor_map.get(mrn)
         if anchor is None:
             rows.append({
                 "MRN": mrn,
+                "BMI_gold": gold_bmi,
                 "recon_date": "",
-                "anchor_source": "",
-                "anchor_cpt_code": "",
-                "anchor_procedure": "",
-                "anchor_reason_for_visit": "",
-                "BMI_gold": merged_map.get(mrn, {}).get("BMI_gold", ""),
-                "BMI_pred_final": merged_map.get(mrn, {}).get("BMI_pred_final", ""),
                 "note_rank": "",
                 "note_date": "",
                 "days_from_recon": "",
                 "note_type": "",
                 "source_file": "",
                 "note_bucket": "",
-                "has_bmi_term": "NO_ANCHOR",
-                "bmi_mentions_found": 0,
-                "bmi_values_found": "",
-                "bmi_snippets": "",
-                "note_id": "",
+                "snippet_type": "NO_ANCHOR",
+                "snippet": ""
             })
             continue
 
@@ -604,16 +571,15 @@ def main():
             if dd is None:
                 continue
 
-            if dd < -WINDOW_DAYS_BEFORE or dd > WINDOW_DAYS_AFTER:
+            if dd < -WINDOW_BEFORE or dd > WINDOW_AFTER:
                 continue
 
             nt = clean_cell(note_row.get("NOTE_TYPE", ""))
             sf = clean_cell(note_row.get("SOURCE_FILE", ""))
             bucket = note_type_bucket(nt, sf)
-            rank_tuple = rank_note(nt, sf, dd)
 
             ranked_notes.append({
-                "rank_tuple": rank_tuple,
+                "rank_tuple": rank_note(nt, sf, dd),
                 "note_date": note_dt.strftime("%Y-%m-%d"),
                 "days_from_recon": dd,
                 "note_type": nt,
@@ -631,81 +597,81 @@ def main():
         if len(ranked_notes) == 0:
             rows.append({
                 "MRN": mrn,
+                "BMI_gold": gold_bmi,
                 "recon_date": recon_date_str,
-                "anchor_source": anchor.get("source", ""),
-                "anchor_cpt_code": anchor.get("cpt_code", ""),
-                "anchor_procedure": anchor.get("procedure", ""),
-                "anchor_reason_for_visit": anchor.get("reason_for_visit", ""),
-                "BMI_gold": merged_map.get(mrn, {}).get("BMI_gold", ""),
-                "BMI_pred_final": merged_map.get(mrn, {}).get("BMI_pred_final", ""),
                 "note_rank": "",
                 "note_date": "",
                 "days_from_recon": "",
                 "note_type": "",
                 "source_file": "",
                 "note_bucket": "",
-                "has_bmi_term": "NO_NOTE_IN_14D",
-                "bmi_mentions_found": 0,
-                "bmi_values_found": "",
-                "bmi_snippets": "",
-                "note_id": "",
+                "snippet_type": "NO_NOTE_IN_WINDOW",
+                "snippet": ""
             })
             continue
 
         note_counter = 0
         for note_info in ranked_notes:
-            note_key = "{0}|{1}|{2}".format(mrn, note_info["note_date"], note_info["note_id"])
-            if note_key in seen_note_keys:
-                continue
-            seen_note_keys.add(note_key)
-
             note_counter += 1
             if note_counter > MAX_NOTES_PER_MRN:
                 break
 
-            text_norm = normalize_text(note_info["note_text"])
-            has_bmi_term = "Y" if BMI_MENTION_RX.search(text_norm) else "N"
-            mentions = extract_bmi_mentions(text_norm)
-            values = [str(x[0]) for x in mentions]
-            snippets = [x[1] for x in mentions]
+            snippets = find_snippets(note_info["note_text"])
+            if not snippets:
+                rows.append({
+                    "MRN": mrn,
+                    "BMI_gold": gold_bmi,
+                    "recon_date": recon_date_str,
+                    "note_rank": note_counter,
+                    "note_date": note_info["note_date"],
+                    "days_from_recon": note_info["days_from_recon"],
+                    "note_type": note_info["note_type"],
+                    "source_file": note_info["source_file"],
+                    "note_bucket": note_info["note_bucket"],
+                    "snippet_type": "NO_BMI_HT_WT_TERM",
+                    "snippet": ""
+                })
+                continue
 
-            rows.append({
-                "MRN": mrn,
-                "recon_date": recon_date_str,
-                "anchor_source": anchor.get("source", ""),
-                "anchor_cpt_code": anchor.get("cpt_code", ""),
-                "anchor_procedure": anchor.get("procedure", ""),
-                "anchor_reason_for_visit": anchor.get("reason_for_visit", ""),
-                "BMI_gold": merged_map.get(mrn, {}).get("BMI_gold", ""),
-                "BMI_pred_final": merged_map.get(mrn, {}).get("BMI_pred_final", ""),
-                "note_rank": note_counter,
-                "note_date": note_info["note_date"],
-                "days_from_recon": note_info["days_from_recon"],
-                "note_type": note_info["note_type"],
-                "source_file": note_info["source_file"],
-                "note_bucket": note_info["note_bucket"],
-                "has_bmi_term": has_bmi_term,
-                "bmi_mentions_found": len(mentions),
-                "bmi_values_found": " || ".join(values),
-                "bmi_snippets": " ||||| ".join(snippets),
-                "note_id": note_info["note_id"],
-            })
+            for snip in snippets[:5]:
+                snip_low = snip.lower()
+                if "bmi" in snip_low or "body mass index" in snip_low:
+                    stype = "BMI_TERM"
+                elif "height" in snip_low or "ht" in snip_low:
+                    stype = "HEIGHT_TERM"
+                elif "weight" in snip_low or "wt" in snip_low:
+                    stype = "WEIGHT_TERM"
+                else:
+                    stype = "OTHER_TERM"
+
+                rows.append({
+                    "MRN": mrn,
+                    "BMI_gold": gold_bmi,
+                    "recon_date": recon_date_str,
+                    "note_rank": note_counter,
+                    "note_date": note_info["note_date"],
+                    "days_from_recon": note_info["days_from_recon"],
+                    "note_type": note_info["note_type"],
+                    "source_file": note_info["source_file"],
+                    "note_bucket": note_info["note_bucket"],
+                    "snippet_type": stype,
+                    "snippet": snip
+                })
 
     out_df = pd.DataFrame(rows)
-
-    os.makedirs(os.path.dirname(OUTPUT_QA), exist_ok=True)
-    out_df.to_csv(OUTPUT_QA, index=False)
+    os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
+    out_df.to_csv(OUTPUT_FILE, index=False)
 
     print("")
     print("DONE.")
     print("Rows written: {0}".format(len(out_df)))
-    print("Output: {0}".format(OUTPUT_QA))
+    print("Output: {0}".format(OUTPUT_FILE))
     print("")
-    print("Suggested next review filters:")
-    print("1) has_bmi_term == 'Y' and bmi_mentions_found == 0")
-    print("2) bmi_mentions_found > 0 and BMI_pred_final is blank")
-    print("3) has_bmi_term == 'NO_NOTE_IN_14D'")
-    print("4) compare BMI_gold vs BMI_pred_final vs bmi_values_found")
+    print("Useful filters:")
+    print("1) snippet_type = BMI_TERM")
+    print("2) snippet_type = HEIGHT_TERM or WEIGHT_TERM")
+    print("3) snippet_type = NO_BMI_HT_WT_TERM")
+    print("4) sort by MRN, then note_rank")
 
 if __name__ == "__main__":
     main()
