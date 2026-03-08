@@ -1,74 +1,66 @@
-# extractors/bmi.py
+# ----------------------------------------------
+# UPDATE (NLP refinement):
+# Improved BMI extraction using vitals-style regex
+# capturing patterns such as:
+#   "BMI 30.12"
+#   "BMI: 30.12"
+#   "BMI=30.12"
+#   "BMI 30 kg/m2"
+#
+# These frequently appear in clinic progress notes
+# in the vitals block.
+#
+# Python 3.6.8 compatible.
+# ----------------------------------------------
+
 import re
-from typing import List
-
-from models import Candidate, SectionedNote
-from .utils import window_around
-
-BMI_RX = re.compile(r"\bBMI\b\s*[:=]?\s*(\d{1,2}(?:\.\d+)?)\b", re.IGNORECASE)
-BMI_RX2 = re.compile(r"\bBody\s+Mass\s+Index\b\s*[:=]?\s*(\d{1,2}(?:\.\d+)?)\b", re.IGNORECASE)
-
-PREFERRED_SECTIONS = {"VITALS", "PHYSICAL EXAM", "H&P", "ANESTHESIA", "ANESTHESIA H&P"}
-SUPPRESS_SECTIONS = {"FAMILY HISTORY", "REVIEW OF SYSTEMS", "ALLERGIES"}
+from models import Candidate
 
 
-def _valid_bmi(val: float) -> bool:
-    # conservative plausible adult BMI bounds
-    return 10.0 <= val <= 80.0
+BMI_REGEX = re.compile(
+    r"\bBMI\s*[:=]?\s*(\d{2,3}(?:\.\d+)?)",
+    re.IGNORECASE
+)
 
 
-def extract_bmi(note: SectionedNote) -> List[Candidate]:
-    cands: List[Candidate] = []
+def extract_bmi(note):
 
-    # search preferred sections first
-    section_order = []
-    for s in note.sections.keys():
-        if s in PREFERRED_SECTIONS and s not in SUPPRESS_SECTIONS:
-            section_order.append(s)
-    for s in note.sections.keys():
-        if s not in section_order and s not in SUPPRESS_SECTIONS:
-            section_order.append(s)
+    results = []
 
-    for section in section_order:
-        text = note.sections.get(section, "") or ""
+    sections = note.sections if note.sections else {"FULL": ""}
+
+    for section_name, text in sections.items():
+
         if not text:
             continue
 
-        for rx in (BMI_RX2, BMI_RX):
-            m = rx.search(text)
-            if not m:
-                continue
+        matches = BMI_REGEX.findall(text)
 
-            raw_val = m.group(1)
+        if not matches:
+            continue
+
+        for m in matches:
+
             try:
-                val = float(raw_val)
+                bmi_val = float(m)
             except Exception:
                 continue
 
-            if not _valid_bmi(val):
+            # sanity bounds
+            if bmi_val < 10 or bmi_val > 80:
                 continue
 
-            evid = window_around(text, m.start(), m.end(), 140)
-
-            cands.append(
+            results.append(
                 Candidate(
                     field="BMI",
-                    value=val,
-                    status="measured",
-                    evidence=evid,
-                    section=section,
-                    note_type=note.note_type,
+                    value=bmi_val,
+                    confidence=0.95,
+                    section=section_name,
+                    evidence="BMI extracted from vitals pattern",
                     note_id=note.note_id,
                     note_date=note.note_date,
-                    confidence=0.95 if section in PREFERRED_SECTIONS else 0.90,
+                    note_type=note.note_type
                 )
             )
-            # take first best match per section to avoid duplicates
-            break
 
-        if cands:
-            # stop early once found in a preferred section
-            if section in PREFERRED_SECTIONS:
-                break
-
-    return cands
+    return results
