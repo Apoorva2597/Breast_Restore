@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
-# qa_bmi_missing_with_snippets.py
+# qa_bmi_missing_bucket_summary.py
 #
 # Purpose:
-# - Focus only on gold MRNs where BMI_pred is missing
-# - Pull nearby notes around reconstruction date
-# - Show snippets containing:
-#     * BMI / body mass index
-#     * height / ht
-#     * weight / wt
-# - Helps quickly determine whether the miss is:
-#     1) true missing documentation
-#     2) regex miss
-#     3) computable from height/weight
+# Summarize BMI gold-present / pred-missing cases into 3 buckets:
+#
+#   1) TRUE_NO_BMI
+#      -> no explicit BMI mention and no computable height+weight in the review window
+#
+#   2) COMPUTABLE_HT_WT_EXISTS
+#      -> no explicit BMI mention, but height+weight are present so BMI could be computed
+#
+#   3) EXPLICIT_BMI_EXISTS
+#      -> explicit BMI text exists in nearby notes, so the miss is likely regex/selection/ranking
+#
+# Also writes a detailed CSV for review.
+#
+# Inputs:
+#   /home/apokol/Breast_Restore/_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv
+#   /home/apokol/Breast_Restore/gold_cleaned_for_cedar.csv
 #
 # Output:
-#   /home/apokol/Breast_Restore/_outputs/qa_bmi_missing_snippets.csv
+#   /home/apokol/Breast_Restore/_outputs/qa_bmi_missing_bucket_summary.csv
 #
 # Python 3.6.8 compatible
 
@@ -28,12 +34,12 @@ BASE_DIR = "/home/apokol/Breast_Restore"
 
 MASTER_FILE = "{0}/_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv".format(BASE_DIR)
 GOLD_FILE = "{0}/gold_cleaned_for_cedar.csv".format(BASE_DIR)
-OUTPUT_FILE = "{0}/_outputs/qa_bmi_missing_snippets.csv".format(BASE_DIR)
+OUTPUT_FILE = "{0}/_outputs/qa_bmi_missing_bucket_summary.csv".format(BASE_DIR)
 
 MERGE_KEY = "MRN"
-WINDOW_BEFORE = 45
-WINDOW_AFTER = 14
-MAX_NOTES_PER_MRN = 12
+WINDOW_BEFORE = 21
+WINDOW_AFTER = 21
+MAX_NOTES_PER_MRN = 15
 
 STRUCT_GLOBS = [
     "{0}/**/HPI11526*Clinic Encounters.csv".format(BASE_DIR),
@@ -53,10 +59,102 @@ NOTE_GLOBS = [
     "{0}/**/HPI11526*operation notes.csv".format(BASE_DIR),
 ]
 
-BMI_RX = re.compile(r"\b(?:BMI|body\s+mass\s+index)\b", re.IGNORECASE)
-HT_RX = re.compile(r"\b(?:Ht|Height)\b", re.IGNORECASE)
-WT_RX = re.compile(r"\b(?:Wt|Weight)\b", re.IGNORECASE)
+# -----------------------
+# Explicit BMI patterns
+# -----------------------
+BMI_PATTERNS = [
+    re.compile(
+        r"\bBMI\s*(?:[:=]|\bis\b|\bwas\b|\bof\b)?\s*\(?\s*(\d{2,3}(?:\.\d+)?)\s*\)?\b",
+        re.IGNORECASE
+    ),
+    re.compile(
+        r"\bBMI\s*(?:approx(?:\.|imately)?|approximately|~)\s*\(?\s*(\d{2,3}(?:\.\d+)?)\s*\)?\b",
+        re.IGNORECASE
+    ),
+    re.compile(
+        r"\bbody\s+mass\s+index\s*(?:[:=]|\bis\b|\bwas\b|\bof\b)?\s*\(?\s*(\d{2,3}(?:\.\d+)?)\s*\)?\b",
+        re.IGNORECASE
+    ),
+    re.compile(
+        r"\bobesity\s*,?\s*BMI\s*\(?\s*(\d{2,3}(?:\.\d+)?)\s*\)?\b",
+        re.IGNORECASE
+    ),
+    re.compile(
+        r"\bobesity\s+with\s+BMI\s*\(?\s*(\d{2,3}(?:\.\d+)?)\s*\)?\b",
+        re.IGNORECASE
+    ),
+    re.compile(
+        r"\bmorbid\s+obesity\s*,?\s*BMI\s*\(?\s*(\d{2,3}(?:\.\d+)?)\s*\)?\b",
+        re.IGNORECASE
+    ),
+    re.compile(
+        r"\bmorbid\s+obesity\s*\(\s*BMI\s*(\d{2,3}(?:\.\d+)?)\s*\)",
+        re.IGNORECASE
+    ),
+    re.compile(
+        r"\bobesity\s*\(\s*BMI\s*(\d{2,3}(?:\.\d+)?)\s*\)",
+        re.IGNORECASE
+    ),
+]
 
+THRESHOLD_FALSE_POS = re.compile(
+    r"(?:"
+    r"\bBMI\s*(?:>=|=>|>|<=|=<|<)\s*\d+(?:\.\d+)?"
+    r"|\bBMI\s*(?:greater|less)\s+than\b"
+    r"|\bBMI\s*(?:greater|less)\s+than\s+or\s+equal\s+to\b"
+    r"|\bBMI\s*(?:over|under|above|below)\b"
+    r"|\bBMI\s*\d+(?:\.\d+)?\s*(?:to|\-)\s*\d+(?:\.\d+)?\b"
+    r"|\bminimum\s+BMI\b"
+    r"|\bmaximum\s+BMI\b"
+    r"|\btarget\s+BMI\b"
+    r"|\bgoal\s+BMI\b"
+    r"|\bacceptable\s+BMI\b"
+    r"|\brequired\s+BMI\b"
+    r"|\beligibility\b"
+    r"|\bcriteria\b"
+    r"|\bqualif(?:y|ies|ied|ication)\b"
+    r")",
+    re.IGNORECASE
+)
+
+# -----------------------
+# Height / Weight patterns
+# -----------------------
+HEIGHT_M_PATTERNS = [
+    re.compile(r"\bHt\s*(?:is|=|:)?\s*(\d(?:\.\d+)?)\s*m\b", re.IGNORECASE),
+    re.compile(r"\bHeight\s*(?:is|=|:)?\s*(\d(?:\.\d+)?)\s*m\b", re.IGNORECASE),
+    re.compile(r"\bheight\s*(?:is|=|:)?\s*(\d(?:\.\d+)?)\s*m\b", re.IGNORECASE),
+]
+
+HEIGHT_CM_PATTERNS = [
+    re.compile(r"\bHt\s*(?:is|=|:)?\s*(\d{2,3}(?:\.\d+)?)\s*cm\b", re.IGNORECASE),
+    re.compile(r"\bHeight\s*(?:is|=|:)?\s*(\d{2,3}(?:\.\d+)?)\s*cm\b", re.IGNORECASE),
+    re.compile(r"\bheight\s*(?:is|=|:)?\s*(\d{2,3}(?:\.\d+)?)\s*cm\b", re.IGNORECASE),
+]
+
+HEIGHT_FT_IN_PATTERNS = [
+    re.compile(r"\b(\d)\s*'\s*(\d{1,2})\s*(?:\"|in\b|inches\b)?", re.IGNORECASE),
+    re.compile(r"\b(\d)\s*ft\.?\s*(\d{1,2})\s*(?:in|inch|inches|\" )?\b", re.IGNORECASE),
+    re.compile(r"\b(\d)\s*feet\s*(\d{1,2})\s*(?:in|inch|inches)?\b", re.IGNORECASE),
+    re.compile(r"\bheight\s*(?:is|=|:)?\s*(\d)\s*feet\s*(\d{1,2})\s*(?:in|inch|inches)?\b", re.IGNORECASE),
+    re.compile(r"\bheight\s*(?:is|=|:)?\s*(\d)\s*ft\.?\s*(\d{1,2})\s*(?:in|inch|inches)?\b", re.IGNORECASE),
+]
+
+WEIGHT_KG_PATTERNS = [
+    re.compile(r"\bWt\s*(?:is|=|:)?\s*(\d{2,3}(?:\.\d+)?)\s*kg\b", re.IGNORECASE),
+    re.compile(r"\bWeight\s*(?:is|=|:)?\s*(\d{2,3}(?:\.\d+)?)\s*kg\b", re.IGNORECASE),
+    re.compile(r"\bweight\s*(?:is|=|:)?\s*(\d{2,3}(?:\.\d+)?)\s*kg\b", re.IGNORECASE),
+]
+
+WEIGHT_LB_PATTERNS = [
+    re.compile(r"\bWt\s*(?:is|=|:)?\s*(\d{2,3}(?:\.\d+)?)\s*(?:lb|lbs|pound|pounds)\b", re.IGNORECASE),
+    re.compile(r"\bWeight\s*(?:is|=|:)?\s*(\d{2,3}(?:\.\d+)?)\s*(?:lb|lbs|pound|pounds)\b", re.IGNORECASE),
+    re.compile(r"\bweight\s*(?:is|=|:)?\s*(\d{2,3}(?:\.\d+)?)\s*(?:lb|lbs|pound|pounds)\b", re.IGNORECASE),
+]
+
+# -----------------------
+# Helpers
+# -----------------------
 def read_csv_robust(path):
     common_kwargs = dict(dtype=str, engine="python")
     try:
@@ -177,6 +275,9 @@ def window_around(text, start, end, width):
     right = min(len(text), end + width)
     return text[left:right].strip()
 
+# -----------------------
+# Structured anchor logic
+# -----------------------
 def load_structured_encounters():
     rows = []
     struct_files = []
@@ -320,6 +421,9 @@ def choose_best_bmi_anchor_rows(struct_df):
 
     return bmi_best
 
+# -----------------------
+# Notes
+# -----------------------
 def load_and_reconstruct_notes():
     note_files = []
     for g in NOTE_GLOBS:
@@ -428,6 +532,9 @@ def load_and_reconstruct_notes():
 
     return pd.DataFrame(reconstructed)
 
+# -----------------------
+# Classification helpers
+# -----------------------
 def note_type_bucket(note_type, source_file):
     s = "{0} {1}".format(clean_cell(note_type).lower(), clean_cell(source_file).lower())
 
@@ -465,23 +572,98 @@ def rank_note(note_type, source_file, day_diff):
         return (4, abs_dd, bucket)
     return (5, abs_dd, bucket)
 
-def find_snippets(text):
+def find_explicit_bmi_hits(text):
     text_norm = normalize_text(text)
-    snippets = []
+    hits = []
 
-    for rx in [BMI_RX, HT_RX, WT_RX]:
+    for rx in BMI_PATTERNS:
         for m in rx.finditer(text_norm):
-            snippets.append(window_around(text_norm, m.start(), m.end(), 140))
+            try:
+                val = float(m.group(1))
+            except Exception:
+                continue
+
+            if val < 10 or val > 80:
+                continue
+
+            ctx = window_around(text_norm, m.start(), m.end(), 160)
+
+            if THRESHOLD_FALSE_POS.search(ctx):
+                continue
+
+            hits.append((round(val, 1), ctx))
 
     dedup = []
     seen = set()
-    for s in snippets:
-        if s not in seen:
-            seen.add(s)
-            dedup.append(s)
-
+    for val, ctx in hits:
+        key = "{0}|{1}".format(val, ctx)
+        if key not in seen:
+            seen.add(key)
+            dedup.append((val, ctx))
     return dedup
 
+def find_height_candidates(text):
+    text_norm = normalize_text(text)
+    vals = []
+
+    for rx in HEIGHT_M_PATTERNS:
+        for m in rx.finditer(text_norm):
+            try:
+                h = float(m.group(1))
+            except Exception:
+                continue
+            if h >= 1.0 and h <= 2.5:
+                vals.append(("m", h, window_around(text_norm, m.start(), m.end(), 120)))
+
+    for rx in HEIGHT_CM_PATTERNS:
+        for m in rx.finditer(text_norm):
+            try:
+                h = float(m.group(1))
+            except Exception:
+                continue
+            if h >= 100 and h <= 250:
+                vals.append(("cm", h, window_around(text_norm, m.start(), m.end(), 120)))
+
+    for rx in HEIGHT_FT_IN_PATTERNS:
+        for m in rx.finditer(text_norm):
+            try:
+                ft = float(m.group(1))
+                inch = float(m.group(2))
+            except Exception:
+                continue
+            total_inches = (ft * 12.0) + inch
+            if total_inches >= 48 and total_inches <= 90:
+                vals.append(("ftin", total_inches, window_around(text_norm, m.start(), m.end(), 120)))
+
+    return vals
+
+def find_weight_candidates(text):
+    text_norm = normalize_text(text)
+    vals = []
+
+    for rx in WEIGHT_KG_PATTERNS:
+        for m in rx.finditer(text_norm):
+            try:
+                w = float(m.group(1))
+            except Exception:
+                continue
+            if w >= 25 and w <= 350:
+                vals.append(("kg", w, window_around(text_norm, m.start(), m.end(), 120)))
+
+    for rx in WEIGHT_LB_PATTERNS:
+        for m in rx.finditer(text_norm):
+            try:
+                w = float(m.group(1))
+            except Exception:
+                continue
+            if w >= 55 and w <= 800:
+                vals.append(("lb", w, window_around(text_norm, m.start(), m.end(), 120)))
+
+    return vals
+
+# -----------------------
+# Main
+# -----------------------
 def main():
     print("Loading master...")
     master = clean_cols(read_csv_robust(MASTER_FILE))
@@ -535,24 +717,32 @@ def main():
     notes_df = notes_df[notes_df[MERGE_KEY].astype(str).isin(target_mrns)].copy()
 
     rows = []
+    summary = {
+        "EXPLICIT_BMI_EXISTS": 0,
+        "COMPUTABLE_HT_WT_EXISTS": 0,
+        "TRUE_NO_BMI": 0,
+        "NO_ANCHOR": 0,
+        "NO_NOTE_IN_WINDOW": 0,
+    }
 
     for mrn in sorted(target_mrns):
         gold_bmi = clean_cell(missing_df[missing_df[MERGE_KEY] == mrn]["BMI_gold"].iloc[0])
 
         anchor = anchor_map.get(mrn)
         if anchor is None:
+            summary["NO_ANCHOR"] += 1
             rows.append({
                 "MRN": mrn,
                 "BMI_gold": gold_bmi,
+                "bucket": "NO_ANCHOR",
                 "recon_date": "",
-                "note_rank": "",
-                "note_date": "",
-                "days_from_recon": "",
-                "note_type": "",
-                "source_file": "",
-                "note_bucket": "",
-                "snippet_type": "NO_ANCHOR",
-                "snippet": ""
+                "notes_reviewed": 0,
+                "explicit_bmi_hits": 0,
+                "height_hits": 0,
+                "weight_hits": 0,
+                "example_explicit_bmi": "",
+                "example_height": "",
+                "example_weight": "",
             })
             continue
 
@@ -595,83 +785,98 @@ def main():
         )
 
         if len(ranked_notes) == 0:
+            summary["NO_NOTE_IN_WINDOW"] += 1
             rows.append({
                 "MRN": mrn,
                 "BMI_gold": gold_bmi,
+                "bucket": "NO_NOTE_IN_WINDOW",
                 "recon_date": recon_date_str,
-                "note_rank": "",
-                "note_date": "",
-                "days_from_recon": "",
-                "note_type": "",
-                "source_file": "",
-                "note_bucket": "",
-                "snippet_type": "NO_NOTE_IN_WINDOW",
-                "snippet": ""
+                "notes_reviewed": 0,
+                "explicit_bmi_hits": 0,
+                "height_hits": 0,
+                "weight_hits": 0,
+                "example_explicit_bmi": "",
+                "example_height": "",
+                "example_weight": "",
             })
             continue
 
-        note_counter = 0
+        explicit_hits = []
+        height_hits = []
+        weight_hits = []
+
+        reviewed = 0
         for note_info in ranked_notes:
-            note_counter += 1
-            if note_counter > MAX_NOTES_PER_MRN:
+            reviewed += 1
+            if reviewed > MAX_NOTES_PER_MRN:
                 break
 
-            snippets = find_snippets(note_info["note_text"])
-            if not snippets:
-                rows.append({
-                    "MRN": mrn,
-                    "BMI_gold": gold_bmi,
-                    "recon_date": recon_date_str,
-                    "note_rank": note_counter,
-                    "note_date": note_info["note_date"],
-                    "days_from_recon": note_info["days_from_recon"],
-                    "note_type": note_info["note_type"],
-                    "source_file": note_info["source_file"],
-                    "note_bucket": note_info["note_bucket"],
-                    "snippet_type": "NO_BMI_HT_WT_TERM",
-                    "snippet": ""
-                })
-                continue
+            text = note_info["note_text"]
 
-            for snip in snippets[:5]:
-                snip_low = snip.lower()
-                if "bmi" in snip_low or "body mass index" in snip_low:
-                    stype = "BMI_TERM"
-                elif "height" in snip_low or "ht" in snip_low:
-                    stype = "HEIGHT_TERM"
-                elif "weight" in snip_low or "wt" in snip_low:
-                    stype = "WEIGHT_TERM"
-                else:
-                    stype = "OTHER_TERM"
+            for v, ctx in find_explicit_bmi_hits(text):
+                explicit_hits.append("{0} | {1} | {2} | {3}".format(
+                    note_info["note_date"],
+                    note_info["note_type"],
+                    note_info["days_from_recon"],
+                    ctx
+                ))
 
-                rows.append({
-                    "MRN": mrn,
-                    "BMI_gold": gold_bmi,
-                    "recon_date": recon_date_str,
-                    "note_rank": note_counter,
-                    "note_date": note_info["note_date"],
-                    "days_from_recon": note_info["days_from_recon"],
-                    "note_type": note_info["note_type"],
-                    "source_file": note_info["source_file"],
-                    "note_bucket": note_info["note_bucket"],
-                    "snippet_type": stype,
-                    "snippet": snip
-                })
+            for unit, val, ctx in find_height_candidates(text):
+                height_hits.append("{0} | {1} | {2} | {3}".format(
+                    note_info["note_date"],
+                    note_info["note_type"],
+                    note_info["days_from_recon"],
+                    ctx
+                ))
+
+            for unit, val, ctx in find_weight_candidates(text):
+                weight_hits.append("{0} | {1} | {2} | {3}".format(
+                    note_info["note_date"],
+                    note_info["note_type"],
+                    note_info["days_from_recon"],
+                    ctx
+                ))
+
+        if len(explicit_hits) > 0:
+            bucket = "EXPLICIT_BMI_EXISTS"
+            summary[bucket] += 1
+        elif len(height_hits) > 0 and len(weight_hits) > 0:
+            bucket = "COMPUTABLE_HT_WT_EXISTS"
+            summary[bucket] += 1
+        else:
+            bucket = "TRUE_NO_BMI"
+            summary[bucket] += 1
+
+        rows.append({
+            "MRN": mrn,
+            "BMI_gold": gold_bmi,
+            "bucket": bucket,
+            "recon_date": recon_date_str,
+            "notes_reviewed": reviewed if reviewed <= MAX_NOTES_PER_MRN else MAX_NOTES_PER_MRN,
+            "explicit_bmi_hits": len(explicit_hits),
+            "height_hits": len(height_hits),
+            "weight_hits": len(weight_hits),
+            "example_explicit_bmi": explicit_hits[0] if len(explicit_hits) > 0 else "",
+            "example_height": height_hits[0] if len(height_hits) > 0 else "",
+            "example_weight": weight_hits[0] if len(weight_hits) > 0 else "",
+        })
 
     out_df = pd.DataFrame(rows)
     os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
     out_df.to_csv(OUTPUT_FILE, index=False)
 
     print("")
-    print("DONE.")
-    print("Rows written: {0}".format(len(out_df)))
-    print("Output: {0}".format(OUTPUT_FILE))
+    print("SUMMARY")
     print("")
-    print("Useful filters:")
-    print("1) snippet_type = BMI_TERM")
-    print("2) snippet_type = HEIGHT_TERM or WEIGHT_TERM")
-    print("3) snippet_type = NO_BMI_HT_WT_TERM")
-    print("4) sort by MRN, then note_rank")
+    print("Total missing cases reviewed: {0}".format(len(target_mrns)))
+    print("EXPLICIT_BMI_EXISTS: {0}".format(summary["EXPLICIT_BMI_EXISTS"]))
+    print("COMPUTABLE_HT_WT_EXISTS: {0}".format(summary["COMPUTABLE_HT_WT_EXISTS"]))
+    print("TRUE_NO_BMI: {0}".format(summary["TRUE_NO_BMI"]))
+    print("NO_ANCHOR: {0}".format(summary["NO_ANCHOR"]))
+    print("NO_NOTE_IN_WINDOW: {0}".format(summary["NO_NOTE_IN_WINDOW"]))
+    print("")
+    print("Detailed CSV written to:")
+    print(OUTPUT_FILE)
 
 if __name__ == "__main__":
     main()
