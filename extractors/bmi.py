@@ -1,16 +1,21 @@
 # ----------------------------------------------
 # UPDATE (BMI extraction improvement)
 #
-# Handles BMI patterns seen in clinic vitals:
+# Extracts BMI values from clinic vitals blocks
+# and narrative text. Handles patterns such as:
+#
 #   BMI 30.12
 #   BMI: 30.12
 #   BMI=30.12
 #   BMI 30.12 kg/m2
-#   vitals rows with "|" separators
+#   BMI 30.1
 #
-# BMI values rounded to ONE decimal to match gold dataset.
+# Handles vitals rows with separators:
+#   Temp | Ht | Wt | BMI
 #
-# Python 3.6.8 compatible.
+# BMI rounded to ONE decimal to match gold set.
+#
+# Python 3.6.8 compatible
 # ----------------------------------------------
 
 import re
@@ -18,9 +23,15 @@ from models import Candidate
 
 
 BMI_REGEX = re.compile(
-    r"BMI\s*[:=]?\s*(\d{2,3}(?:\.\d+)?)",
+    r"\bBMI\s*[:=]?\s*(\d{2,3}(?:\.\d+)?)",
     re.IGNORECASE
 )
+
+
+def normalize_text(text):
+    text = text.replace("\n", " ")
+    text = re.sub(r"\s+", " ", text)
+    return text
 
 
 def extract_bmi(note):
@@ -33,6 +44,8 @@ def extract_bmi(note):
 
         if not text:
             continue
+
+        text = normalize_text(text)
 
         matches = BMI_REGEX.findall(text)
 
@@ -57,7 +70,7 @@ def extract_bmi(note):
                     value=bmi_val,
                     confidence=0.95,
                     section=section_name,
-                    evidence="BMI extracted from vitals",
+                    evidence="BMI extracted from vitals pattern",
                     note_id=note.note_id,
                     note_date=note.note_date,
                     note_type=note.note_type
