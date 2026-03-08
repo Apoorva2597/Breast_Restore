@@ -7,9 +7,12 @@
 # - Load the already-built master file
 # - Recompute ONLY BMI using reconstruction-anchored logic
 # - Use staged fallback:
-#     1) same-day peri-op explicit BMI
-#     2) nearest peri-op explicit BMI
-#     3) nearest peri-op computed BMI
+#     1) search notes in +/-14 day window
+#        a) same-day peri-op explicit BMI
+#        b) nearest peri-op explicit BMI
+#        c) nearest peri-op computed BMI
+#     2) if NO BMI candidate found at all in +/-14 day window,
+#        search again in +/-21 day window using the same hierarchy
 # - Update only BMI and Obesity columns
 # - Write a BMI-only evidence file for QA
 #
@@ -51,6 +54,11 @@ NOTE_GLOBS = [
     "{0}/**/HPI11526*inpatient notes.csv".format(BASE_DIR),
     "{0}/**/HPI11526*operation notes.csv".format(BASE_DIR),
 ]
+
+WINDOW_STAGE1_BEFORE = 14
+WINDOW_STAGE1_AFTER = 14
+WINDOW_STAGE2_BEFORE = 21
+WINDOW_STAGE2_AFTER = 21
 
 from models import SectionedNote  # noqa: E402
 from extractors.bmi import extract_bmi  # noqa: E402
@@ -465,12 +473,6 @@ def load_and_reconstruct_notes():
 # -----------------------
 # BMI selection logic
 # -----------------------
-def bmi_note_in_allowed_window(note_dt, recon_dt):
-    dd = days_between(note_dt, recon_dt)
-    if dd is None:
-        return False
-    return (dd >= -45 and dd <= 14)
-
 def note_type_bucket(note_type, source_file):
     s = "{0} {1}".format(clean_cell(note_type).lower(), clean_cell(source_file).lower())
 
@@ -492,7 +494,7 @@ def note_type_bucket(note_type, source_file):
         return "consult"
     return "other"
 
-def bmi_stage_rank(cand, recon_dt, source_file):
+def candidate_stage_rank(cand, recon_dt, source_file):
     note_dt = parse_date_safe(getattr(cand, "note_date", ""))
     if note_dt is None or recon_dt is None:
         return None
@@ -505,28 +507,31 @@ def bmi_stage_rank(cand, recon_dt, source_file):
     status = clean_cell(getattr(cand, "status", "")).lower()
     explicit = (status != "computed")
 
-    # Stage 1: same-day peri-op explicit BMI
+    # Stage A: same-day peri-op explicit BMI
     if explicit and dd == 0 and bucket in ("brief_op", "operation", "preop", "anesthesia", "hp"):
-        return (1, 0 if bucket == "brief_op" else 1 if bucket == "operation" else 2, 0, 0)
+        bucket_ord = 0 if bucket == "brief_op" else 1 if bucket == "operation" else 2
+        return (1, bucket_ord, 0, 0, 0)
 
-    # Stage 2: nearest peri-op explicit BMI
+    # Stage B: nearest peri-op explicit BMI
     if explicit and bucket in ("brief_op", "operation", "preop", "anesthesia", "hp", "clinic", "progress", "consult"):
+        bucket_ord = 0 if bucket == "brief_op" else 1 if bucket == "operation" else 2 if bucket in ("preop", "anesthesia", "hp") else 3
         post_penalty = 1 if dd > 0 else 0
-        return (2, abs(dd), post_penalty, 0)
+        return (2, abs(dd), post_penalty, bucket_ord, 0)
 
-    # Stage 3: nearest peri-op computed BMI
+    # Stage C: nearest peri-op computed BMI
     if (not explicit) and bucket in ("brief_op", "operation", "preop", "anesthesia", "hp", "clinic", "progress", "consult"):
+        bucket_ord = 0 if bucket == "brief_op" else 1 if bucket == "operation" else 2 if bucket in ("preop", "anesthesia", "hp") else 3
         post_penalty = 1 if dd > 0 else 0
-        return (3, abs(dd), post_penalty, 0)
+        return (3, abs(dd), post_penalty, bucket_ord, 0)
 
-    return (9, abs(dd), 1 if dd > 0 else 0, 0)
+    return (9, abs(dd), 1 if dd > 0 else 0, 9, 0)
 
 def choose_best_bmi(existing, new, recon_dt, source_file):
     if existing is None:
         return new
 
-    ex_rank = bmi_stage_rank(existing, recon_dt, source_file)
-    nw_rank = bmi_stage_rank(new, recon_dt, source_file)
+    ex_rank = candidate_stage_rank(existing, recon_dt, source_file)
+    nw_rank = candidate_stage_rank(new, recon_dt, source_file)
 
     if ex_rank is None:
         return new
@@ -544,29 +549,15 @@ def choose_best_bmi(existing, new, recon_dt, source_file):
 
     return existing
 
-# -----------------------
-# Main
-# -----------------------
-def main():
-    print("Loading master...")
-    master = clean_cols(read_csv_robust(MASTER_FILE))
-    master = normalize_mrn(master)
+def note_in_window(note_dt, recon_dt, before_days, after_days):
+    dd = days_between(note_dt, recon_dt)
+    if dd is None:
+        return False
+    return (dd >= (-1 * before_days) and dd <= after_days)
 
-    print("Master rows: {0}".format(len(master)))
-
-    print("Loading structured encounters...")
-    struct_df = load_structured_encounters()
-    bmi_anchor_map = choose_best_bmi_anchor_rows(struct_df)
-    print("Structured reconstruction-date BMI anchors found for MRNs: {0}".format(len(bmi_anchor_map)))
-
-    print("Loading and reconstructing notes...")
-    notes_df = load_and_reconstruct_notes()
-    print("Reconstructed notes: {0}".format(len(notes_df)))
-
-    evidence_rows = []
+def collect_bmi_candidates_for_window(notes_df, bmi_anchor_map, before_days, after_days, evidence_rows):
     best_bmi_by_mrn = {}
-
-    print("Running BMI-only update...")
+    notes_with_any_candidate = set()
 
     for _, row in notes_df.iterrows():
         mrn = clean_cell(row.get(MERGE_KEY, ""))
@@ -583,7 +574,7 @@ def main():
         if recon_dt is None or note_dt is None:
             continue
 
-        if not bmi_note_in_allowed_window(note_dt, recon_dt):
+        if not note_in_window(note_dt, recon_dt, before_days, after_days):
             continue
 
         snote = build_sectioned_note(
@@ -606,12 +597,15 @@ def main():
                 "STATUS": "",
                 "CONFIDENCE": "",
                 "SECTION": "",
+                "WINDOW_USED": "{0}_{1}".format(before_days, after_days),
                 "EVIDENCE": "extract_bmi failed: {0}".format(repr(e))
             })
             continue
 
         if not bmi_candidates:
             continue
+
+        notes_with_any_candidate.add(mrn)
 
         for c in bmi_candidates:
             note_day_diff = days_between(parse_date_safe(getattr(c, "note_date", "")), recon_dt)
@@ -631,20 +625,82 @@ def main():
                 "STATUS": getattr(c, "status", ""),
                 "CONFIDENCE": getattr(c, "confidence", ""),
                 "SECTION": getattr(c, "section", ""),
+                "WINDOW_USED": "{0}_{1}".format(before_days, after_days),
                 "EVIDENCE": evid
             })
 
             existing = best_bmi_by_mrn.get(mrn)
             best_bmi_by_mrn[mrn] = choose_best_bmi(existing, c, recon_dt, row.get("SOURCE_FILE", ""))
 
-    print("BMI predictions aggregated for MRNs: {0}".format(len(best_bmi_by_mrn)))
+    return best_bmi_by_mrn, notes_with_any_candidate, evidence_rows
+
+# -----------------------
+# Main
+# -----------------------
+def main():
+    print("Loading master...")
+    master = clean_cols(read_csv_robust(MASTER_FILE))
+    master = normalize_mrn(master)
+    print("Master rows: {0}".format(len(master)))
+
+    print("Loading structured encounters...")
+    struct_df = load_structured_encounters()
+    bmi_anchor_map = choose_best_bmi_anchor_rows(struct_df)
+    print("Structured reconstruction-date BMI anchors found for MRNs: {0}".format(len(bmi_anchor_map)))
+
+    print("Loading and reconstructing notes...")
+    notes_df = load_and_reconstruct_notes()
+    print("Reconstructed notes: {0}".format(len(notes_df)))
+
+    evidence_rows = []
+
+    print("Stage 1: searching BMI in +/-14 day window...")
+    best_stage1, found_stage1, evidence_rows = collect_bmi_candidates_for_window(
+        notes_df=notes_df,
+        bmi_anchor_map=bmi_anchor_map,
+        before_days=WINDOW_STAGE1_BEFORE,
+        after_days=WINDOW_STAGE1_AFTER,
+        evidence_rows=evidence_rows
+    )
+    print("MRNs with any BMI candidate in +/-14 days: {0}".format(len(found_stage1)))
+
+    # Stage 2 fallback only for MRNs with anchor and no candidates in stage 1
+    fallback_mrns = set()
+    for mrn in bmi_anchor_map.keys():
+        if mrn not in found_stage1:
+            fallback_mrns.add(mrn)
+
+    print("Stage 2 fallback: searching BMI in +/-21 day window ONLY for MRNs with no candidate in +/-14 days...")
+    print("Fallback MRNs: {0}".format(len(fallback_mrns)))
+
+    notes_stage2 = notes_df[notes_df[MERGE_KEY].astype(str).str.strip().isin(fallback_mrns)].copy()
+
+    best_stage2, found_stage2, evidence_rows = collect_bmi_candidates_for_window(
+        notes_df=notes_stage2,
+        bmi_anchor_map=bmi_anchor_map,
+        before_days=WINDOW_STAGE2_BEFORE,
+        after_days=WINDOW_STAGE2_AFTER,
+        evidence_rows=evidence_rows
+    )
+    print("MRNs with any BMI candidate in +/-21 fallback: {0}".format(len(found_stage2)))
+
+    # Combine results: stage1 wins whenever available; stage2 only fills missing
+    final_best_bmi = {}
+    for mrn, cand in best_stage1.items():
+        final_best_bmi[mrn] = cand
+
+    for mrn, cand in best_stage2.items():
+        if mrn not in final_best_bmi:
+            final_best_bmi[mrn] = cand
+
+    print("Final BMI predictions aggregated for MRNs: {0}".format(len(final_best_bmi)))
 
     if "BMI" not in master.columns:
         master["BMI"] = pd.NA
     if "Obesity" not in master.columns:
         master["Obesity"] = pd.NA
 
-    for mrn, cand in best_bmi_by_mrn.items():
+    for mrn, cand in final_best_bmi.items():
         mask = (master[MERGE_KEY].astype(str).str.strip() == mrn)
         if not mask.any():
             continue
