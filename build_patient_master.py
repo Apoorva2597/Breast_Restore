@@ -14,7 +14,7 @@
 #
 # UPDATE:
 # - BMI anchoring widened to peri-reconstruction notes.
-# - BMI is now searched across ALL notes in the best available date window
+# - BMI is searched across all notes in the best available date window
 #   around the structured reconstruction date:
 #     (1) same day
 #     (2) +/- 1 day
@@ -23,8 +23,7 @@
 #     OP NOTE / BRIEF OP NOTE / operative / operation
 #     then anesthesia / pre-op
 #     then progress / clinic / H&P / physical exam style notes
-# - This keeps BMI reconstruction-timed while no longer assuming the BMI
-#   must be written inside the OP NOTE text itself.
+# - BMI is written to the master file rounded to ONE decimal.
 #
 # Python 3.6.8 compatible
 
@@ -74,6 +73,7 @@ from extractors.comorbidities import extract_comorbidities  # noqa: E402
 from extractors.pbs import extract_pbs  # noqa: E402
 from extractors.mastectomy import extract_mastectomy  # noqa: E402
 from extractors.cancer_treatment import extract_cancer_treatment  # noqa: E402
+
 
 # -----------------------
 # Robust CSV read
@@ -966,7 +966,7 @@ def enrich_master_with_structured_demo(master, notes_df, evidence_rows):
 
 def choose_bmi_candidate_note_ids_by_mrn(notes_df, bmi_anchor_map):
     """
-    For each MRN with structured reconstruction date anchor, return ALL candidate
+    For each MRN with structured reconstruction date anchor, return all candidate
     note NOTE_IDs in the best available date window:
       same day > +/-1 day > +/-3 days
 
@@ -980,8 +980,6 @@ def choose_bmi_candidate_note_ids_by_mrn(notes_df, bmi_anchor_map):
     tmp = notes_df.copy()
     tmp["NOTE_DATE_PARSED"] = tmp["NOTE_DATE"].apply(parse_date_safe)
     tmp["BMI_NOTE_TYPE_PRIORITY"] = tmp["NOTE_TYPE"].apply(bmi_note_type_priority)
-
-    # keep note types we are willing to consider for BMI
     tmp = tmp[tmp["BMI_NOTE_TYPE_PRIORITY"] < 9].copy()
 
     if len(tmp) == 0:
@@ -1191,9 +1189,9 @@ def main():
 
             if logical == "BMI" and not pd.isna(val):
                 try:
-                    bmi_val = round(float(val))
+                    bmi_val = round(float(val), 1)
                     master.loc[mask, "BMI"] = bmi_val
-                    master.loc[mask, "Obesity"] = 1 if bmi_val >= 30 else 0
+                    master.loc[mask, "Obesity"] = 1 if bmi_val >= 30.0 else 0
                 except Exception:
                     master.loc[mask, "BMI"] = pd.NA
                 continue
