@@ -1,35 +1,51 @@
 import pandas as pd
 
-mrn = input("Enter MRN: ").strip()
+GOLD = "gold_cleaned_for_cedar.csv"
+PRED = "_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv"
+EVID = "_outputs/rule_hit_evidence_FINAL_NO_GOLD.csv"
 
-def read_csv_safe(path):
-    try:
-        return pd.read_csv(path, dtype=str)
-    except:
-        return pd.read_csv(path, dtype=str, encoding="latin1")
+gold = pd.read_csv(GOLD, dtype=str)
+pred = pd.read_csv(PRED, dtype=str)
+evid = pd.read_csv(EVID, dtype=str)
 
-clinic = read_csv_safe("/home/apokol/Breast_Restore/_staging_inputs/HPI11526 Clinic Encounters.csv")
-opnotes = read_csv_safe("/home/apokol/Breast_Restore/_staging_inputs/HPI11526 Operation Notes.csv")
+gold["MRN"] = gold["MRN"].astype(str).str.strip()
+pred["MRN"] = pred["MRN"].astype(str).str.strip()
+evid["MRN"] = evid["MRN"].astype(str).str.strip()
 
-clinic.columns=[str(c).strip() for c in clinic.columns]
-opnotes.columns=[str(c).strip() for c in opnotes.columns]
+# Only true BMI extraction rows
+bmi_evid = evid[evid["FIELD"].astype(str).str.strip() == "BMI"].copy()
 
-clinic["MRN"]=clinic["MRN"].astype(str).str.strip()
-opnotes["MRN"]=opnotes["MRN"].astype(str).str.strip()
+# Clean up
+for c in ["VALUE", "NOTE_DATE", "NOTE_TYPE", "SECTION", "EVIDENCE", "STATUS", "CONFIDENCE"]:
+    if c in bmi_evid.columns:
+        bmi_evid[c] = bmi_evid[c].astype(str).str.strip()
 
-c=clinic[clinic["MRN"]==mrn]
-o=opnotes[opnotes["MRN"]==mrn]
+# Merge gold + pred first
+merged = gold.merge(pred, on="MRN", how="inner", suffixes=("_gold", "_pred"))
 
-print("\n=== CLINIC ENCOUNTERS ===")
-if len(c)==0:
-    print("No clinic rows found")
+# Then attach ALL BMI evidence rows
+out = merged.merge(
+    bmi_evid[["MRN", "VALUE", "NOTE_DATE", "NOTE_TYPE", "SECTION", "STATUS", "CONFIDENCE", "EVIDENCE"]],
+    on="MRN",
+    how="left"
+)
+
+# Keep only rows where there was some BMI extraction evidence
+out_nonnull = out[out["VALUE"].notna()].copy()
+
+print("\nBMI EXTRACTION QA\n")
+if len(out_nonnull) == 0:
+    print("No BMI extraction rows found in evidence file.")
 else:
-    cols=[x for x in ["MRN","AGE_AT_ENCOUNTER","ADMIT_DATE","RECONSTRUCTION_DATE","CPT_CODE","PROCEDURE","REASON_FOR_VISIT"] if x in c.columns]
-    print(c[cols].fillna("").to_string(index=False))
+    print(
+        out_nonnull[
+            ["MRN", "BMI_gold", "BMI_pred", "VALUE", "NOTE_DATE", "NOTE_TYPE", "SECTION", "STATUS", "CONFIDENCE", "EVIDENCE"]
+        ].head(100).to_string(index=False)
+    )
 
-print("\n=== OPERATION NOTES ===")
-if len(o)==0:
-    print("No operation notes found")
-else:
-    cols=[x for x in ["MRN","NOTE_ID","NOTE_TYPE","NOTE_DATE_OF_SERVICE"] if x in o.columns]
-    print(o[cols].drop_duplicates().fillna("").to_string(index=False))
+out_nonnull[
+    ["MRN", "BMI_gold", "BMI_pred", "VALUE", "NOTE_DATE", "NOTE_TYPE", "SECTION", "STATUS", "CONFIDENCE", "EVIDENCE"]
+].to_csv("_outputs/bmi_extraction_qa.csv", index=False)
+
+print("\nSaved:")
+print("_outputs/bmi_extraction_qa.csv")
