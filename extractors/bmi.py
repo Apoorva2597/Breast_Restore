@@ -1,14 +1,14 @@
 # ----------------------------------------------
-# UPDATE (NLP refinement):
-# Improved BMI extraction using vitals-style regex
-# capturing patterns such as:
-#   "BMI 30.12"
-#   "BMI: 30.12"
-#   "BMI=30.12"
-#   "BMI 30 kg/m2"
+# UPDATE (BMI extraction improvement)
 #
-# BMI values are rounded to ONE decimal to match
-# the gold dataset formatting.
+# Handles BMI patterns seen in clinic vitals:
+#   BMI 30.12
+#   BMI: 30.12
+#   BMI=30.12
+#   BMI 30.12 kg/m2
+#   vitals rows with "|" separators
+#
+# BMI values rounded to ONE decimal to match gold dataset.
 #
 # Python 3.6.8 compatible.
 # ----------------------------------------------
@@ -18,7 +18,7 @@ from models import Candidate
 
 
 BMI_REGEX = re.compile(
-    r"\bBMI\s*[:=]?\s*(\d{2,3}(?:\.\d+)?)",
+    r"BMI\s*[:=]?\s*(\d{2,3}(?:\.\d+)?)",
     re.IGNORECASE
 )
 
@@ -49,7 +49,6 @@ def extract_bmi(note):
             if bmi_val < 10 or bmi_val > 80:
                 continue
 
-            # round to ONE decimal to match gold dataset
             bmi_val = round(bmi_val, 1)
 
             results.append(
@@ -58,7 +57,7 @@ def extract_bmi(note):
                     value=bmi_val,
                     confidence=0.95,
                     section=section_name,
-                    evidence="BMI extracted from vitals pattern",
+                    evidence="BMI extracted from vitals",
                     note_id=note.note_id,
                     note_date=note.note_date,
                     note_type=note.note_type
