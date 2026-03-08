@@ -26,10 +26,16 @@ from models import Candidate
 #     "(BMI 37.28)"
 # - Returns multiple candidates per note so build/ranking logic
 #   can choose the best reconstruction-linked value.
+# - NEW FALLBACK:
+#   If explicit BMI is absent, compute BMI from height + weight found
+#   in the same note.
 #
 # Python 3.6.8 compatible.
 # ----------------------------------------------
 
+# -----------------------
+# Explicit BMI patterns
+# -----------------------
 BMI_PATTERNS = [
     re.compile(
         r"\bBMI\s*(?:[:=]|\bis\b|\bwas\b|\bof\b)?\s*\(?\s*(\d{2,3}(?:\.\d+)?)\s*\)?\b",
@@ -49,6 +55,9 @@ BMI_PATTERNS = [
     ),
 ]
 
+# -----------------------
+# Threshold / non-measured BMI contexts to reject
+# -----------------------
 THRESHOLD_FALSE_POS = re.compile(
     r"(?:"
     r"\bBMI\s*(?:>=|=>|>|<=|=<|<)\s*\d+(?:\.\d+)?"
@@ -82,6 +91,47 @@ CONDITIONAL_FALSE_POS = re.compile(
     r")",
     re.IGNORECASE
 )
+
+# -----------------------
+# Height / Weight fallback patterns
+# -----------------------
+
+# Height in meters: Ht 1.753 m / Height 1.626 m
+HEIGHT_M_PATTERNS = [
+    re.compile(r"\bHt\s*[:=]?\s*(\d(?:\.\d+)?)\s*m\b", re.IGNORECASE),
+    re.compile(r"\bHeight\s*[:=]?\s*(\d(?:\.\d+)?)\s*m\b", re.IGNORECASE),
+]
+
+# Height in centimeters: Height 168 cm / Ht 170 cm
+HEIGHT_CM_PATTERNS = [
+    re.compile(r"\bHt\s*[:=]?\s*(\d{2,3}(?:\.\d+)?)\s*cm\b", re.IGNORECASE),
+    re.compile(r"\bHeight\s*[:=]?\s*(\d{2,3}(?:\.\d+)?)\s*cm\b", re.IGNORECASE),
+]
+
+# Height in feet/inches:
+# 5' 8"
+# 5'8"
+# 5 ft 8 in
+# 5 ft 8
+HEIGHT_FT_IN_PATTERNS = [
+    re.compile(r"\b(\d)\s*'\s*(\d{1,2})\s*(?:\"|in\b)?", re.IGNORECASE),
+    re.compile(r"\b(\d)\s*ft\.?\s*(\d{1,2})\s*(?:in|inches|\" )?\b", re.IGNORECASE),
+]
+
+# Weight in kg: Wt 73.2 kg / Weight 130 kg
+WEIGHT_KG_PATTERNS = [
+    re.compile(r"\bWt\s*[:=]?\s*(\d{2,3}(?:\.\d+)?)\s*kg\b", re.IGNORECASE),
+    re.compile(r"\bWeight\s*[:=]?\s*(\d{2,3}(?:\.\d+)?)\s*kg\b", re.IGNORECASE),
+]
+
+# Weight in lb:
+# Wt 161 lb
+# Weight 220 lb
+# Weight: (!) 130 kg handled by kg regex above, so okay
+WEIGHT_LB_PATTERNS = [
+    re.compile(r"\bWt\s*[:=]?\s*(\d{2,3}(?:\.\d+)?)\s*lb\b", re.IGNORECASE),
+    re.compile(r"\bWeight\s*[:=]?\s*(\d{2,3}(?:\.\d+)?)\s*lb\b", re.IGNORECASE),
+]
 
 PREFERRED_SECTIONS = set([
     "FULL",
@@ -126,12 +176,15 @@ def _section_order(note):
             order.append(s)
     return order
 
-def _confidence_for_context(note_type, section, evidence):
+def _confidence_for_context(note_type, section, evidence, source_kind):
     nt = str(note_type or "").lower().strip()
     sec = str(section or "").upper().strip()
     ev = str(evidence or "").lower()
 
-    score = 0.90
+    if source_kind == "computed":
+        score = 0.88
+    else:
+        score = 0.90
 
     if (
         "brief op" in nt or
@@ -139,13 +192,13 @@ def _confidence_for_context(note_type, section, evidence):
         "operation" in nt or
         "op note" in nt
     ):
-        score = 0.96
+        score += 0.06
     elif (
         "anesthesia" in nt or
         "pre-op" in nt or
         "preop" in nt
     ):
-        score = 0.94
+        score += 0.04
     elif (
         "progress" in nt or
         "clinic" in nt or
@@ -153,24 +206,25 @@ def _confidence_for_context(note_type, section, evidence):
         "consult" in nt or
         "h&p" in nt
     ):
-        score = 0.92
+        score += 0.02
 
     if sec in {
-        "OPERATIVE NOTE",
-        "BRIEF OPERATIVE NOTE",
-        "OPERATIVE FINDINGS",
+        "VITALS",
+        "PHYSICAL EXAM",
+        "HPI",
+        "HISTORY OF PRESENT ILLNESS",
         "PREOPERATIVE DIAGNOSIS",
         "POSTOPERATIVE DIAGNOSIS",
         "INDICATIONS FOR PROCEDURE",
         "INDICATIONS",
-        "CODING NOTE",
-        "MICROSURGICAL DETAILS",
-        "VITALS",
+        "OPERATIVE NOTE",
+        "BRIEF OPERATIVE NOTE",
     }:
         score += 0.01
 
-    if "kg/m2" in ev or "kg/m^2" in ev or "kg/m²" in ev:
-        score += 0.01
+    if source_kind == "explicit":
+        if "kg/m2" in ev or "kg/m^2" in ev or "kg/m²" in ev:
+            score += 0.01
 
     if score > 0.99:
         score = 0.99
@@ -185,19 +239,105 @@ def window_around(text, start, end, width):
 def _candidate_sort_key(c):
     conf = float(getattr(c, "confidence", 0.0) or 0.0)
     evid = str(getattr(c, "evidence", "") or "")
-    return (-conf, -len(evid))
+    source_kind = str(getattr(c, "status", "") or "")
+    explicit_bonus = 0 if source_kind == "measured" else 1
+    return (explicit_bonus, -conf, -len(evid))
+
+def _find_all_height_candidates(text):
+    vals_m = []
+
+    for rx in HEIGHT_M_PATTERNS:
+        for m in rx.finditer(text):
+            try:
+                h_m = float(m.group(1))
+            except Exception:
+                continue
+            if h_m >= 1.0 and h_m <= 2.5:
+                vals_m.append((h_m, m.start(), m.end()))
+
+    for rx in HEIGHT_CM_PATTERNS:
+        for m in rx.finditer(text):
+            try:
+                h_cm = float(m.group(1))
+            except Exception:
+                continue
+            if h_cm >= 100 and h_cm <= 250:
+                vals_m.append((h_cm / 100.0, m.start(), m.end()))
+
+    for rx in HEIGHT_FT_IN_PATTERNS:
+        for m in rx.finditer(text):
+            try:
+                ft = float(m.group(1))
+                inch = float(m.group(2))
+            except Exception:
+                continue
+            total_inches = (ft * 12.0) + inch
+            if total_inches >= 48 and total_inches <= 90:
+                vals_m.append((total_inches * 0.0254, m.start(), m.end()))
+
+    return vals_m
+
+def _find_all_weight_candidates(text):
+    vals_kg = []
+
+    for rx in WEIGHT_KG_PATTERNS:
+        for m in rx.finditer(text):
+            try:
+                w_kg = float(m.group(1))
+            except Exception:
+                continue
+            if w_kg >= 25 and w_kg <= 350:
+                vals_kg.append((w_kg, m.start(), m.end()))
+
+    for rx in WEIGHT_LB_PATTERNS:
+        for m in rx.finditer(text):
+            try:
+                w_lb = float(m.group(1))
+            except Exception:
+                continue
+            if w_lb >= 55 and w_lb <= 800:
+                vals_kg.append((w_lb * 0.45359237, m.start(), m.end()))
+
+    return vals_kg
+
+def _pair_height_weight(height_candidates, weight_candidates):
+    """
+    Pair nearest height and weight mentions in same note section.
+    """
+    pairs = []
+    for h_val, h_start, h_end in height_candidates:
+        best = None
+        best_dist = None
+        for w_val, w_start, w_end in weight_candidates:
+            dist = abs(h_start - w_start)
+            if best is None or dist < best_dist:
+                best = (w_val, w_start, w_end)
+                best_dist = dist
+        if best is not None:
+            pairs.append((h_val, h_start, h_end, best[0], best[1], best[2], best_dist))
+    return pairs
+
+def _has_explicit_bmi_in_text(text):
+    for rx in BMI_PATTERNS:
+        if rx.search(text):
+            return True
+    return False
 
 def extract_bmi(note):
     """
     Extract measured BMI values from a note.
-
-    Returns:
-        list[Candidate]
+    Priority:
+    1) Explicit BMI mentions
+    2) If none found in the note, compute BMI from height + weight
     """
     candidates = []
     seen = set()
+    explicit_found_anywhere = False
     section_order = _section_order(note)
 
+    # -----------------------
+    # Pass 1: explicit BMI
+    # -----------------------
     for section in section_order:
         raw_text = note.sections.get(section, "") or ""
         if not raw_text:
@@ -238,8 +378,9 @@ def extract_bmi(note):
                         continue
 
                 bmi_val = round(bmi_val, 1)
+                explicit_found_anywhere = True
 
-                key = "{0}|{1}|{2}|{3}|{4}".format(
+                key = "{0}|{1}|{2}|{3}|{4}|explicit".format(
                     bmi_val,
                     section,
                     note.note_id,
@@ -260,9 +401,89 @@ def extract_bmi(note):
                         note_type=note.note_type,
                         note_id=note.note_id,
                         note_date=note.note_date,
-                        confidence=_confidence_for_context(note.note_type, section, ctx),
+                        confidence=_confidence_for_context(note.note_type, section, ctx, "explicit"),
                     )
                 )
+
+    if explicit_found_anywhere:
+        candidates = sorted(candidates, key=_candidate_sort_key)
+        return candidates
+
+    # -----------------------
+    # Pass 2: compute from height + weight fallback
+    # Only if NO explicit BMI found anywhere in note
+    # -----------------------
+    for section in section_order:
+        raw_text = note.sections.get(section, "") or ""
+        if not raw_text:
+            continue
+
+        text = _normalize_text(raw_text)
+        if not text:
+            continue
+
+        # extra safety
+        if _has_explicit_bmi_in_text(text):
+            continue
+
+        height_candidates = _find_all_height_candidates(text)
+        weight_candidates = _find_all_weight_candidates(text)
+
+        if not height_candidates or not weight_candidates:
+            continue
+
+        pairs = _pair_height_weight(height_candidates, weight_candidates)
+
+        for h_m, h_start, h_end, w_kg, w_start, w_end, pair_dist in pairs:
+            if h_m <= 0:
+                continue
+
+            try:
+                bmi_val = w_kg / (h_m ** 2)
+            except Exception:
+                continue
+
+            if bmi_val < 10 or bmi_val > 80:
+                continue
+
+            bmi_val = round(bmi_val, 1)
+
+            start = min(h_start, w_start)
+            end = max(h_end, w_end)
+            ctx = window_around(text, start, end, 180)
+
+            # avoid computing from clearly non-current or junk contexts
+            if THRESHOLD_FALSE_POS.search(ctx):
+                continue
+
+            key = "{0}|{1}|{2}|{3}|{4}|computed".format(
+                bmi_val,
+                section,
+                note.note_id,
+                note.note_date,
+                ctx
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+
+            evidence = "BMI_COMPUTED_FROM_HEIGHT_WEIGHT | height_m={0:.3f} | weight_kg={1:.1f} | {2}".format(
+                h_m, w_kg, ctx
+            )
+
+            candidates.append(
+                Candidate(
+                    field="BMI",
+                    value=bmi_val,
+                    status="computed",
+                    evidence=evidence,
+                    section=section,
+                    note_type=note.note_type,
+                    note_id=note.note_id,
+                    note_date=note.note_date,
+                    confidence=_confidence_for_context(note.note_type, section, evidence, "computed"),
+                )
+            )
 
     if not candidates:
         return []
