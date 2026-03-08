@@ -12,6 +12,15 @@
 #   1) /home/apokol/Breast_Restore/_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv
 #   2) /home/apokol/Breast_Restore/_outputs/rule_hit_evidence_FINAL_NO_GOLD.csv
 #
+# UPDATE:
+# - BMI is now anchored to reconstruction-date OP notes only.
+# - Reconstruction date is selected from structured encounter rows using
+#   the same reconstruction-style anchoring logic used for age, but BMI
+#   does NOT require AGE_AT_ENCOUNTER.
+# - During note extraction, extract_bmi is only run when:
+#     (1) the note is an operation/operative note, and
+#     (2) NOTE_DATE matches the selected reconstruction date for that MRN.
+#
 # Python 3.6.8 compatible
 
 import os
@@ -178,6 +187,20 @@ def parse_date_safe(x):
         return ts.to_pydatetime()
     except Exception:
         return None
+
+
+def same_calendar_date(d1, d2):
+    if d1 is None or d2 is None:
+        return False
+    try:
+        return d1.date() == d2.date()
+    except Exception:
+        return False
+
+
+def is_operation_note_type(note_type):
+    nt = clean_cell(note_type).lower()
+    return ("op" in nt) or ("operation" in nt) or ("operative" in nt)
 
 
 # -----------------------
@@ -494,7 +517,7 @@ def load_and_reconstruct_notes():
 
 
 # -----------------------
-# Structured enrichment: Race / Ethnicity / Age
+# Structured enrichment: Race / Ethnicity / Age / BMI anchor date
 # -----------------------
 def load_structured_encounters():
     rows = []
@@ -672,12 +695,16 @@ def choose_race_us_categories(struct_df):
     return out
 
 
-# ---------- Age logic with clinic->operation->inpatient priority and fallback CPTs ----------
-def choose_best_clinic_age_rows(struct_df):
-    age_best = {}
+def _recon_anchor_helper(struct_df, require_age=False):
+    """
+    Shared reconstruction-row chooser used by age and BMI anchor logic.
+    When require_age=True, requires AGE_AT_ENCOUNTER.
+    When require_age=False, only needs reconstruction date/admit date and qualifying recon anchor.
+    """
+    out_best = {}
 
     if len(struct_df) == 0:
-        return age_best
+        return out_best
 
     source_priority = {
         "clinic": 1,
@@ -707,7 +734,7 @@ def choose_best_clinic_age_rows(struct_df):
 
     eligible_sources = struct_df[struct_df["STRUCT_SOURCE"].isin(["clinic", "operation", "inpatient"])].copy()
     if len(eligible_sources) == 0:
-        return age_best
+        return out_best
 
     has_preferred_cpt = {}
 
@@ -739,7 +766,10 @@ def choose_best_clinic_age_rows(struct_df):
         procedure = clean_cell(row.get("PROCEDURE_STRUCT", "")).lower()
         reason_for_visit = clean_cell(row.get("REASON_FOR_VISIT_STRUCT", "")).lower()
 
-        if age_base is None or admit_date is None or recon_date is None:
+        if require_age and age_base is None:
+            continue
+
+        if admit_date is None or recon_date is None:
             continue
 
         if cpt_code in primary_exclude_cpts:
@@ -772,28 +802,18 @@ def choose_best_clinic_age_rows(struct_df):
         if not is_anchor:
             continue
 
-        day_diff = (recon_date - admit_date).days
-        adjusted_age = float(age_base) + (float(day_diff) / 365.25)
-
-        age_floor = int(math.floor(adjusted_age))
-        age_round = int(math.floor(adjusted_age + 0.5))
-
         score = (
             source_priority[source],
             recon_date,
             admit_date
         )
 
-        current_best = age_best.get(mrn)
+        current_best = out_best.get(mrn)
 
         if current_best is None or score < current_best["score"]:
-            age_best[mrn] = {
-                "age_at_encounter": age_raw,
+            payload = {
                 "admit_date": admit_date.strftime("%Y-%m-%d"),
                 "recon_date": recon_date.strftime("%Y-%m-%d"),
-                "day_diff": day_diff,
-                "value_floor": age_floor,
-                "value_round": age_round,
                 "score": score,
                 "source": source,
                 "cpt_code": cpt_code,
@@ -801,11 +821,35 @@ def choose_best_clinic_age_rows(struct_df):
                 "reason_for_visit": clean_cell(row.get("REASON_FOR_VISIT_STRUCT", ""))
             }
 
-    return age_best
+            if require_age:
+                day_diff = (recon_date - admit_date).days
+                adjusted_age = float(age_base) + (float(day_diff) / 365.25)
+                age_floor = int(math.floor(adjusted_age))
+                age_round = int(math.floor(adjusted_age + 0.5))
+                payload.update({
+                    "age_at_encounter": age_raw,
+                    "day_diff": day_diff,
+                    "value_floor": age_floor,
+                    "value_round": age_round
+                })
+
+            out_best[mrn] = payload
+
+    return out_best
+
+
+# ---------- Age logic with clinic->operation->inpatient priority and fallback CPTs ----------
+def choose_best_clinic_age_rows(struct_df):
+    return _recon_anchor_helper(struct_df, require_age=True)
+
+
+def choose_best_bmi_recon_rows(struct_df):
+    return _recon_anchor_helper(struct_df, require_age=False)
 
 
 def enrich_master_with_structured_demo(master, notes_df, evidence_rows):
     print("Loading structured encounters for Race / Ethnicity / Age...")
+
     struct_df = load_structured_encounters()
     print("Structured encounter rows: {0}".format(len(struct_df)))
 
@@ -916,6 +960,11 @@ def main():
 
     master, evidence_rows = enrich_master_with_structured_demo(master, notes_df, evidence_rows)
 
+    # BMI anchor map: selected reconstruction date per MRN from structured encounters
+    struct_df_for_bmi = load_structured_encounters()
+    bmi_anchor_map = choose_best_bmi_recon_rows(struct_df_for_bmi)
+    print("Structured reconstruction-date BMI anchor rows found for MRNs: {0}".format(len(bmi_anchor_map)))
+
     print("Running rule-based extractors...")
     extractor_fns = [
         extract_age,
@@ -942,6 +991,24 @@ def main():
         all_cands = []
 
         for fn in extractor_fns:
+            # BMI special rule:
+            # only run extract_bmi on operation/operative notes whose NOTE_DATE matches
+            # the selected reconstruction date for that MRN.
+            if fn == extract_bmi:
+                bmi_anchor = bmi_anchor_map.get(mrn)
+
+                if bmi_anchor is None:
+                    continue
+
+                recon_dt = parse_date_safe(bmi_anchor.get("recon_date", ""))
+                note_dt = parse_date_safe(row["NOTE_DATE"])
+
+                if not is_operation_note_type(row["NOTE_TYPE"]):
+                    continue
+
+                if not same_calendar_date(note_dt, recon_dt):
+                    continue
+
             try:
                 all_cands.extend(fn(snote))
             except Exception as e:
