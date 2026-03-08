@@ -8,7 +8,6 @@ from models import Candidate
 # Rewritten BMI extractor for reconstruction workflow.
 #
 # Key changes:
-# - No longer returns early after the first attempted match.
 # - Scans the whole note and collects ALL valid BMI mentions.
 # - Keeps explicit measured BMI values from operative / peri-op notes.
 # - Rejects threshold / policy / eligibility statements such as:
@@ -31,7 +30,6 @@ from models import Candidate
 # Python 3.6.8 compatible.
 # ----------------------------------------------
 
-# Explicit measured BMI expressions
 BMI_PATTERNS = [
     re.compile(
         r"\bBMI\s*(?:[:=]|\bis\b|\bwas\b|\bof\b)?\s*\(?\s*(\d{2,3}(?:\.\d+)?)\s*\)?\b",
@@ -51,7 +49,6 @@ BMI_PATTERNS = [
     ),
 ]
 
-# Threshold / guideline / comparison language to reject
 THRESHOLD_FALSE_POS = re.compile(
     r"(?:"
     r"\bBMI\s*(?:>=|=>|>|<=|=<|<)\s*\d+(?:\.\d+)?"
@@ -72,7 +69,6 @@ THRESHOLD_FALSE_POS = re.compile(
     re.IGNORECASE
 )
 
-# Contexts where BMI is mentioned conceptually, not as a measured value
 CONDITIONAL_FALSE_POS = re.compile(
     r"(?:"
     r"\bif\s+BMI\b"
@@ -173,7 +169,6 @@ def _confidence_for_context(note_type, section, evidence):
     }:
         score += 0.01
 
-    # Slight boost if units are present around the match
     if "kg/m2" in ev or "kg/m^2" in ev or "kg/m²" in ev:
         score += 0.01
 
@@ -188,7 +183,6 @@ def window_around(text, start, end, width):
     return text[left:right].strip()
 
 def _candidate_sort_key(c):
-    # Higher confidence first; then longer evidence as a weak tie-breaker
     conf = float(getattr(c, "confidence", 0.0) or 0.0)
     evid = str(getattr(c, "evidence", "") or "")
     return (-conf, -len(evid))
@@ -222,18 +216,15 @@ def extract_bmi(note):
                 except Exception:
                     continue
 
-                # Plausible adult BMI range
                 if bmi_val < 10 or bmi_val > 80:
                     continue
 
                 ctx = window_around(text, m.start(), m.end(), 160)
                 ctx_low = ctx.lower()
 
-                # Reject clear threshold / policy language
                 if THRESHOLD_FALSE_POS.search(ctx):
                     continue
 
-                # Reject conceptual mentions unless clearly phrased as measured value
                 if CONDITIONAL_FALSE_POS.search(ctx):
                     allow_measured = (
                         ("bmi is " in ctx_low) or
@@ -246,7 +237,6 @@ def extract_bmi(note):
                     if not allow_measured:
                         continue
 
-                # Normalize to 1 decimal to align with downstream comparison style
                 bmi_val = round(bmi_val, 1)
 
                 key = "{0}|{1}|{2}|{3}|{4}".format(
