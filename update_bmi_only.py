@@ -12,10 +12,9 @@
 #        b) nearest peri-op explicit BMI
 #        c) nearest peri-op computed BMI
 #     2) if NO BMI candidate found at all in +/-14 day window,
-#        search again in +/-21 day window using the same hierarchy
-# - NEW:
-#     if no standard structured recon anchor exists, build a BACKUP anchor
-#     from structured encounter rows using CPT/procedure/date logic
+#        search again in -45 / +21 day window using the same hierarchy
+# - If no standard structured recon anchor exists, build a BACKUP anchor
+#   from structured encounter rows using CPT/procedure/date logic
 # - Update only BMI and Obesity columns
 # - Write a BMI-only evidence file for QA
 #
@@ -60,7 +59,9 @@ NOTE_GLOBS = [
 
 WINDOW_STAGE1_BEFORE = 14
 WINDOW_STAGE1_AFTER = 14
-WINDOW_STAGE2_BEFORE = 21
+
+# widened fallback window
+WINDOW_STAGE2_BEFORE = 45
 WINDOW_STAGE2_AFTER = 21
 
 from models import SectionedNote  # noqa: E402
@@ -313,10 +314,6 @@ def _is_recon_like_row(row, has_preferred_cpt):
     return False
 
 def choose_best_bmi_anchor_rows(struct_df):
-    """
-    Primary anchor:
-    requires RECONSTRUCTION_DATE_STRUCT + ADMIT_DATE_STRUCT
-    """
     bmi_best = {}
     if len(struct_df) == 0:
         return bmi_best
@@ -382,19 +379,6 @@ def choose_best_bmi_anchor_rows(struct_df):
     return bmi_best
 
 def choose_backup_bmi_anchor_rows(struct_df, existing_anchor_map):
-    """
-    Backup anchor:
-    for MRNs with no primary anchor, use best available structured date from a
-    recon-like encounter row, prioritizing:
-      1) operation encounter date
-      2) clinic encounter date
-      3) inpatient encounter date
-
-    Date preference within row:
-      RECONSTRUCTION_DATE_STRUCT
-      ADMIT_DATE_STRUCT
-      STRUCT_DATE_RAW
-    """
     backup = {}
     if len(struct_df) == 0:
         return backup
@@ -793,7 +777,7 @@ def main():
         if mrn not in found_stage1:
             fallback_mrns.add(mrn)
 
-    print("Stage 2 fallback: searching BMI in +/-21 day window ONLY for MRNs with no candidate in +/-14 days...")
+    print("Stage 2 fallback: searching BMI in -45 / +21 day window ONLY for MRNs with no candidate in +/-14 days...")
     print("Fallback MRNs: {0}".format(len(fallback_mrns)))
 
     notes_stage2 = notes_df[notes_df[MERGE_KEY].astype(str).str.strip().isin(fallback_mrns)].copy()
@@ -805,7 +789,7 @@ def main():
         after_days=WINDOW_STAGE2_AFTER,
         evidence_rows=evidence_rows
     )
-    print("MRNs with any BMI candidate in +/-21 fallback: {0}".format(len(found_stage2)))
+    print("MRNs with any BMI candidate in -45 / +21 fallback: {0}".format(len(found_stage2)))
 
     final_best_bmi = {}
     for mrn, cand in best_stage1.items():
