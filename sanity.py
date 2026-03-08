@@ -1,6 +1,6 @@
 import pandas as pd
 
-GOLD = "gold.csv"   # path to your gold dataset
+GOLD = "/home/apokol/Breast_Restore/gold_cleaned_for_cedar.csv"   
 PRED = "_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv"
 
 gold = pd.read_csv(GOLD, dtype=str)
