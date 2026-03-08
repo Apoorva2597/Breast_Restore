@@ -2,7 +2,6 @@ import os
 from glob import glob
 from datetime import datetime
 import pandas as pd
-import re
 
 BASE_DIR = "/home/apokol/Breast_Restore"
 MERGE_KEY = "MRN"
@@ -20,11 +19,6 @@ NOTE_GLOBS = [
     BASE_DIR + "/**/HPI11526*Operation Notes.csv",
     BASE_DIR + "/**/HPI11526*operation notes.csv",
 ]
-
-BMI_SNIPPET_RX = re.compile(
-    r".{0,80}\b(?:morbid\s+obesity|obesity|BMI|body\s+mass\s+index)\b.{0,120}",
-    re.IGNORECASE
-)
 
 
 def read_csv_robust(path):
@@ -406,33 +400,31 @@ for mrn, info in bmi_anchor_map.items():
             "RECON_DATE": recon_date,
             "NOTE_ID": "",
             "NOTE_TYPE": "",
-            "BMI_TEXT_FOUND": 0,
-            "BMI_SNIPPET": ""
+            "NOTE_TEXT": ""
         })
         continue
 
     for _, row in same_day.iterrows():
-        text = str(row["NOTE_TEXT"])
-        m = BMI_SNIPPET_RX.search(text.replace("\n", " "))
-
         rows.append({
             "MRN": mrn,
             "RECON_DATE": recon_date,
             "NOTE_ID": row["NOTE_ID"],
             "NOTE_TYPE": row["NOTE_TYPE"],
-            "BMI_TEXT_FOUND": 1 if m else 0,
-            "BMI_SNIPPET": m.group(0).strip() if m else ""
+            "NOTE_TEXT": row["NOTE_TEXT"]
         })
 
 out = pd.DataFrame(rows)
 
-print("\nRECON-DATE OP NOTE BMI TEXT AUDIT\n")
-print(out.head(50).to_string(index=False))
+print("\nFULL NOTE TEXT AUDIT\n")
+for i, row in out.head(20).iterrows():
+    print("=" * 120)
+    print("MRN: {0}".format(row["MRN"]))
+    print("RECON_DATE: {0}".format(row["RECON_DATE"]))
+    print("NOTE_ID: {0}".format(row["NOTE_ID"]))
+    print("NOTE_TYPE: {0}".format(row["NOTE_TYPE"]))
+    print("-" * 120)
+    print(row["NOTE_TEXT"])
+    print()
 
-print("\nSUMMARY")
-print("Total rows audited:", len(out))
-print("Rows with BMI text found:", int(out["BMI_TEXT_FOUND"].sum()))
-print("Rows without BMI text found:", int((out["BMI_TEXT_FOUND"] == 0).sum()))
-
-out.to_csv("_outputs/recon_date_opnote_bmi_text_audit.csv", index=False)
-print("\nSaved: _outputs/recon_date_opnote_bmi_text_audit.csv")
+out.to_csv("_outputs/recon_date_opnote_fulltext_audit.csv", index=False)
+print("\nSaved: _outputs/recon_date_opnote_fulltext_audit.csv")
