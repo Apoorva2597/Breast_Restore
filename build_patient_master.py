@@ -13,13 +13,15 @@
 #   2) /home/apokol/Breast_Restore/_outputs/rule_hit_evidence_FINAL_NO_GOLD.csv
 #
 # UPDATE:
-# - BMI is anchored to operation/operative notes nearest the structured
-#   reconstruction date.
-# - Matching priority for BMI note selection:
-#     (1) same-day op note
-#     (2) nearest op note within +/- 1 day
-#     (3) nearest op note within +/- 3 days
-# - This keeps BMI surgery-anchored without requiring exact same-day note dates.
+# - BMI anchoring revised.
+# - BMI is now searched across ALL OP NOTE / BRIEF OP NOTE notes nearest the
+#   structured reconstruction date, instead of locking to one single note.
+# - BMI note window priority:
+#     (1) same-day OP NOTE / BRIEF OP NOTE
+#     (2) all OP NOTE / BRIEF OP NOTE within +/- 1 day
+#     (3) all OP NOTE / BRIEF OP NOTE within +/- 3 days
+# - This preserves surgery anchoring while preventing blank BMI when the
+#   nearest single operative note lacks the BMI text.
 #
 # Python 3.6.8 compatible
 
@@ -69,6 +71,7 @@ from extractors.comorbidities import extract_comorbidities  # noqa: E402
 from extractors.pbs import extract_pbs  # noqa: E402
 from extractors.mastectomy import extract_mastectomy  # noqa: E402
 from extractors.cancer_treatment import extract_cancer_treatment  # noqa: E402
+
 
 # -----------------------
 # Robust CSV read
@@ -208,8 +211,8 @@ def abs_day_diff(d1, d2):
 
 
 def is_operation_note_type(note_type):
-    nt = clean_cell(note_type).lower()
-    return ("op" in nt) or ("operation" in nt) or ("operative" in nt)
+    nt = clean_cell(note_type).upper()
+    return nt in {"OP NOTE", "BRIEF OP NOTE"} or ("OPERATIVE" in nt) or ("OP NOTE" in nt) or ("BRIEF OP NOTE" in nt)
 
 
 # -----------------------
@@ -705,11 +708,6 @@ def choose_race_us_categories(struct_df):
 
 
 def _recon_anchor_helper(struct_df, require_age=False):
-    """
-    Shared reconstruction-row chooser used by age and BMI anchor logic.
-    When require_age=True, requires AGE_AT_ENCOUNTER.
-    When require_age=False, only needs reconstruction date/admit date and qualifying recon anchor.
-    """
     out_best = {}
 
     if len(struct_df) == 0:
@@ -847,7 +845,6 @@ def _recon_anchor_helper(struct_df, require_age=False):
     return out_best
 
 
-# ---------- Age logic with clinic->operation->inpatient priority and fallback CPTs ----------
 def choose_best_clinic_age_rows(struct_df):
     return _recon_anchor_helper(struct_df, require_age=True)
 
@@ -950,36 +947,27 @@ def enrich_master_with_structured_demo(master, notes_df, evidence_rows):
     return master, evidence_rows
 
 
-def choose_best_bmi_note_mrn_map(notes_df, bmi_anchor_map):
+def choose_bmi_candidate_note_ids_by_mrn(notes_df, bmi_anchor_map):
     """
-    For each MRN with a structured BMI anchor row:
-      1) same-day op note
-      2) nearest op note within +/-1 day
-      3) nearest op note within +/-3 days
-
-    Returns dict:
-      mrn -> {
-        "NOTE_ID": ...,
-        "NOTE_DATE": ...,
-        "NOTE_TYPE": ...,
-        "DAY_DIFF": ...,
-        "MATCH_TIER": "same_day" | "within_1_day" | "within_3_days"
-      }
+    For each MRN with structured reconstruction date anchor, return ALL candidate
+    OP NOTE / BRIEF OP NOTE NOTE_IDs in the best available date window:
+      same day > +/-1 day > +/-3 days
     """
     out = {}
 
     if len(notes_df) == 0 or len(bmi_anchor_map) == 0:
         return out
 
-    op_notes = notes_df.copy()
-    op_notes["NOTE_DATE_PARSED"] = op_notes["NOTE_DATE"].apply(parse_date_safe)
-    op_notes = op_notes[op_notes["NOTE_TYPE"].apply(is_operation_note_type)].copy()
+    tmp = notes_df.copy()
+    tmp["NOTE_DATE_PARSED"] = tmp["NOTE_DATE"].apply(parse_date_safe)
+    tmp = tmp[tmp["NOTE_TYPE"].apply(is_operation_note_type)].copy()
 
-    if len(op_notes) == 0:
+    if len(tmp) == 0:
         return out
 
-    for mrn, g in op_notes.groupby(MERGE_KEY):
-        anchor = bmi_anchor_map.get(str(mrn).strip())
+    for mrn, g in tmp.groupby(MERGE_KEY):
+        mrn = str(mrn).strip()
+        anchor = bmi_anchor_map.get(mrn)
         if anchor is None:
             continue
 
@@ -987,47 +975,46 @@ def choose_best_bmi_note_mrn_map(notes_df, bmi_anchor_map):
         if recon_dt is None:
             continue
 
-        candidates = []
-
+        rows = []
         for _, row in g.iterrows():
             note_dt = row.get("NOTE_DATE_PARSED")
             dd = abs_day_diff(note_dt, recon_dt)
             if dd is None:
                 continue
             if dd <= 3:
-                candidates.append({
-                    "NOTE_ID": row["NOTE_ID"],
+                rows.append({
+                    "NOTE_ID": str(row["NOTE_ID"]).strip(),
                     "NOTE_DATE": row["NOTE_DATE"],
                     "NOTE_TYPE": row["NOTE_TYPE"],
                     "DAY_DIFF": dd
                 })
 
-        if not candidates:
+        if not rows:
             continue
 
-        same_day = [x for x in candidates if x["DAY_DIFF"] == 0]
-        within_1 = [x for x in candidates if x["DAY_DIFF"] <= 1]
-        within_3 = [x for x in candidates if x["DAY_DIFF"] <= 3]
+        same_day = [r for r in rows if r["DAY_DIFF"] == 0]
+        within_1 = [r for r in rows if r["DAY_DIFF"] <= 1]
+        within_3 = [r for r in rows if r["DAY_DIFF"] <= 3]
 
-        chosen = None
+        chosen_rows = []
         match_tier = ""
 
         if same_day:
-            same_day = sorted(same_day, key=lambda x: (x["DAY_DIFF"], str(x["NOTE_ID"])))
-            chosen = same_day[0]
+            chosen_rows = same_day
             match_tier = "same_day"
         elif within_1:
-            within_1 = sorted(within_1, key=lambda x: (x["DAY_DIFF"], str(x["NOTE_ID"])))
-            chosen = within_1[0]
+            chosen_rows = within_1
             match_tier = "within_1_day"
         elif within_3:
-            within_3 = sorted(within_3, key=lambda x: (x["DAY_DIFF"], str(x["NOTE_ID"])))
-            chosen = within_3[0]
+            chosen_rows = within_3
             match_tier = "within_3_days"
 
-        if chosen is not None:
-            chosen["MATCH_TIER"] = match_tier
-            out[str(mrn).strip()] = chosen
+        if chosen_rows:
+            out[mrn] = {
+                "note_ids": set([r["NOTE_ID"] for r in chosen_rows]),
+                "match_tier": match_tier,
+                "rows": chosen_rows
+            }
 
     return out
 
@@ -1050,13 +1037,12 @@ def main():
 
     master, evidence_rows = enrich_master_with_structured_demo(master, notes_df, evidence_rows)
 
-    # BMI anchor map: selected reconstruction date per MRN from structured encounters
     struct_df_for_bmi = load_structured_encounters()
     bmi_anchor_map = choose_best_bmi_recon_rows(struct_df_for_bmi)
     print("Structured reconstruction-date BMI anchor rows found for MRNs: {0}".format(len(bmi_anchor_map)))
 
-    bmi_note_target_map = choose_best_bmi_note_mrn_map(notes_df, bmi_anchor_map)
-    print("BMI-targeted operation notes found for MRNs: {0}".format(len(bmi_note_target_map)))
+    bmi_candidate_note_map = choose_bmi_candidate_note_ids_by_mrn(notes_df, bmi_anchor_map)
+    print("BMI candidate OP NOTE / BRIEF OP NOTE windows found for MRNs: {0}".format(len(bmi_candidate_note_map)))
 
     print("Running rule-based extractors...")
     extractor_fns = [
@@ -1085,34 +1071,34 @@ def main():
 
         for fn in extractor_fns:
             if fn == extract_bmi:
-                target = bmi_note_target_map.get(mrn)
+                target = bmi_candidate_note_map.get(mrn)
                 if target is None:
                     continue
-                if str(row["NOTE_ID"]).strip() != str(target.get("NOTE_ID", "")).strip():
+                if str(row["NOTE_ID"]).strip() not in target.get("note_ids", set()):
                     continue
 
             try:
                 new_cands = fn(snote)
                 all_cands.extend(new_cands)
 
-                if fn == extract_bmi and new_cands:
-                    target = bmi_note_target_map.get(mrn, {})
-                    evidence_rows.append({
-                        MERGE_KEY: mrn,
-                        "NOTE_ID": row["NOTE_ID"],
-                        "NOTE_DATE": row["NOTE_DATE"],
-                        "NOTE_TYPE": row["NOTE_TYPE"],
-                        "FIELD": "BMI_NOTE_SELECTION",
-                        "VALUE": "",
-                        "STATUS": "targeted_selection",
-                        "CONFIDENCE": "",
-                        "SECTION": "STRUCTURED_PLUS_NOTE_DATE_WINDOW",
-                        "EVIDENCE": "BMI note selected by reconstruction-date anchoring | RECON_DATE={0} | MATCH_TIER={1} | DAY_DIFF={2}".format(
-                            bmi_anchor_map.get(mrn, {}).get("recon_date", ""),
-                            target.get("MATCH_TIER", ""),
-                            target.get("DAY_DIFF", "")
-                        )
-                    })
+                if fn == extract_bmi:
+                    target = bmi_candidate_note_map.get(mrn)
+                    if target is not None and str(row["NOTE_ID"]).strip() in target.get("note_ids", set()):
+                        evidence_rows.append({
+                            MERGE_KEY: mrn,
+                            "NOTE_ID": row["NOTE_ID"],
+                            "NOTE_DATE": row["NOTE_DATE"],
+                            "NOTE_TYPE": row["NOTE_TYPE"],
+                            "FIELD": "BMI_NOTE_SELECTION",
+                            "VALUE": "",
+                            "STATUS": "targeted_selection",
+                            "CONFIDENCE": "",
+                            "SECTION": "STRUCTURED_PLUS_NOTE_DATE_WINDOW",
+                            "EVIDENCE": "BMI note eligible by reconstruction-date anchoring | RECON_DATE={0} | MATCH_TIER={1}".format(
+                                bmi_anchor_map.get(mrn, {}).get("recon_date", ""),
+                                target.get("match_tier", "")
+                            )
+                        })
 
             except Exception as e:
                 evidence_rows.append({
