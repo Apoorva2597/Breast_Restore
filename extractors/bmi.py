@@ -7,9 +7,9 @@ from .utils import window_around
 
 # ----------------------------------------------
 # UPDATE:
-# Refined BMI extraction to target measured BMI
-# mentions and avoid threshold / eligibility /
-# counseling language.
+# Restrict BMI extraction to operative / operation
+# notes only, because gold BMI should reflect BMI
+# at reconstruction rather than any clinic BMI.
 #
 # Captures:
 #   BMI 30.12
@@ -18,9 +18,9 @@ from .utils import window_around
 #   BMI of 30.12
 #   body mass index 30.12
 #
-# Rejects examples like:
-#   BMI is greater than or equal to 35
-#   BMI > 35
+# Rejects threshold / policy / comparison language:
+#   BMI >= 35
+#   BMI greater than or equal to 35
 #   BMI < 30
 #   if BMI ...
 #
@@ -28,7 +28,6 @@ from .utils import window_around
 # Python 3.6.8 compatible.
 # ----------------------------------------------
 
-# Explicit measured BMI mentions
 BMI_PATTERNS = [
     re.compile(r"\bBMI\s*[:=]?\s*(\d{2,3}(?:\.\d+)?)\b", re.IGNORECASE),
     re.compile(r"\bBMI\s+of\s+(\d{2,3}(?:\.\d+)?)\b", re.IGNORECASE),
@@ -36,18 +35,16 @@ BMI_PATTERNS = [
     re.compile(r"\bbody\s+mass\s+index\s+of\s+(\d{2,3}(?:\.\d+)?)\b", re.IGNORECASE),
 ]
 
-# Reject threshold / comparison / rule language
 THRESHOLD_FALSE_POS = re.compile(
     r"\bBMI\b.{0,40}\b("
     r"greater\s+than|less\s+than|greater\s+than\s+or\s+equal\s+to|"
     r"less\s+than\s+or\s+equal\s+to|at\s+least|more\s+than|under|over|"
     r"above|below|minimum|maximum|threshold|criteria|cutoff|eligib"
     r")\b|"
-    r"\bBMI\s*(>=|<=|>|<)\s*\d{1,3}(\.\d+)?\b",
+    r"\bBMI\s*(>=|<=|>|<)\s*\d{1,3}(?:\.\d+)?\b",
     re.IGNORECASE,
 )
 
-# Extra caution for non-measured counseling / conditional language
 CONDITIONAL_FALSE_POS = re.compile(
     r"\b(if|when|because|due to|given)\b.{0,40}\bBMI\b",
     re.IGNORECASE,
@@ -58,8 +55,6 @@ PREFERRED_SECTIONS = {
     "OBJECTIVE",
     "ASSESSMENT",
     "ASSESSMENT/PLAN",
-    "PROGRESS NOTE",
-    "PROGRESS NOTES",
     "FULL",
 }
 
@@ -93,25 +88,36 @@ def _section_order(note):
     return order
 
 
+def _is_operation_note(note_type):
+    nt = str(note_type or "").lower().strip()
+    return (
+        "op" in nt or
+        "operation" in nt or
+        "operative" in nt
+    )
+
+
 def _confidence_for_note_type(note_type):
     nt = str(note_type or "").lower().strip()
     if nt in {"op note", "operation notes", "brief op notes", "operative note", "operation note"}:
         return 0.95
     if "op" in nt or "operative" in nt or "operation" in nt:
         return 0.93
-    if "progress" in nt or "clinic" in nt:
-        return 0.88
-    return 0.82
+    return 0.90
 
 
 def extract_bmi(note: SectionedNote) -> List[Candidate]:
     """
     High-precision BMI extraction:
+      - only from operative / operation notes
       - requires explicit numeric BMI mention
       - rejects threshold/comparison language
       - rounds to 1 decimal
     Returns at most one candidate per note.
     """
+
+    if not _is_operation_note(note.note_type):
+        return []
 
     section_order = _section_order(note)
 
@@ -121,12 +127,6 @@ def extract_bmi(note: SectionedNote) -> List[Candidate]:
             continue
 
         text = _normalize_text(raw_text)
-
-        # If whole section is clearly threshold/rule language, skip it
-        if THRESHOLD_FALSE_POS.search(text):
-            # still allow extraction later only if an explicit measured BMI exists
-            # outside the threshold window, so do not continue here
-            pass
 
         for rx in BMI_PATTERNS:
             for m in rx.finditer(text):
@@ -140,11 +140,9 @@ def extract_bmi(note: SectionedNote) -> List[Candidate]:
 
                 ctx = window_around(text, m.start(), m.end(), 140)
 
-                # reject if local context is threshold / comparative language
                 if THRESHOLD_FALSE_POS.search(ctx):
                     continue
 
-                # reject obvious conditional / policy wording around BMI
                 if CONDITIONAL_FALSE_POS.search(ctx) and "bmi of" not in ctx.lower():
                     continue
 
