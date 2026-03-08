@@ -13,6 +13,9 @@
 #        c) nearest peri-op computed BMI
 #     2) if NO BMI candidate found at all in +/-14 day window,
 #        search again in +/-21 day window using the same hierarchy
+# - NEW:
+#     if no standard structured recon anchor exists, build a BACKUP anchor
+#     from structured encounter rows using CPT/procedure/date logic
 # - Update only BMI and Obesity columns
 # - Write a BMI-only evidence file for QA
 #
@@ -212,7 +215,7 @@ def build_sectioned_note(note_text, note_type, note_id, note_date):
     )
 
 # -----------------------
-# Structured reconstruction anchor
+# Structured anchor logic
 # -----------------------
 def load_structured_encounters():
     rows = []
@@ -266,7 +269,54 @@ def load_structured_encounters():
 
     return pd.concat(rows, ignore_index=True)
 
+def _is_recon_like_row(row, has_preferred_cpt):
+    preferred_cpts = set([
+        "19357", "19340", "19342", "19361", "19364", "19367", "S2068"
+    ])
+    primary_exclude_cpts = set(["19325", "19330"])
+    fallback_allowed_cpts = set(["19350", "19380"])
+
+    cpt_code = clean_cell(row.get("CPT_CODE_STRUCT", "")).upper()
+    procedure = clean_cell(row.get("PROCEDURE_STRUCT", "")).lower()
+    reason_for_visit = clean_cell(row.get("REASON_FOR_VISIT_STRUCT", "")).lower()
+
+    if cpt_code in primary_exclude_cpts:
+        return False
+
+    if cpt_code in preferred_cpts:
+        return True
+
+    if (not has_preferred_cpt) and (cpt_code in fallback_allowed_cpts):
+        return True
+
+    text = "{0} {1}".format(procedure, reason_for_visit)
+
+    keywords = [
+        "tissue expander",
+        "breast recon",
+        "implant on same day of mastectomy",
+        "insert or replcmnt breast implnt on sep day from mastectomy",
+        "latissimus",
+        "diep",
+        "tram",
+        "flap",
+        "free flap",
+        "expander placmnt",
+        "reconstruct",
+        "reconstruction",
+    ]
+
+    for kw in keywords:
+        if kw in text:
+            return True
+
+    return False
+
 def choose_best_bmi_anchor_rows(struct_df):
+    """
+    Primary anchor:
+    requires RECONSTRUCTION_DATE_STRUCT + ADMIT_DATE_STRUCT
+    """
     bmi_best = {}
     if len(struct_df) == 0:
         return bmi_best
@@ -277,22 +327,16 @@ def choose_best_bmi_anchor_rows(struct_df):
         "inpatient": 3
     }
 
-    preferred_cpts = set([
-        "19357", "19340", "19342", "19361", "19364", "19367", "S2068"
-    ])
-    primary_exclude_cpts = set(["19325", "19330"])
-    fallback_allowed_cpts = set(["19350", "19380"])
-
     eligible_sources = struct_df[struct_df["STRUCT_SOURCE"].isin(["clinic", "operation", "inpatient"])].copy()
     if len(eligible_sources) == 0:
         return bmi_best
 
     has_preferred_cpt = {}
+    preferred_cpts = set(["19357", "19340", "19342", "19361", "19364", "19367", "S2068"])
     for mrn, g in eligible_sources.groupby(MERGE_KEY):
         found = False
         for val in g["CPT_CODE_STRUCT"].fillna("").astype(str).tolist():
-            cpt = clean_cell(val).upper()
-            if cpt in preferred_cpts:
+            if clean_cell(val).upper() in preferred_cpts:
                 found = True
                 break
         has_preferred_cpt[mrn] = found
@@ -308,35 +352,11 @@ def choose_best_bmi_anchor_rows(struct_df):
 
         admit_date = parse_date_safe(row.get("ADMIT_DATE_STRUCT", ""))
         recon_date = parse_date_safe(row.get("RECONSTRUCTION_DATE_STRUCT", ""))
-        cpt_code = clean_cell(row.get("CPT_CODE_STRUCT", "")).upper()
-        procedure = clean_cell(row.get("PROCEDURE_STRUCT", "")).lower()
 
         if admit_date is None or recon_date is None:
             continue
-        if cpt_code in primary_exclude_cpts:
-            continue
-        if has_preferred_cpt.get(mrn, False) and cpt_code in fallback_allowed_cpts:
-            continue
 
-        is_anchor = False
-        if cpt_code in preferred_cpts:
-            is_anchor = True
-        if (not has_preferred_cpt.get(mrn, False)) and (cpt_code in fallback_allowed_cpts):
-            is_anchor = True
-        if not is_anchor:
-            if (
-                ("tissue expander" in procedure) or
-                ("breast recon" in procedure) or
-                ("implant on same day of mastectomy" in procedure) or
-                ("insert or replcmnt breast implnt on sep day from mastectomy" in procedure) or
-                ("latissimus" in procedure) or
-                ("diep" in procedure) or
-                ("tram" in procedure) or
-                ("flap" in procedure)
-            ):
-                is_anchor = True
-
-        if not is_anchor:
+        if not _is_recon_like_row(row, has_preferred_cpt.get(mrn, False)):
             continue
 
         score = (
@@ -348,16 +368,100 @@ def choose_best_bmi_anchor_rows(struct_df):
         current_best = bmi_best.get(mrn)
         if current_best is None or score < current_best["score"]:
             bmi_best[mrn] = {
+                "anchor_type": "primary_recon_date",
+                "anchor_date": recon_date.strftime("%Y-%m-%d"),
                 "admit_date": admit_date.strftime("%Y-%m-%d"),
                 "recon_date": recon_date.strftime("%Y-%m-%d"),
                 "score": score,
                 "source": source,
-                "cpt_code": cpt_code,
+                "cpt_code": clean_cell(row.get("CPT_CODE_STRUCT", "")),
                 "procedure": clean_cell(row.get("PROCEDURE_STRUCT", "")),
                 "reason_for_visit": clean_cell(row.get("REASON_FOR_VISIT_STRUCT", ""))
             }
 
     return bmi_best
+
+def choose_backup_bmi_anchor_rows(struct_df, existing_anchor_map):
+    """
+    Backup anchor:
+    for MRNs with no primary anchor, use best available structured date from a
+    recon-like encounter row, prioritizing:
+      1) operation encounter date
+      2) clinic encounter date
+      3) inpatient encounter date
+
+    Date preference within row:
+      RECONSTRUCTION_DATE_STRUCT
+      ADMIT_DATE_STRUCT
+      STRUCT_DATE_RAW
+    """
+    backup = {}
+    if len(struct_df) == 0:
+        return backup
+
+    source_priority = {
+        "operation": 1,
+        "clinic": 2,
+        "inpatient": 3,
+        "other": 9
+    }
+
+    eligible = struct_df[struct_df["STRUCT_SOURCE"].isin(["clinic", "operation", "inpatient"])].copy()
+    if len(eligible) == 0:
+        return backup
+
+    has_preferred_cpt = {}
+    preferred_cpts = set(["19357", "19340", "19342", "19361", "19364", "19367", "S2068"])
+    for mrn, g in eligible.groupby(MERGE_KEY):
+        found = False
+        for val in g["CPT_CODE_STRUCT"].fillna("").astype(str).tolist():
+            if clean_cell(val).upper() in preferred_cpts:
+                found = True
+                break
+        has_preferred_cpt[mrn] = found
+
+    for _, row in eligible.iterrows():
+        mrn = clean_cell(row.get(MERGE_KEY, ""))
+        if (not mrn) or (mrn in existing_anchor_map):
+            continue
+
+        if not _is_recon_like_row(row, has_preferred_cpt.get(mrn, False)):
+            continue
+
+        source = clean_cell(row.get("STRUCT_SOURCE", "")).lower()
+        pr = source_priority.get(source, 9)
+
+        dt = parse_date_safe(row.get("RECONSTRUCTION_DATE_STRUCT", ""))
+        anchor_type = "backup_recon_date_struct"
+
+        if dt is None:
+            dt = parse_date_safe(row.get("ADMIT_DATE_STRUCT", ""))
+            anchor_type = "backup_admit_date_struct"
+
+        if dt is None:
+            dt = parse_date_safe(row.get("STRUCT_DATE_RAW", ""))
+            anchor_type = "backup_struct_date_raw"
+
+        if dt is None:
+            continue
+
+        score = (pr, dt)
+
+        cur = backup.get(mrn)
+        if cur is None or score < cur["score"]:
+            backup[mrn] = {
+                "anchor_type": anchor_type,
+                "anchor_date": dt.strftime("%Y-%m-%d"),
+                "admit_date": clean_cell(row.get("ADMIT_DATE_STRUCT", "")),
+                "recon_date": dt.strftime("%Y-%m-%d"),
+                "score": score,
+                "source": source,
+                "cpt_code": clean_cell(row.get("CPT_CODE_STRUCT", "")),
+                "procedure": clean_cell(row.get("PROCEDURE_STRUCT", "")),
+                "reason_for_visit": clean_cell(row.get("REASON_FOR_VISIT_STRUCT", ""))
+            }
+
+    return backup
 
 # -----------------------
 # Notes
@@ -507,18 +611,15 @@ def candidate_stage_rank(cand, recon_dt, source_file):
     status = clean_cell(getattr(cand, "status", "")).lower()
     explicit = (status != "computed")
 
-    # Stage A: same-day peri-op explicit BMI
     if explicit and dd == 0 and bucket in ("brief_op", "operation", "preop", "anesthesia", "hp"):
         bucket_ord = 0 if bucket == "brief_op" else 1 if bucket == "operation" else 2
         return (1, bucket_ord, 0, 0, 0)
 
-    # Stage B: nearest peri-op explicit BMI
     if explicit and bucket in ("brief_op", "operation", "preop", "anesthesia", "hp", "clinic", "progress", "consult"):
         bucket_ord = 0 if bucket == "brief_op" else 1 if bucket == "operation" else 2 if bucket in ("preop", "anesthesia", "hp") else 3
         post_penalty = 1 if dd > 0 else 0
         return (2, abs(dd), post_penalty, bucket_ord, 0)
 
-    # Stage C: nearest peri-op computed BMI
     if (not explicit) and bucket in ("brief_op", "operation", "preop", "anesthesia", "hp", "clinic", "progress", "consult"):
         bucket_ord = 0 if bucket == "brief_op" else 1 if bucket == "operation" else 2 if bucket in ("preop", "anesthesia", "hp") else 3
         post_penalty = 1 if dd > 0 else 0
@@ -598,6 +699,8 @@ def collect_bmi_candidates_for_window(notes_df, bmi_anchor_map, before_days, aft
                 "CONFIDENCE": "",
                 "SECTION": "",
                 "WINDOW_USED": "{0}_{1}".format(before_days, after_days),
+                "ANCHOR_TYPE": bmi_anchor.get("anchor_type", ""),
+                "ANCHOR_DATE": bmi_anchor.get("anchor_date", ""),
                 "EVIDENCE": "extract_bmi failed: {0}".format(repr(e))
             })
             continue
@@ -609,10 +712,17 @@ def collect_bmi_candidates_for_window(notes_df, bmi_anchor_map, before_days, aft
 
         for c in bmi_candidates:
             note_day_diff = days_between(parse_date_safe(getattr(c, "note_date", "")), recon_dt)
-            evid = "{0} | BMI_RECON_DATE={1} | BMI_NOTE_DAY_DIFF={2}".format(
+            evid = (
+                "{0} | BMI_RECON_DATE={1} | BMI_NOTE_DAY_DIFF={2} | "
+                "ANCHOR_TYPE={3} | ANCHOR_SOURCE={4} | ANCHOR_CPT={5} | ANCHOR_PROCEDURE={6}"
+            ).format(
                 getattr(c, "evidence", ""),
                 bmi_anchor.get("recon_date", ""),
-                note_day_diff
+                note_day_diff,
+                bmi_anchor.get("anchor_type", ""),
+                bmi_anchor.get("source", ""),
+                bmi_anchor.get("cpt_code", ""),
+                bmi_anchor.get("procedure", "")
             )
 
             evidence_rows.append({
@@ -626,6 +736,8 @@ def collect_bmi_candidates_for_window(notes_df, bmi_anchor_map, before_days, aft
                 "CONFIDENCE": getattr(c, "confidence", ""),
                 "SECTION": getattr(c, "section", ""),
                 "WINDOW_USED": "{0}_{1}".format(before_days, after_days),
+                "ANCHOR_TYPE": bmi_anchor.get("anchor_type", ""),
+                "ANCHOR_DATE": bmi_anchor.get("anchor_date", ""),
                 "EVIDENCE": evid
             })
 
@@ -645,8 +757,20 @@ def main():
 
     print("Loading structured encounters...")
     struct_df = load_structured_encounters()
-    bmi_anchor_map = choose_best_bmi_anchor_rows(struct_df)
-    print("Structured reconstruction-date BMI anchors found for MRNs: {0}".format(len(bmi_anchor_map)))
+
+    primary_anchor_map = choose_best_bmi_anchor_rows(struct_df)
+    backup_anchor_map = choose_backup_bmi_anchor_rows(struct_df, primary_anchor_map)
+
+    bmi_anchor_map = {}
+    for mrn, info in primary_anchor_map.items():
+        bmi_anchor_map[mrn] = info
+    for mrn, info in backup_anchor_map.items():
+        if mrn not in bmi_anchor_map:
+            bmi_anchor_map[mrn] = info
+
+    print("Primary structured BMI anchors found: {0}".format(len(primary_anchor_map)))
+    print("Backup BMI anchors found from CPT/procedure/date logic: {0}".format(len(backup_anchor_map)))
+    print("Total BMI anchors available: {0}".format(len(bmi_anchor_map)))
 
     print("Loading and reconstructing notes...")
     notes_df = load_and_reconstruct_notes()
@@ -664,7 +788,6 @@ def main():
     )
     print("MRNs with any BMI candidate in +/-14 days: {0}".format(len(found_stage1)))
 
-    # Stage 2 fallback only for MRNs with anchor and no candidates in stage 1
     fallback_mrns = set()
     for mrn in bmi_anchor_map.keys():
         if mrn not in found_stage1:
@@ -684,7 +807,6 @@ def main():
     )
     print("MRNs with any BMI candidate in +/-21 fallback: {0}".format(len(found_stage2)))
 
-    # Combine results: stage1 wins whenever available; stage2 only fills missing
     final_best_bmi = {}
     for mrn, cand in best_stage1.items():
         final_best_bmi[mrn] = cand
