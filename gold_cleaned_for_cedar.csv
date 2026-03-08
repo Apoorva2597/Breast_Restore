@@ -1,0 +1,27 @@
+import pandas as pd
+
+GOLD = "gold_cleaned_for_cedar.csv"
+PRED = "_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv"
+
+gold = pd.read_csv(GOLD, dtype=str)
+pred = pd.read_csv(PRED, dtype=str)
+
+gold["MRN"] = gold["MRN"].astype(str).str.strip()
+pred["MRN"] = pred["MRN"].astype(str).str.strip()
+
+merged = gold.merge(pred, on="MRN", suffixes=("_gold","_pred"))
+
+# convert BMI to float
+merged["BMI_gold_f"] = pd.to_numeric(merged["BMI_gold"], errors="coerce")
+merged["BMI_pred_f"] = pd.to_numeric(merged["BMI_pred"], errors="coerce")
+
+# round to nearest integer
+merged["BMI_gold_round"] = merged["BMI_gold_f"].round(0)
+merged["BMI_pred_round"] = merged["BMI_pred_f"].round(0)
+
+matches = (merged["BMI_gold_round"] == merged["BMI_pred_round"]).sum()
+total = merged["BMI_gold_round"].notna().sum()
+
+print("Rounded BMI matches:", matches)
+print("Total compared:", total)
+print("Accuracy:", matches/float(total))
