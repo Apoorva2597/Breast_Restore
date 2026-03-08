@@ -1,23 +1,31 @@
 # ----------------------------------------------
-# UPDATE (NLP refinement):
-# Expanded smoking extraction rules to capture
-# tobacco-related synonyms commonly found under
-# SOCIAL HISTORY in clinic notes.
+# UPDATE (Smoking extraction improvement)
 #
-# Recognizes phrases such as:
+# Expanded phrase detection for smoking status.
+# Captures common oncology clinic documentation:
+#
+# Current:
 #   "current smoker"
+#   "smokes"
+#
+# Former:
 #   "former smoker"
 #   "quit smoking"
-#   "never smoked"
-#   "never tobacco user"
-#   "nonsmoker"
-#   "denies tobacco"
+#   "quit smoking 7 years ago"
 #   "previous history of tobacco use"
+#   "smoking status: former"
 #
-# Outputs standardized labels:
-#   Current
-#   Former
-#   Never
+# Never:
+#   "never smoked"
+#   "never smoker"
+#   "never tobacco user"
+#   "lifetime nonsmoker"
+#   "nonsmoker"
+#   "non-smoker"
+#   "denies tobacco"
+#
+# Output labels match gold dataset:
+#   Current / Former / Never
 #
 # Python 3.6.8 compatible.
 # ----------------------------------------------
@@ -27,28 +35,28 @@ from models import Candidate
 
 
 CURRENT_PATTERNS = [
-    r"\bcurrent smoker\b",
+    r"current smoker",
     r"\bsmokes\b",
-    r"\bactive smoker\b",
+    r"active smoker"
 ]
 
 FORMER_PATTERNS = [
-    r"\bformer smoker\b",
-    r"\bquit smoking\b",
-    r"\bquit tobacco\b",
-    r"\bsmoking status:\s*former\b",
-    r"\bprevious history of tobacco\b",
+    r"former smoker",
+    r"quit smoking",
+    r"quit tobacco",
+    r"smoking status:\s*former",
+    r"previous history of tobacco",
 ]
 
 NEVER_PATTERNS = [
-    r"\bnever smoker\b",
-    r"\bnever smoked\b",
-    r"\bnever tobacco\b",
-    r"\bnonsmoker\b",
-    r"\bnon[- ]smoker\b",
-    r"\blifetime nonsmoker\b",
-    r"\bnever tobacco user\b",
-    r"\bdenies tobacco\b",
+    r"never smoked",
+    r"never smoker",
+    r"never tobacco",
+    r"never tobacco user",
+    r"lifetime nonsmoker",
+    r"nonsmoker",
+    r"non-smoker",
+    r"denies tobacco"
 ]
 
 
@@ -68,14 +76,11 @@ def extract_smoking(note):
         if not text:
             continue
 
-        lower_text = text.lower()
-
         label = None
         evidence = None
 
-        # order matters
         for r in CURRENT_REGEX:
-            m = r.search(lower_text)
+            m = r.search(text)
             if m:
                 label = "Current"
                 evidence = m.group(0)
@@ -83,7 +88,7 @@ def extract_smoking(note):
 
         if label is None:
             for r in FORMER_REGEX:
-                m = r.search(lower_text)
+                m = r.search(text)
                 if m:
                     label = "Former"
                     evidence = m.group(0)
@@ -91,7 +96,7 @@ def extract_smoking(note):
 
         if label is None:
             for r in NEVER_REGEX:
-                m = r.search(lower_text)
+                m = r.search(text)
                 if m:
                     label = "Never"
                     evidence = m.group(0)
@@ -104,7 +109,7 @@ def extract_smoking(note):
             Candidate(
                 field="SmokingStatus",
                 value=label,
-                confidence=0.90,
+                confidence=0.9,
                 section=section_name,
                 evidence=evidence,
                 note_id=note.note_id,
