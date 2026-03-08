@@ -27,7 +27,7 @@ print("Merging gold and predictions...")
 df = gold[[MRN_COL, GOLD_COL]].merge(
     master[[MRN_COL, PRED_COL]],
     on=MRN_COL,
-    how="outer",
+    how="left",
     suffixes=("_gold", "_pred")
 )
 
