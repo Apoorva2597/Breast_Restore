@@ -6,7 +6,6 @@ PRED = "_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv"
 gold = pd.read_csv(GOLD, dtype=str)
 pred = pd.read_csv(PRED, dtype=str)
 
-gold = gold.rename(columns={"PatientID":"MRN"}) if "PatientID" in gold.columns else gold
 
 gold["MRN"] = gold["MRN"].astype(str)
 pred["MRN"] = pred["MRN"].astype(str)
