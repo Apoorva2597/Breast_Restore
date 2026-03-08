@@ -648,23 +648,23 @@ def choose_best_clinic_age_rows(struct_df):
     }
 
     preferred_cpts = set([
-        "19357",  # tissue expander placement
-        "19340",  # immediate implant
-        "19342",  # delayed implant
-        "19361",  # latissimus flap
-        "19364",  # free flap
-        "19367",  # TRAM flap
-        "S2068"   # DIEP / SIEA flap
+        "19357",
+        "19340",
+        "19342",
+        "19361",
+        "19364",
+        "19367",
+        "S2068"
     ])
 
     primary_exclude_cpts = set([
-        "19325",  # augmentation
-        "19330"   # implant replacement / removal-related
+        "19325",
+        "19330"
     ])
 
     fallback_allowed_cpts = set([
-        "19350",  # nipple / areola reconstruction
-        "19380"   # revision
+        "19350",
+        "19380"
     ])
 
     eligible_sources = struct_df[struct_df["STRUCT_SOURCE"].isin(["clinic", "operation", "inpatient"])].copy()
@@ -768,23 +768,23 @@ def choose_best_bmi_anchor_rows(struct_df):
     }
 
     preferred_cpts = set([
-        "19357",  # tissue expander placement
-        "19340",  # immediate implant
-        "19342",  # delayed implant
-        "19361",  # latissimus flap
-        "19364",  # free flap
-        "19367",  # TRAM flap
-        "S2068"   # DIEP / SIEA flap
+        "19357",
+        "19340",
+        "19342",
+        "19361",
+        "19364",
+        "19367",
+        "S2068"
     ])
 
     primary_exclude_cpts = set([
-        "19325",  # augmentation
-        "19330"   # implant replacement / removal-related
+        "19325",
+        "19330"
     ])
 
     fallback_allowed_cpts = set([
-        "19350",  # nipple / areola reconstruction
-        "19380"   # revision
+        "19350",
+        "19380"
     ])
 
     eligible_sources = struct_df[struct_df["STRUCT_SOURCE"].isin(["clinic", "operation", "inpatient"])].copy()
@@ -915,8 +915,6 @@ def bmi_note_in_allowed_window(note_dt, recon_dt):
     dd = days_between(note_dt, recon_dt)
     if dd is None:
         return False
-    # allow up to 45 days before recon and 14 days after recon
-    # to catch pre-op clinic BMI and very near peri-op documentation
     if dd >= -45 and dd <= 14:
         return True
     return False
@@ -933,27 +931,21 @@ def bmi_candidate_rank(cand, recon_dt):
     op_note = is_operation_note_type(note_type)
     clinic_like = is_clinic_like_note(note_type, "")
 
-    # exact-date op note / brief op note
     if day_delta == 0 and op_note:
         return (0, 0, 0, -cand_score(cand))
 
-    # exact-date clinic/progress note
     if day_delta == 0 and clinic_like:
         return (1, 0, 0, -cand_score(cand))
 
-    # near-date op note within +/- 3 days
     if abs_dd <= 3 and op_note:
         return (2, abs_dd, 0 if day_delta <= 0 else 1, -cand_score(cand))
 
-    # pre-op clinic note within 45 days
     if day_delta < 0 and abs_dd <= 45 and clinic_like:
         return (3, abs_dd, 0, -cand_score(cand))
 
-    # post-op clinic note within 14 days
     if day_delta > 0 and abs_dd <= 14 and clinic_like:
         return (4, abs_dd, 1, -cand_score(cand))
 
-    # other note in allowed window
     if abs_dd <= 45:
         return (5, abs_dd, 0 if day_delta <= 0 else 1, -cand_score(cand))
 
@@ -1074,8 +1066,6 @@ def main():
     evidence_rows = []
     master, evidence_rows = enrich_master_with_structured_demo(master, notes_df, evidence_rows)
 
-    # BMI anchor map loaded from the same structured source logic;
-    # this affects BMI only and does not change any other variable path.
     struct_df = load_structured_encounters()
     bmi_anchor_map = choose_best_bmi_anchor_rows(struct_df)
     print("Structured reconstruction-date BMI anchors found for MRNs: {0}".format(len(bmi_anchor_map)))
@@ -1106,9 +1096,6 @@ def main():
         all_cands = []
 
         for fn in extractor_fns:
-            # BMI special rule only:
-            # run BMI extraction only on notes in a reconstruction-relevant window
-            # for patients with a valid structured reconstruction anchor.
             if fn == extract_bmi:
                 bmi_anchor = bmi_anchor_map.get(mrn)
                 if bmi_anchor is None:
