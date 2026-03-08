@@ -13,16 +13,19 @@
 #   2) /home/apokol/Breast_Restore/_outputs/rule_hit_evidence_FINAL_NO_GOLD.csv
 #
 # UPDATE (BMI ONLY):
-# - BMI is no longer selected as "best mention anywhere".
-# - BMI is now anchored to reconstruction date using structured encounter logic
+# - BMI is anchored to reconstruction date using structured encounter logic
 #   parallel to the age anchor logic.
 # - BMI candidates are only considered from notes in a reconstruction-relevant
-#   date window, then ranked so the pipeline prefers:
-#     1) exact-date operation / brief-op note
-#     2) exact-date clinic/progress note
-#     3) near-date operation / brief-op note
-#     4) pre-op clinic/progress note closest to reconstruction
-# - No other variable logic has been changed.
+#   date window.
+# - BMI ranking is revised to prefer:
+#     1) same-day brief op note
+#     2) same-day op note
+#     3) same-day pre-op / anesthesia / H&P
+#     4) same-day clinic / progress / consult
+#     5) closest pre-op explicit BMI
+#     6) closest post-op explicit BMI
+#     7) computed BMI only if no explicit BMI candidate wins
+# - No non-BMI variable logic has been changed.
 #
 # Python 3.6.8 compatible
 
@@ -873,83 +876,123 @@ def days_between(dt1, dt2):
         return None
     return (dt1.date() - dt2.date()).days
 
-def is_operation_note_type(note_type):
-    s = clean_cell(note_type).lower()
-    if not s:
-        return False
-    if "brief op" in s:
-        return True
-    if "op note" in s:
-        return True
-    if "operative" in s:
-        return True
-    if "operation" in s:
-        return True
-    if "oper report" in s:
-        return True
-    return False
-
-def is_clinic_like_note(note_type, source_file):
+# -----------------------
+# BMI ranking helpers ONLY
+# -----------------------
+def note_type_bucket_for_bmi(note_type, source_file):
     s1 = clean_cell(note_type).lower()
     s2 = clean_cell(source_file).lower()
     joined = "{0} {1}".format(s1, s2)
 
-    patterns = [
-        "progress",
-        "clinic",
-        "office",
-        "follow up",
-        "follow-up",
-        "pre-op",
-        "preop",
-        "consult",
-        "h&p",
-        "history and physical"
-    ]
-    for p in patterns:
-        if p in joined:
-            return True
-    return False
+    if "brief op" in joined:
+        return "brief_op"
+    if "op note" in joined or "operative" in joined or "operation" in joined or "oper report" in joined:
+        return "operation"
+    if "anesthesia" in joined:
+        return "anesthesia"
+    if "pre-op" in joined or "preop" in joined:
+        return "preop"
+    if "h&p" in joined or "history and physical" in joined:
+        return "hp"
+    if "clinic" in joined or "office" in joined:
+        return "clinic"
+    if "progress" in joined:
+        return "progress"
+    if "consult" in joined:
+        return "consult"
+    return "other"
+
+def section_rank_for_bmi(section_name):
+    s = clean_cell(section_name).upper()
+
+    if s == "VITALS":
+        return 0
+    if s == "PHYSICAL EXAM":
+        return 1
+    if s == "HPI" or s == "HISTORY OF PRESENT ILLNESS":
+        return 2
+    if s == "HISTORY":
+        return 3
+    if s == "PREOPERATIVE DIAGNOSIS":
+        return 4
+    if s == "POSTOPERATIVE DIAGNOSIS":
+        return 5
+    if s == "INDICATIONS FOR PROCEDURE" or s == "INDICATIONS":
+        return 6
+    if s == "OPERATIVE NOTE":
+        return 7
+    if s == "BRIEF OPERATIVE NOTE":
+        return 8
+    if s == "OPERATIVE FINDINGS":
+        return 9
+    if s == "PROCEDURE" or s == "PROCEDURES":
+        return 10
+    if s == "CODING NOTE":
+        return 11
+    if s == "MICROSURGICAL DETAILS":
+        return 12
+    if s == "FULL":
+        return 13
+    return 14
 
 def bmi_note_in_allowed_window(note_dt, recon_dt):
     dd = days_between(note_dt, recon_dt)
     if dd is None:
         return False
-    if dd >= -45 and dd <= 14:
+    if dd >= -14 and dd <= 14:
         return True
     return False
 
 def bmi_candidate_rank(cand, recon_dt):
     note_dt = parse_date_safe(getattr(cand, "note_date", ""))
     note_type = clean_cell(getattr(cand, "note_type", ""))
-    day_delta = days_between(note_dt, recon_dt)
+    section = clean_cell(getattr(cand, "section", ""))
+    status = clean_cell(getattr(cand, "status", "")).lower()
+    evidence = clean_cell(getattr(cand, "evidence", "")).lower()
+    conf = float(getattr(cand, "confidence", 0.0) or 0.0)
 
+    day_delta = days_between(note_dt, recon_dt)
     if day_delta is None:
-        return (9, 9999, 9999, -cand_score(cand))
+        return (99, 999, 99, 99, 99, 99, -conf)
 
     abs_dd = abs(day_delta)
-    op_note = is_operation_note_type(note_type)
-    clinic_like = is_clinic_like_note(note_type, "")
+    bucket = note_type_bucket_for_bmi(note_type, "")
+    sec_rank = section_rank_for_bmi(section)
 
-    if day_delta == 0 and op_note:
-        return (0, 0, 0, -cand_score(cand))
+    is_computed = 1 if status == "computed" else 0
+    has_units = 1 if ("kg/m2" in evidence or "kg/m^2" in evidence or "kg/m²" in evidence) else 0
+    post_penalty = 1 if day_delta > 0 else 0
 
-    if day_delta == 0 and clinic_like:
-        return (1, 0, 0, -cand_score(cand))
+    if day_delta == 0 and bucket == "brief_op":
+        bucket_rank = 0
+    elif day_delta == 0 and bucket == "operation":
+        bucket_rank = 1
+    elif day_delta == 0 and bucket in ("preop", "anesthesia", "hp"):
+        bucket_rank = 2
+    elif day_delta == 0 and bucket in ("clinic", "progress", "consult"):
+        bucket_rank = 3
+    elif day_delta < 0 and bucket in ("preop", "anesthesia", "hp"):
+        bucket_rank = 4
+    elif day_delta < 0 and bucket in ("clinic", "progress", "consult"):
+        bucket_rank = 5
+    elif day_delta > 0 and bucket in ("brief_op", "operation"):
+        bucket_rank = 6
+    elif day_delta > 0 and bucket in ("preop", "anesthesia", "hp"):
+        bucket_rank = 7
+    elif day_delta > 0 and bucket in ("clinic", "progress", "consult"):
+        bucket_rank = 8
+    else:
+        bucket_rank = 9
 
-    if abs_dd <= 3 and op_note:
-        return (2, abs_dd, 0 if day_delta <= 0 else 1, -cand_score(cand))
-
-    if day_delta < 0 and abs_dd <= 45 and clinic_like:
-        return (3, abs_dd, 0, -cand_score(cand))
-
-    if day_delta > 0 and abs_dd <= 14 and clinic_like:
-        return (4, abs_dd, 1, -cand_score(cand))
-
-    if abs_dd <= 45:
-        return (5, abs_dd, 0 if day_delta <= 0 else 1, -cand_score(cand))
-
-    return (9, abs_dd, 0 if day_delta <= 0 else 1, -cand_score(cand))
+    return (
+        is_computed,
+        bucket_rank,
+        abs_dd,
+        post_penalty,
+        sec_rank,
+        -has_units,
+        -conf
+    )
 
 def choose_best_bmi(existing, new, recon_dt):
     if existing is None:
@@ -1211,8 +1254,9 @@ def main():
 
             if logical == "BMI" and not pd.isna(val):
                 try:
-                    master.loc[mask, "BMI"] = float(val)
-                    master.loc[mask, "Obesity"] = 1 if float(val) >= 30.0 else 0
+                    bmi_float = round(float(val), 1)
+                    master.loc[mask, "BMI"] = bmi_float
+                    master.loc[mask, "Obesity"] = 1 if bmi_float >= 30.0 else 0
                 except Exception:
                     master.loc[mask, "BMI"] = pd.NA
                 continue
