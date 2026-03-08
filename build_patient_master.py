@@ -12,11 +12,17 @@
 #   1) /home/apokol/Breast_Restore/_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv
 #   2) /home/apokol/Breast_Restore/_outputs/rule_hit_evidence_FINAL_NO_GOLD.csv
 #
-# UPDATE:
-# - BMI selection is now reconstruction-anchored with note-family fallback:
-#     (1) nearest OP NOTE / BRIEF OP NOTE around recon date
-#     (2) if no BMI extracted for that MRN, nearest clinic-style note around recon date
-# - This keeps BMI tied to reconstruction while allowing clinic fallback.
+# UPDATE (BMI ONLY):
+# - BMI is no longer selected as "best mention anywhere".
+# - BMI is now anchored to reconstruction date using structured encounter logic
+#   parallel to the age anchor logic.
+# - BMI candidates are only considered from notes in a reconstruction-relevant
+#   date window, then ranked so the pipeline prefers:
+#     1) exact-date operation / brief-op note
+#     2) exact-date clinic/progress note
+#     3) near-date operation / brief-op note
+#     4) pre-op clinic/progress note closest to reconstruction
+# - No other variable logic has been changed.
 #
 # Python 3.6.8 compatible
 
@@ -25,7 +31,6 @@ import re
 import math
 from glob import glob
 from datetime import datetime
-
 import pandas as pd
 
 # -----------------------
@@ -34,25 +39,26 @@ import pandas as pd
 BASE_DIR = "/home/apokol/Breast_Restore"
 
 STRUCT_GLOBS = [
-    f"{BASE_DIR}/**/HPI11526*Clinic Encounters.csv",
-    f"{BASE_DIR}/**/HPI11526*Inpatient Encounters.csv",
-    f"{BASE_DIR}/**/HPI11526*Operation Encounters.csv",
-    f"{BASE_DIR}/**/HPI11526*clinic encounters.csv",
-    f"{BASE_DIR}/**/HPI11526*inpatient encounters.csv",
-    f"{BASE_DIR}/**/HPI11526*operation encounters.csv",
+    "{0}/**/HPI11526*Clinic Encounters.csv".format(BASE_DIR),
+    "{0}/**/HPI11526*Inpatient Encounters.csv".format(BASE_DIR),
+    "{0}/**/HPI11526*Operation Encounters.csv".format(BASE_DIR),
+    "{0}/**/HPI11526*clinic encounters.csv".format(BASE_DIR),
+    "{0}/**/HPI11526*inpatient encounters.csv".format(BASE_DIR),
+    "{0}/**/HPI11526*operation encounters.csv".format(BASE_DIR),
 ]
 
 NOTE_GLOBS = [
-    f"{BASE_DIR}/**/HPI11526*Clinic Notes.csv",
-    f"{BASE_DIR}/**/HPI11526*Inpatient Notes.csv",
-    f"{BASE_DIR}/**/HPI11526*Operation Notes.csv",
-    f"{BASE_DIR}/**/HPI11526*clinic notes.csv",
-    f"{BASE_DIR}/**/HPI11526*inpatient notes.csv",
-    f"{BASE_DIR}/**/HPI11526*operation notes.csv",
+    "{0}/**/HPI11526*Clinic Notes.csv".format(BASE_DIR),
+    "{0}/**/HPI11526*Inpatient Notes.csv".format(BASE_DIR),
+    "{0}/**/HPI11526*Operation Notes.csv".format(BASE_DIR),
+    "{0}/**/HPI11526*clinic notes.csv".format(BASE_DIR),
+    "{0}/**/HPI11526*inpatient notes.csv".format(BASE_DIR),
+    "{0}/**/HPI11526*operation notes.csv".format(BASE_DIR),
 ]
 
-OUTPUT_MASTER = f"{BASE_DIR}/_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv"
-OUTPUT_EVID = f"{BASE_DIR}/_outputs/rule_hit_evidence_FINAL_NO_GOLD.csv"
+OUTPUT_MASTER = "{0}/_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv".format(BASE_DIR)
+OUTPUT_EVID = "{0}/_outputs/rule_hit_evidence_FINAL_NO_GOLD.csv".format(BASE_DIR)
+
 MERGE_KEY = "MRN"
 
 # -----------------------
@@ -66,7 +72,6 @@ from extractors.comorbidities import extract_comorbidities  # noqa: E402
 from extractors.pbs import extract_pbs  # noqa: E402
 from extractors.mastectomy import extract_mastectomy  # noqa: E402
 from extractors.cancer_treatment import extract_cancer_treatment  # noqa: E402
-
 
 # -----------------------
 # Robust CSV read
@@ -93,7 +98,12 @@ def read_csv_robust(path):
             )
     except UnicodeDecodeError:
         try:
-            return pd.read_csv(path, **common_kwargs, encoding="latin-1", on_bad_lines="skip")
+            return pd.read_csv(
+                path,
+                **common_kwargs,
+                encoding="latin-1",
+                on_bad_lines="skip"
+            )
         except TypeError:
             return pd.read_csv(
                 path,
@@ -103,11 +113,9 @@ def read_csv_robust(path):
                 warn_bad_lines=True
             )
 
-
 def clean_cols(df):
     df.columns = [str(c).strip().replace("\ufeff", "") for c in df.columns]
     return df
-
 
 def normalize_mrn(df):
     key_variants = ["MRN", "mrn", "Patient_MRN", "PAT_MRN", "PATIENT_MRN"]
@@ -121,7 +129,6 @@ def normalize_mrn(df):
     df[MERGE_KEY] = df[MERGE_KEY].astype(str).str.strip()
     return df
 
-
 def pick_col(df, options, required=True):
     for c in options:
         if c in df.columns:
@@ -132,20 +139,17 @@ def pick_col(df, options, required=True):
         ))
     return None
 
-
 def to_int_safe(x):
     try:
         return int(float(str(x).strip()))
     except Exception:
         return None
 
-
 def to_float_safe(x):
     try:
         return float(str(x).strip())
     except Exception:
         return None
-
 
 def clean_cell(x):
     if x is None:
@@ -155,12 +159,10 @@ def clean_cell(x):
         return ""
     return s
 
-
 def parse_date_safe(x):
     s = clean_cell(x)
     if not s:
         return None
-
     fmts = [
         "%Y-%m-%d",
         "%Y-%m-%d %H:%M:%S",
@@ -171,13 +173,11 @@ def parse_date_safe(x):
         "%d-%b-%Y",
         "%d-%b-%Y %H:%M:%S",
     ]
-
     for fmt in fmts:
         try:
             return datetime.strptime(s, fmt)
         except Exception:
             pass
-
     try:
         ts = pd.to_datetime(s, errors="coerce")
         if pd.isna(ts):
@@ -186,45 +186,10 @@ def parse_date_safe(x):
     except Exception:
         return None
 
-
-def abs_day_diff(d1, d2):
-    if d1 is None or d2 is None:
-        return None
-    try:
-        return abs((d1.date() - d2.date()).days)
-    except Exception:
-        return None
-
-
-def clean_note_type(note_type):
-    return clean_cell(note_type).upper()
-
-
-def is_op_or_brief_op(note_type):
-    nt = clean_note_type(note_type)
-    return nt in {"OP NOTE", "BRIEF OP NOTE", "BRIEF OP NOTES"}
-
-
-def is_clinic_like_for_bmi(note_type):
-    nt = clean_note_type(note_type)
-    if nt in {"CLINIC NOTE", "CLINIC NOTES", "PROGRESS NOTE", "PROGRESS NOTES", "H&P"}:
-        return True
-    if "CLINIC" in nt:
-        return True
-    if "PROGRESS" in nt:
-        return True
-    if "H&P" in nt:
-        return True
-    if "HISTORY AND PHYSICAL" in nt:
-        return True
-    return False
-
-
 # -----------------------
 # Lightweight sectionizer
 # -----------------------
 HEADER_RX = re.compile(r"^\s*([A-Z][A-Z0-9 /&\-]{2,60})\s*:\s*$")
-
 
 def sectionize(text):
     if not text:
@@ -233,7 +198,6 @@ def sectionize(text):
     sections = {}
     current = "FULL"
     sections[current] = []
-
     for line in lines:
         m = HEADER_RX.match(line)
         if m:
@@ -243,14 +207,12 @@ def sectionize(text):
                 sections[current] = []
             continue
         sections[current].append(line)
-
     out = {}
     for k, v in sections.items():
         joined = "\n".join(v).strip()
         if joined:
             out[k] = joined
     return out if out else {"FULL": text}
-
 
 def build_sectioned_note(note_text, note_type, note_id, note_date):
     return SectionedNote(
@@ -259,7 +221,6 @@ def build_sectioned_note(note_text, note_type, note_id, note_date):
         note_id=note_id or "",
         note_date=note_date or ""
     )
-
 
 # -----------------------
 # Aggregation logic
@@ -271,12 +232,10 @@ def cand_score(c):
     date_bonus = 0.01 if (getattr(c, "note_date", "") or "").strip() else 0.0
     return conf + op_bonus + date_bonus
 
-
 def choose_best(existing, new):
     if existing is None:
         return new
     return new if cand_score(new) > cand_score(existing) else existing
-
 
 def merge_boolean(existing, new):
     if existing is None:
@@ -291,7 +250,6 @@ def merge_boolean(existing, new):
     if exv and not nwv:
         return existing
     return choose_best(existing, new)
-
 
 # -----------------------
 # Field mapping to your FINAL columns
@@ -381,13 +339,11 @@ MASTER_COLUMNS = [
     "Stage2_Applicable",
 ]
 
-
 def seed_master_from_structured():
     struct_files = []
     for g in STRUCT_GLOBS:
         struct_files.extend(glob(g, recursive=True))
     struct_files = sorted(set(struct_files))
-
     mrns = set()
 
     if struct_files:
@@ -400,10 +356,8 @@ def seed_master_from_structured():
         for g in NOTE_GLOBS:
             note_files.extend(glob(g, recursive=True))
         note_files = sorted(set(note_files))
-
         if not note_files:
             raise FileNotFoundError("No structured encounters OR notes found to seed MRNs.")
-
         for fp in note_files:
             df = clean_cols(read_csv_robust(fp))
             df = normalize_mrn(df)
@@ -412,14 +366,11 @@ def seed_master_from_structured():
     mrns = sorted([m for m in mrns if m])
     master = pd.DataFrame({MERGE_KEY: mrns})
     master["ENCRYPTED_PAT_ID"] = master[MERGE_KEY]
-
     for c in MASTER_COLUMNS:
         if c not in master.columns:
             master[c] = pd.NA
-
     master = master[MASTER_COLUMNS]
     return master
-
 
 def load_and_reconstruct_notes():
     note_files = []
@@ -442,14 +393,12 @@ def load_and_reconstruct_notes():
         note_type_col = pick_col(df, ["NOTE_TYPE", "NOTE TYPE"], required=False)
         date_col = pick_col(
             df,
-            ["NOTE_DATE_OF_SERVICE", "NOTE DATE OF SERVICE", "OPERATION_DATE",
-             "ADMIT_DATE", "HOSP_ADMSN_TIME"],
+            ["NOTE_DATE_OF_SERVICE", "NOTE DATE OF SERVICE", "OPERATION_DATE", "ADMIT_DATE", "HOSP_ADMSN_TIME"],
             required=False
         )
 
         df[note_text_col] = df[note_text_col].fillna("").astype(str)
         df[note_id_col] = df[note_id_col].fillna("").astype(str)
-
         if line_col:
             df[line_col] = df[line_col].fillna("").astype(str)
         if note_type_col:
@@ -503,7 +452,6 @@ def load_and_reconstruct_notes():
     for (mrn, nid), g in grouped:
         mrn = str(mrn).strip()
         nid = str(nid).strip()
-
         if not nid:
             continue
 
@@ -532,9 +480,8 @@ def load_and_reconstruct_notes():
 
     return pd.DataFrame(reconstructed)
 
-
 # -----------------------
-# Structured enrichment: Race / Ethnicity / Age / recon anchor
+# Structured enrichment: Race / Ethnicity / Age
 # -----------------------
 def load_structured_encounters():
     rows = []
@@ -545,8 +492,8 @@ def load_structured_encounters():
     for fp in sorted(set(struct_files)):
         df = clean_cols(read_csv_robust(fp))
         df = normalize_mrn(df)
-
         source_name = os.path.basename(fp).lower()
+
         if "operation encounters" in source_name:
             encounter_source = "operation"
             priority = 1
@@ -596,12 +543,10 @@ def load_structured_encounters():
     struct_df = pd.concat(rows, ignore_index=True)
     return struct_df
 
-
 def normalize_race_token(x):
     s = clean_cell(x).lower()
     if not s:
         return ""
-
     if s in {"white or caucasian", "white", "caucasian"}:
         return "White"
     if s in {"black or african american", "black", "african american"}:
@@ -616,9 +561,7 @@ def normalize_race_token(x):
         return "Other"
     if s in {"unknown", "patient refused", "declined", "refused", "unable to obtain", "choose not to disclose"}:
         return "Unknown / Declined / Not Reported"
-
     return clean_cell(x)
-
 
 def normalize_ethnicity_value(x):
     s = clean_cell(x)
@@ -626,11 +569,9 @@ def normalize_ethnicity_value(x):
         return ""
     return s
 
-
 def normalize_race_value_list(raw_values):
     real_races = []
     unknown_seen = False
-
     for raw in raw_values:
         norm = normalize_race_token(raw)
         if not norm:
@@ -640,21 +581,16 @@ def normalize_race_value_list(raw_values):
             continue
         if norm not in real_races:
             real_races.append(norm)
-
     if len(real_races) == 0:
         if unknown_seen:
             return "Unknown / Declined / Not Reported"
         return ""
-
     if len(real_races) == 1:
         return real_races[0]
-
     return "Multiracial"
-
 
 def choose_best_ethnicity(struct_df):
     eth_best = {}
-
     if len(struct_df) == 0:
         return eth_best
 
@@ -662,18 +598,14 @@ def choose_best_ethnicity(struct_df):
         mrn = clean_cell(row.get(MERGE_KEY, ""))
         if not mrn:
             continue
-
         eth_val = normalize_ethnicity_value(row.get("ETHNICITY_STRUCT", ""))
         if not eth_val:
             continue
-
         priority = to_int_safe(row.get("STRUCT_PRIORITY", 9))
         if priority is None:
             priority = 9
-
         cur = eth_best.get(mrn)
         score = priority
-
         if cur is None or score < cur["score"]:
             eth_best[mrn] = {
                 "value": eth_val,
@@ -681,42 +613,33 @@ def choose_best_ethnicity(struct_df):
                 "source": row.get("STRUCT_SOURCE", ""),
                 "date_raw": row.get("STRUCT_DATE_RAW", "")
             }
-
     return eth_best
-
 
 def choose_race_us_categories(struct_df):
     race_by_mrn = {}
-
     if len(struct_df) == 0:
         return race_by_mrn
-
     for _, row in struct_df.iterrows():
         mrn = clean_cell(row.get(MERGE_KEY, ""))
         if not mrn:
             continue
-
         raw_race = clean_cell(row.get("RACE_STRUCT", ""))
         if not raw_race:
             continue
-
         if mrn not in race_by_mrn:
             race_by_mrn[mrn] = []
-
         race_by_mrn[mrn].append(raw_race)
 
     out = {}
     for mrn, raw_values in race_by_mrn.items():
         out[mrn] = normalize_race_value_list(raw_values)
-
     return out
 
-
-def _recon_anchor_helper(struct_df, require_age=False):
-    out_best = {}
-
+# ---------- Age logic with clinic->operation->inpatient priority and fallback CPTs ----------
+def choose_best_clinic_age_rows(struct_df):
+    age_best = {}
     if len(struct_df) == 0:
-        return out_best
+        return age_best
 
     source_priority = {
         "clinic": 1,
@@ -725,31 +648,150 @@ def _recon_anchor_helper(struct_df, require_age=False):
     }
 
     preferred_cpts = set([
-        "19357",
-        "19340",
-        "19342",
-        "19361",
-        "19364",
-        "19367",
-        "S2068"
+        "19357",  # tissue expander placement
+        "19340",  # immediate implant
+        "19342",  # delayed implant
+        "19361",  # latissimus flap
+        "19364",  # free flap
+        "19367",  # TRAM flap
+        "S2068"   # DIEP / SIEA flap
     ])
 
     primary_exclude_cpts = set([
-        "19325",
-        "19330"
+        "19325",  # augmentation
+        "19330"   # implant replacement / removal-related
     ])
 
     fallback_allowed_cpts = set([
-        "19350",
-        "19380"
+        "19350",  # nipple / areola reconstruction
+        "19380"   # revision
     ])
 
     eligible_sources = struct_df[struct_df["STRUCT_SOURCE"].isin(["clinic", "operation", "inpatient"])].copy()
     if len(eligible_sources) == 0:
-        return out_best
+        return age_best
 
     has_preferred_cpt = {}
+    for mrn, g in eligible_sources.groupby(MERGE_KEY):
+        found = False
+        for val in g["CPT_CODE_STRUCT"].fillna("").astype(str).tolist():
+            cpt = clean_cell(val).upper()
+            if cpt in preferred_cpts:
+                found = True
+                break
+        has_preferred_cpt[mrn] = found
 
+    for _, row in eligible_sources.iterrows():
+        mrn = clean_cell(row.get(MERGE_KEY, ""))
+        if not mrn:
+            continue
+        source = clean_cell(row.get("STRUCT_SOURCE", "")).lower()
+        if source not in source_priority:
+            continue
+
+        age_raw = clean_cell(row.get("AGE_AT_ENCOUNTER_STRUCT", ""))
+        age_base = to_float_safe(age_raw)
+        admit_date = parse_date_safe(row.get("ADMIT_DATE_STRUCT", ""))
+        recon_date = parse_date_safe(row.get("RECONSTRUCTION_DATE_STRUCT", ""))
+        cpt_code = clean_cell(row.get("CPT_CODE_STRUCT", "")).upper()
+        procedure = clean_cell(row.get("PROCEDURE_STRUCT", "")).lower()
+        reason_for_visit = clean_cell(row.get("REASON_FOR_VISIT_STRUCT", "")).lower()
+
+        if age_base is None or admit_date is None or recon_date is None:
+            continue
+        if cpt_code in primary_exclude_cpts:
+            continue
+        if has_preferred_cpt.get(mrn, False) and cpt_code in fallback_allowed_cpts:
+            continue
+
+        is_anchor = False
+        if cpt_code in preferred_cpts:
+            is_anchor = True
+        if (not has_preferred_cpt.get(mrn, False)) and (cpt_code in fallback_allowed_cpts):
+            is_anchor = True
+        if not is_anchor:
+            if (
+                ("tissue expander" in procedure) or
+                ("breast recon" in procedure) or
+                ("implant on same day of mastectomy" in procedure) or
+                ("insert or replcmnt breast implnt on sep day from mastectomy" in procedure) or
+                ("latissimus" in procedure) or
+                ("diep" in procedure) or
+                ("tram" in procedure) or
+                ("flap" in procedure)
+            ):
+                is_anchor = True
+
+        if not is_anchor:
+            continue
+
+        day_diff = (recon_date - admit_date).days
+        adjusted_age = float(age_base) + (float(day_diff) / 365.25)
+        age_floor = int(math.floor(adjusted_age))
+        age_round = int(math.floor(adjusted_age + 0.5))
+
+        score = (
+            source_priority[source],
+            recon_date,
+            admit_date
+        )
+        current_best = age_best.get(mrn)
+        if current_best is None or score < current_best["score"]:
+            age_best[mrn] = {
+                "age_at_encounter": age_raw,
+                "admit_date": admit_date.strftime("%Y-%m-%d"),
+                "recon_date": recon_date.strftime("%Y-%m-%d"),
+                "day_diff": day_diff,
+                "value_floor": age_floor,
+                "value_round": age_round,
+                "score": score,
+                "source": source,
+                "cpt_code": cpt_code,
+                "procedure": clean_cell(row.get("PROCEDURE_STRUCT", "")),
+                "reason_for_visit": clean_cell(row.get("REASON_FOR_VISIT_STRUCT", ""))
+            }
+
+    return age_best
+
+# -----------------------
+# BMI-only reconstruction anchor logic
+# -----------------------
+def choose_best_bmi_anchor_rows(struct_df):
+    bmi_best = {}
+    if len(struct_df) == 0:
+        return bmi_best
+
+    source_priority = {
+        "clinic": 1,
+        "operation": 2,
+        "inpatient": 3
+    }
+
+    preferred_cpts = set([
+        "19357",  # tissue expander placement
+        "19340",  # immediate implant
+        "19342",  # delayed implant
+        "19361",  # latissimus flap
+        "19364",  # free flap
+        "19367",  # TRAM flap
+        "S2068"   # DIEP / SIEA flap
+    ])
+
+    primary_exclude_cpts = set([
+        "19325",  # augmentation
+        "19330"   # implant replacement / removal-related
+    ])
+
+    fallback_allowed_cpts = set([
+        "19350",  # nipple / areola reconstruction
+        "19380"   # revision
+    ])
+
+    eligible_sources = struct_df[struct_df["STRUCT_SOURCE"].isin(["clinic", "operation", "inpatient"])].copy()
+    if len(eligible_sources) == 0:
+        return bmi_best
+
+    has_preferred_cpt = {}
     for mrn, g in eligible_sources.groupby(MERGE_KEY):
         found = False
         for val in g["CPT_CODE_STRUCT"].fillna("").astype(str).tolist():
@@ -768,36 +810,24 @@ def _recon_anchor_helper(struct_df, require_age=False):
         if source not in source_priority:
             continue
 
-        age_raw = clean_cell(row.get("AGE_AT_ENCOUNTER_STRUCT", ""))
-        age_base = to_float_safe(age_raw)
-
         admit_date = parse_date_safe(row.get("ADMIT_DATE_STRUCT", ""))
         recon_date = parse_date_safe(row.get("RECONSTRUCTION_DATE_STRUCT", ""))
-
         cpt_code = clean_cell(row.get("CPT_CODE_STRUCT", "")).upper()
         procedure = clean_cell(row.get("PROCEDURE_STRUCT", "")).lower()
         reason_for_visit = clean_cell(row.get("REASON_FOR_VISIT_STRUCT", "")).lower()
 
-        if require_age and age_base is None:
-            continue
-
         if admit_date is None or recon_date is None:
             continue
-
         if cpt_code in primary_exclude_cpts:
             continue
-
         if has_preferred_cpt.get(mrn, False) and cpt_code in fallback_allowed_cpts:
             continue
 
         is_anchor = False
-
         if cpt_code in preferred_cpts:
             is_anchor = True
-
         if (not has_preferred_cpt.get(mrn, False)) and (cpt_code in fallback_allowed_cpts):
             is_anchor = True
-
         if not is_anchor:
             if (
                 ("tissue expander" in procedure) or
@@ -819,11 +849,9 @@ def _recon_anchor_helper(struct_df, require_age=False):
             recon_date,
             admit_date
         )
-
-        current_best = out_best.get(mrn)
-
+        current_best = bmi_best.get(mrn)
         if current_best is None or score < current_best["score"]:
-            payload = {
+            bmi_best[mrn] = {
                 "admit_date": admit_date.strftime("%Y-%m-%d"),
                 "recon_date": recon_date.strftime("%Y-%m-%d"),
                 "score": score,
@@ -833,30 +861,110 @@ def _recon_anchor_helper(struct_df, require_age=False):
                 "reason_for_visit": clean_cell(row.get("REASON_FOR_VISIT_STRUCT", ""))
             }
 
-            if require_age:
-                day_diff = (recon_date - admit_date).days
-                adjusted_age = float(age_base) + (float(day_diff) / 365.25)
-                age_floor = int(math.floor(adjusted_age))
-                age_round = int(math.floor(adjusted_age + 0.5))
-                payload.update({
-                    "age_at_encounter": age_raw,
-                    "day_diff": day_diff,
-                    "value_floor": age_floor,
-                    "value_round": age_round
-                })
+    return bmi_best
 
-            out_best[mrn] = payload
+def same_calendar_date(dt1, dt2):
+    if dt1 is None or dt2 is None:
+        return False
+    return dt1.date() == dt2.date()
 
-    return out_best
+def days_between(dt1, dt2):
+    if dt1 is None or dt2 is None:
+        return None
+    return (dt1.date() - dt2.date()).days
 
+def is_operation_note_type(note_type):
+    s = clean_cell(note_type).lower()
+    if not s:
+        return False
+    if "brief op" in s:
+        return True
+    if "op note" in s:
+        return True
+    if "operative" in s:
+        return True
+    if "operation" in s:
+        return True
+    if "oper report" in s:
+        return True
+    return False
 
-def choose_best_clinic_age_rows(struct_df):
-    return _recon_anchor_helper(struct_df, require_age=True)
+def is_clinic_like_note(note_type, source_file):
+    s1 = clean_cell(note_type).lower()
+    s2 = clean_cell(source_file).lower()
+    joined = "{0} {1}".format(s1, s2)
 
+    patterns = [
+        "progress",
+        "clinic",
+        "office",
+        "follow up",
+        "follow-up",
+        "pre-op",
+        "preop",
+        "consult",
+        "h&p",
+        "history and physical"
+    ]
+    for p in patterns:
+        if p in joined:
+            return True
+    return False
 
-def choose_best_bmi_recon_rows(struct_df):
-    return _recon_anchor_helper(struct_df, require_age=False)
+def bmi_note_in_allowed_window(note_dt, recon_dt):
+    dd = days_between(note_dt, recon_dt)
+    if dd is None:
+        return False
+    # allow up to 45 days before recon and 14 days after recon
+    # to catch pre-op clinic BMI and very near peri-op documentation
+    if dd >= -45 and dd <= 14:
+        return True
+    return False
 
+def bmi_candidate_rank(cand, recon_dt):
+    note_dt = parse_date_safe(getattr(cand, "note_date", ""))
+    note_type = clean_cell(getattr(cand, "note_type", ""))
+    day_delta = days_between(note_dt, recon_dt)
+
+    if day_delta is None:
+        return (9, 9999, 9999, -cand_score(cand))
+
+    abs_dd = abs(day_delta)
+    op_note = is_operation_note_type(note_type)
+    clinic_like = is_clinic_like_note(note_type, "")
+
+    # exact-date op note / brief op note
+    if day_delta == 0 and op_note:
+        return (0, 0, 0, -cand_score(cand))
+
+    # exact-date clinic/progress note
+    if day_delta == 0 and clinic_like:
+        return (1, 0, 0, -cand_score(cand))
+
+    # near-date op note within +/- 3 days
+    if abs_dd <= 3 and op_note:
+        return (2, abs_dd, 0 if day_delta <= 0 else 1, -cand_score(cand))
+
+    # pre-op clinic note within 45 days
+    if day_delta < 0 and abs_dd <= 45 and clinic_like:
+        return (3, abs_dd, 0, -cand_score(cand))
+
+    # post-op clinic note within 14 days
+    if day_delta > 0 and abs_dd <= 14 and clinic_like:
+        return (4, abs_dd, 1, -cand_score(cand))
+
+    # other note in allowed window
+    if abs_dd <= 45:
+        return (5, abs_dd, 0 if day_delta <= 0 else 1, -cand_score(cand))
+
+    return (9, abs_dd, 0 if day_delta <= 0 else 1, -cand_score(cand))
+
+def choose_best_bmi(existing, new, recon_dt):
+    if existing is None:
+        return new
+    ex_rank = bmi_candidate_rank(existing, recon_dt)
+    nw_rank = bmi_candidate_rank(new, recon_dt)
+    return new if nw_rank < ex_rank else existing
 
 def enrich_master_with_structured_demo(master, notes_df, evidence_rows):
     print("Loading structured encounters for Race / Ethnicity / Age...")
@@ -912,16 +1020,15 @@ def enrich_master_with_structured_demo(master, notes_df, evidence_rows):
         if age_info is not None:
             age_floor = age_info.get("value_floor")
             age_round = age_info.get("value_round")
-
             final_age = age_round if age_round is not None else age_floor
-
             if final_age is not None:
                 master.loc[mask, "Age"] = final_age
-
                 ev = (
-                    "Age from structured encounter row using AGE_AT_ENCOUNTER + ADMIT_DATE + RECONSTRUCTION_DATE with source priority and fallback CPT logic | "
+                    "Age from structured encounter row using AGE_AT_ENCOUNTER + ADMIT_DATE + RECONSTRUCTION_DATE with "
+                    "source priority and fallback CPT logic | "
                     "AGE_AT_ENCOUNTER={0} | ADMIT_DATE={1} | RECONSTRUCTION_DATE={2} | DAY_DIFF={3} | "
-                    "AGE_FLOOR={4} | AGE_ROUND={5} | FINAL_USED={6} | SOURCE={7} | CPT_CODE={8} | PROCEDURE={9} | REASON_FOR_VISIT={10}"
+                    "AGE_FLOOR={4} | AGE_ROUND={5} | FINAL_USED={6} | SOURCE={7} | CPT_CODE={8} | "
+                    "PROCEDURE={9} | REASON_FOR_VISIT={10}"
                 ).format(
                     age_info.get("age_at_encounter", ""),
                     age_info.get("admit_date", ""),
@@ -935,7 +1042,6 @@ def enrich_master_with_structured_demo(master, notes_df, evidence_rows):
                     age_info.get("procedure", ""),
                     age_info.get("reason_for_visit", "")
                 )
-
                 evidence_rows.append({
                     MERGE_KEY: mrn,
                     "NOTE_ID": "",
@@ -950,87 +1056,6 @@ def enrich_master_with_structured_demo(master, notes_df, evidence_rows):
                 })
 
     return master, evidence_rows
-
-
-def build_bmi_note_targets(notes_df, bmi_anchor_map):
-    """
-    For each MRN:
-      phase 1 -> nearest OP NOTE / BRIEF OP NOTE around recon date
-      phase 2 -> nearest clinic-style note around recon date
-    """
-    targets = {}
-
-    if len(notes_df) == 0 or len(bmi_anchor_map) == 0:
-        return targets
-
-    tmp = notes_df.copy()
-    tmp["NOTE_DATE_PARSED"] = tmp["NOTE_DATE"].apply(parse_date_safe)
-
-    for mrn, anchor in bmi_anchor_map.items():
-        recon_dt = parse_date_safe(anchor.get("recon_date", ""))
-        if recon_dt is None:
-            continue
-
-        g = tmp[tmp[MERGE_KEY].astype(str).str.strip() == mrn].copy()
-        if len(g) == 0:
-            continue
-
-        candidates = []
-
-        # phase 1: op / brief op
-        for _, row in g.iterrows():
-            note_dt = row.get("NOTE_DATE_PARSED")
-            dd = abs_day_diff(note_dt, recon_dt)
-            if dd is None:
-                continue
-            nt = row.get("NOTE_TYPE", "")
-            if is_op_or_brief_op(nt):
-                candidates.append({
-                    "NOTE_ID": str(row["NOTE_ID"]).strip(),
-                    "NOTE_TYPE": nt,
-                    "NOTE_DATE": row["NOTE_DATE"],
-                    "DAY_DIFF": dd,
-                    "PHASE": "op_note"
-                })
-
-        if candidates:
-            candidates = sorted(candidates, key=lambda x: (x["DAY_DIFF"], x["NOTE_ID"]))
-            targets[mrn] = {
-                "phase1_note_ids": set([x["NOTE_ID"] for x in candidates if x["DAY_DIFF"] == candidates[0]["DAY_DIFF"]]),
-                "phase1_day_diff": candidates[0]["DAY_DIFF"],
-                "phase2_note_ids": set(),
-                "recon_date": anchor.get("recon_date", "")
-            }
-            continue
-
-        # phase 2: clinic fallback
-        clinic_candidates = []
-        for _, row in g.iterrows():
-            note_dt = row.get("NOTE_DATE_PARSED")
-            dd = abs_day_diff(note_dt, recon_dt)
-            if dd is None:
-                continue
-            nt = row.get("NOTE_TYPE", "")
-            if is_clinic_like_for_bmi(nt):
-                clinic_candidates.append({
-                    "NOTE_ID": str(row["NOTE_ID"]).strip(),
-                    "NOTE_TYPE": nt,
-                    "NOTE_DATE": row["NOTE_DATE"],
-                    "DAY_DIFF": dd,
-                    "PHASE": "clinic_fallback"
-                })
-
-        if clinic_candidates:
-            clinic_candidates = sorted(clinic_candidates, key=lambda x: (x["DAY_DIFF"], x["NOTE_ID"]))
-            targets[mrn] = {
-                "phase1_note_ids": set(),
-                "phase1_day_diff": None,
-                "phase2_note_ids": set([x["NOTE_ID"] for x in clinic_candidates if x["DAY_DIFF"] == clinic_candidates[0]["DAY_DIFF"]]),
-                "recon_date": anchor.get("recon_date", "")
-            }
-
-    return targets
-
 
 def main():
     print("Seeding clean master WITHOUT gold...")
@@ -1047,15 +1072,13 @@ def main():
     print("Reconstructed notes: {0}".format(len(notes_df)))
 
     evidence_rows = []
-
     master, evidence_rows = enrich_master_with_structured_demo(master, notes_df, evidence_rows)
 
+    # BMI anchor map loaded from the same structured source logic;
+    # this affects BMI only and does not change any other variable path.
     struct_df = load_structured_encounters()
-    bmi_anchor_map = choose_best_bmi_recon_rows(struct_df)
-    print("Structured reconstruction-date BMI anchor rows found for MRNs: {0}".format(len(bmi_anchor_map)))
-
-    bmi_note_targets = build_bmi_note_targets(notes_df, bmi_anchor_map)
-    print("BMI note targets built for MRNs: {0}".format(len(bmi_note_targets)))
+    bmi_anchor_map = choose_best_bmi_anchor_rows(struct_df)
+    print("Structured reconstruction-date BMI anchors found for MRNs: {0}".format(len(bmi_anchor_map)))
 
     print("Running rule-based extractors...")
     extractor_fns = [
@@ -1069,9 +1092,7 @@ def main():
     ]
 
     best_by_mrn = {}
-    bmi_phase1_found = set()
 
-    # -------- pass 1: op / brief op only for BMI --------
     for _, row in notes_df.iterrows():
         mrn = str(row[MERGE_KEY]).strip()
 
@@ -1085,39 +1106,42 @@ def main():
         all_cands = []
 
         for fn in extractor_fns:
+            # BMI special rule only:
+            # run BMI extraction only on notes in a reconstruction-relevant window
+            # for patients with a valid structured reconstruction anchor.
             if fn == extract_bmi:
-                target = bmi_note_targets.get(mrn)
-                if target is None:
+                bmi_anchor = bmi_anchor_map.get(mrn)
+                if bmi_anchor is None:
                     continue
-                if str(row["NOTE_ID"]).strip() not in target.get("phase1_note_ids", set()):
+
+                recon_dt = parse_date_safe(bmi_anchor.get("recon_date", ""))
+                note_dt = parse_date_safe(row["NOTE_DATE"])
+
+                if recon_dt is None or note_dt is None:
                     continue
+
+                if not bmi_note_in_allowed_window(note_dt, recon_dt):
+                    continue
+
+                try:
+                    all_cands.extend(fn(snote))
+                except Exception as e:
+                    evidence_rows.append({
+                        MERGE_KEY: mrn,
+                        "NOTE_ID": row["NOTE_ID"],
+                        "NOTE_DATE": row["NOTE_DATE"],
+                        "NOTE_TYPE": row["NOTE_TYPE"],
+                        "FIELD": "EXTRACTOR_ERROR",
+                        "VALUE": "",
+                        "STATUS": "",
+                        "CONFIDENCE": "",
+                        "SECTION": "",
+                        "EVIDENCE": "{0} failed: {1}".format(fn.__name__, repr(e))
+                    })
+                continue
 
             try:
-                new_cands = fn(snote)
-                all_cands.extend(new_cands)
-
-                if fn == extract_bmi:
-                    target = bmi_note_targets.get(mrn)
-                    if target is not None and str(row["NOTE_ID"]).strip() in target.get("phase1_note_ids", set()):
-                        evidence_rows.append({
-                            MERGE_KEY: mrn,
-                            "NOTE_ID": row["NOTE_ID"],
-                            "NOTE_DATE": row["NOTE_DATE"],
-                            "NOTE_TYPE": row["NOTE_TYPE"],
-                            "FIELD": "BMI_NOTE_SELECTION",
-                            "VALUE": "",
-                            "STATUS": "targeted_selection_phase1",
-                            "CONFIDENCE": "",
-                            "SECTION": "STRUCTURED_RECON_PLUS_NEAREST_OP_NOTE",
-                            "EVIDENCE": "BMI phase1 target | RECON_DATE={0} | NOTE_ID={1} | NOTE_TYPE={2}".format(
-                                target.get("recon_date", ""),
-                                row["NOTE_ID"],
-                                row["NOTE_TYPE"]
-                            )
-                        })
-                        if len(new_cands) > 0:
-                            bmi_phase1_found.add(mrn)
-
+                all_cands.extend(fn(snote))
             except Exception as e:
                 evidence_rows.append({
                     MERGE_KEY: mrn,
@@ -1143,6 +1167,18 @@ def main():
             if not logical:
                 continue
 
+            evid = getattr(c, "evidence", "")
+            if logical == "BMI":
+                bmi_anchor = bmi_anchor_map.get(mrn)
+                recon_dt = parse_date_safe((bmi_anchor or {}).get("recon_date", ""))
+                note_dt = parse_date_safe(getattr(c, "note_date", row["NOTE_DATE"]))
+                note_day_diff = days_between(note_dt, recon_dt)
+                evid = "{0} | BMI_RECON_DATE={1} | BMI_NOTE_DAY_DIFF={2}".format(
+                    evid,
+                    (bmi_anchor or {}).get("recon_date", ""),
+                    note_day_diff
+                )
+
             evidence_rows.append({
                 MERGE_KEY: mrn,
                 "NOTE_ID": getattr(c, "note_id", row["NOTE_ID"]),
@@ -1153,96 +1189,19 @@ def main():
                 "STATUS": getattr(c, "status", ""),
                 "CONFIDENCE": getattr(c, "confidence", ""),
                 "SECTION": getattr(c, "section", ""),
-                "EVIDENCE": getattr(c, "evidence", "")
+                "EVIDENCE": evid
             })
 
             existing = best_by_mrn[mrn].get(logical)
-            if logical in BOOLEAN_FIELDS:
+
+            if logical == "BMI":
+                bmi_anchor = bmi_anchor_map.get(mrn)
+                recon_dt = parse_date_safe((bmi_anchor or {}).get("recon_date", ""))
+                best_by_mrn[mrn][logical] = choose_best_bmi(existing, c, recon_dt)
+            elif logical in BOOLEAN_FIELDS:
                 best_by_mrn[mrn][logical] = merge_boolean(existing, c)
             else:
                 best_by_mrn[mrn][logical] = choose_best(existing, c)
-
-    # -------- pass 2: clinic fallback only if no phase1 BMI --------
-    for _, row in notes_df.iterrows():
-        mrn = str(row[MERGE_KEY]).strip()
-
-        if mrn in bmi_phase1_found:
-            continue
-
-        target = bmi_note_targets.get(mrn)
-        if target is None:
-            continue
-
-        if str(row["NOTE_ID"]).strip() not in target.get("phase2_note_ids", set()):
-            continue
-
-        snote = build_sectioned_note(
-            note_text=row["NOTE_TEXT"],
-            note_type=row["NOTE_TYPE"],
-            note_id=row["NOTE_ID"],
-            note_date=row["NOTE_DATE"]
-        )
-
-        try:
-            new_cands = extract_bmi(snote)
-
-            evidence_rows.append({
-                MERGE_KEY: mrn,
-                "NOTE_ID": row["NOTE_ID"],
-                "NOTE_DATE": row["NOTE_DATE"],
-                "NOTE_TYPE": row["NOTE_TYPE"],
-                "FIELD": "BMI_NOTE_SELECTION",
-                "VALUE": "",
-                "STATUS": "targeted_selection_phase2",
-                "CONFIDENCE": "",
-                "SECTION": "STRUCTURED_RECON_PLUS_NEAREST_CLINIC_FALLBACK",
-                "EVIDENCE": "BMI phase2 fallback target | RECON_DATE={0} | NOTE_ID={1} | NOTE_TYPE={2}".format(
-                    target.get("recon_date", ""),
-                    row["NOTE_ID"],
-                    row["NOTE_TYPE"]
-                )
-            })
-
-            if not new_cands:
-                continue
-
-            if mrn not in best_by_mrn:
-                best_by_mrn[mrn] = {}
-
-            for c in new_cands:
-                logical = FIELD_MAP.get(str(c.field))
-                if not logical:
-                    continue
-
-                evidence_rows.append({
-                    MERGE_KEY: mrn,
-                    "NOTE_ID": getattr(c, "note_id", row["NOTE_ID"]),
-                    "NOTE_DATE": getattr(c, "note_date", row["NOTE_DATE"]),
-                    "NOTE_TYPE": getattr(c, "note_type", row["NOTE_TYPE"]),
-                    "FIELD": logical,
-                    "VALUE": getattr(c, "value", ""),
-                    "STATUS": getattr(c, "status", ""),
-                    "CONFIDENCE": getattr(c, "confidence", ""),
-                    "SECTION": getattr(c, "section", ""),
-                    "EVIDENCE": getattr(c, "evidence", "")
-                })
-
-                existing = best_by_mrn[mrn].get(logical)
-                best_by_mrn[mrn][logical] = choose_best(existing, c)
-
-        except Exception as e:
-            evidence_rows.append({
-                MERGE_KEY: mrn,
-                "NOTE_ID": row["NOTE_ID"],
-                "NOTE_DATE": row["NOTE_DATE"],
-                "NOTE_TYPE": row["NOTE_TYPE"],
-                "FIELD": "EXTRACTOR_ERROR",
-                "VALUE": "",
-                "STATUS": "",
-                "CONFIDENCE": "",
-                "SECTION": "",
-                "EVIDENCE": "extract_bmi phase2 failed: {0}".format(repr(e))
-            })
 
     print("Aggregated note-based predictions for {0} MRNs".format(len(best_by_mrn)))
 
@@ -1286,7 +1245,6 @@ def main():
     print("- Evidence: {0}".format(OUTPUT_EVID))
     print("\nRun:")
     print(" python build_master_rule_FINAL_NO_GOLD.py")
-
 
 if __name__ == "__main__":
     main()
