@@ -1191,8 +1191,9 @@ def main():
 
             if logical == "BMI" and not pd.isna(val):
                 try:
-                    master.loc[mask, "BMI"] = float(val)
-                    master.loc[mask, "Obesity"] = 1 if float(val) >= 30.0 else 0
+                    bmi_val = round(float(val))
+                    master.loc[mask, "BMI"] = bmi_val
+                    master.loc[mask, "Obesity"] = 1 if bmi_val >= 30 else 0
                 except Exception:
                     master.loc[mask, "BMI"] = pd.NA
                 continue
