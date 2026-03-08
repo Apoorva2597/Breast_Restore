@@ -1,160 +1,144 @@
 # extractors/bmi.py
-#
-# BMI extractor designed for OP NOTE / BRIEF OP NOTE wording, with clinic fallback support.
-#
-# Captures patterns such as:
-#   BMI 30.4
-#   BMI: 30.4
-#   BMI (30.4)
-#   BMI=30.4
-#   BMI 30
-#   BMI of 30.4
-#   body mass index 30.4
-#   obesity, BMI 30
-#   morbid obesity-BMI 48.4
-#   morbid obesity (BMI 37.8)
-#
-# Avoids threshold / rule language such as:
-#   BMI >= 35
-#   BMI greater than 35
-#   if BMI ...
-#
-# Python 3.6.8 compatible.
 
 import re
-from typing import List
+from models import Candidate
 
-from models import Candidate, SectionedNote
-from .utils import window_around
-
+# ----------------------------------------------
+# UPDATE:
+# Restrict BMI extraction to operative / operation
+# notes only, because gold BMI should reflect BMI
+# at reconstruction rather than any clinic BMI.
+#
+# Captures:
+# BMI 30.12
+# BMI: 30.12
+# BMI=30.12
+# BMI of 30.12
+# body mass index 30.12
+#
+# Rejects threshold / policy / comparison language:
+# BMI >= 35
+# BMI greater than or equal to 35
+# BMI < 30
+# if BMI ...
+#
+# BMI rounded to ONE decimal to match gold file.
+# Python 3.6.8 compatible.
+# ----------------------------------------------
 
 BMI_PATTERNS = [
-    # BMI 30.4 / BMI: 30.4 / BMI=30 / BMI 30 kg/m2
-    re.compile(
-        r"\bBMI\b\s*[:=]?\s*\(?\s*(\d{2,3}(?:\.\d+)?)\s*\)?\s*(?:kg\s*/\s*m2|kg\s*/\s*m\^?2|kg/m2|kg/m\^?2)?\b",
-        re.IGNORECASE
-    ),
-
-    # BMI of 30.4
-    re.compile(
-        r"\bBMI\s+of\s+\(?\s*(\d{2,3}(?:\.\d+)?)\s*\)?\b",
-        re.IGNORECASE
-    ),
-
-    # body mass index 30.4 / body mass index: 30.4
-    re.compile(
-        r"\bbody\s+mass\s+index\b\s*[:=]?\s*\(?\s*(\d{2,3}(?:\.\d+)?)\s*\)?\b",
-        re.IGNORECASE
-    ),
-
-    # obesity, BMI 30 / obesity - BMI 30 / obesity (BMI 30)
-    re.compile(
-        r"\bobesity\b[\s,\-:;()]{0,12}\bBMI\b[\s:=()\-]{0,8}\(?\s*(\d{2,3}(?:\.\d+)?)\s*\)?\b",
-        re.IGNORECASE
-    ),
-
-    # morbid obesity-BMI 48.4 / morbid obesity (BMI 37.8)
-    re.compile(
-        r"\bmorbid\s+obesity\b[\s,\-:;()]{0,12}\bBMI\b[\s:=()\-]{0,8}\(?\s*(\d{2,3}(?:\.\d+)?)\s*\)?\b",
-        re.IGNORECASE
-    ),
+    re.compile(r"\bBMI\s*[:=]?\s*(\d{2,3}(?:\.\d+)?)\b", re.IGNORECASE),
+    re.compile(r"\bBMI\s+of\s+(\d{2,3}(?:\.\d+)?)\b", re.IGNORECASE),
+    re.compile(r"\bbody\s+mass\s+index\s*[:=]?\s*(\d{2,3}(?:\.\d+)?)\b", re.IGNORECASE),
 ]
 
-
 THRESHOLD_FALSE_POS = re.compile(
-    r"\bBMI\b.{0,50}\b("
-    r"greater\s+than|less\s+than|greater\s+than\s+or\s+equal\s+to|"
-    r"less\s+than\s+or\s+equal\s+to|at\s+least|more\s+than|under|over|"
-    r"above|below|minimum|maximum|threshold|criteria|cutoff|eligib"
-    r")\b|"
-    r"\bBMI\s*(>=|<=|>|<)\s*\d{1,3}(?:\.\d+)?\b",
-    re.IGNORECASE,
+    r"(?:"
+    r"bmi\s*(?:>=|=>|>|<=|=<|<)\s*\d+"
+    r"|bmi\s*(?:greater|less)\s+than"
+    r"|bmi\s*(?:greater|less)\s+than\s+or\s+equal\s+to"
+    r"|bmi\s*(?:over|under|above|below)"
+    r"|minimum\s+bmi"
+    r"|maximum\s+bmi"
+    r"|target\s+bmi"
+    r"|goal\s+bmi"
+    r"|acceptable\s+bmi"
+    r"|required\s+bmi"
+    r")",
+    re.IGNORECASE
 )
 
 CONDITIONAL_FALSE_POS = re.compile(
-    r"\b(if|when|because|due\s+to|given|for\s+patients?\s+with)\b.{0,50}\bBMI\b",
-    re.IGNORECASE,
+    r"(?:"
+    r"\bif\s+bmi\b"
+    r"|\bwhen\s+bmi\b"
+    r"|\bunless\s+bmi\b"
+    r"|\bfor\s+bmi\s*(?:>=|=>|>|<=|=<|<)\b"
+    r"|\bpatients?\s+with\s+bmi\b"
+    r"|\bpts?\s+with\s+bmi\b"
+    r"|\bfor\s+patients?\s+with\s+bmi\b"
+    r")",
+    re.IGNORECASE
 )
 
-NON_MEASURED_FALSE_POS = re.compile(
-    r"\b(weight\s+loss|diet|exercise|counsel|counseling|goal\s+bmi|target\s+bmi)\b",
-    re.IGNORECASE,
-)
-
-PREFERRED_SECTIONS = {
+PREFERRED_SECTIONS = set([
     "FULL",
-    "PREOPERATIVE DIAGNOSES",
-    "PREOPERATIVE DIAGNOSIS",
-    "POSTOPERATIVE DIAGNOSES",
-    "POSTOPERATIVE DIAGNOSIS",
+    "PROCEDURES",
+    "PROCEDURE",
+    "OPERATIVE FINDINGS",
+    "OPERATIVE NOTE",
+    "BRIEF OPERATIVE NOTE",
+    "HISTORY",
+    "HISTORY OF PRESENT ILLNESS",
+    "HPI",
+    "VITALS",
     "PHYSICAL EXAM",
-    "OBJECTIVE",
+])
+
+SUPPRESS_SECTIONS = set([
+    "PLAN",
     "ASSESSMENT",
-    "ASSESSMENT/PLAN",
-}
-
-SUPPRESS_SECTIONS = {
-    "FAMILY HISTORY",
-    "SOCIAL HISTORY",
-    "ALLERGIES",
-}
-
+    "INSTRUCTIONS",
+    "DISPOSITION",
+])
 
 def _normalize_text(text):
-    text = text or ""
-    text = text.replace("\r", " ")
     text = text.replace("\n", " ")
-    text = text.replace(u"\xa0", " ")
-    text = text.replace(u"\u25a1", " ")
-    text = text.replace(u"\ufeff", " ")
     text = re.sub(r"\s+", " ", text)
     return text.strip()
 
-
 def _section_order(note):
     order = []
-
     for s in note.sections.keys():
         if s in PREFERRED_SECTIONS and s not in SUPPRESS_SECTIONS:
             order.append(s)
-
     for s in note.sections.keys():
         if s not in order and s not in SUPPRESS_SECTIONS:
             order.append(s)
-
     return order
 
+def _is_operation_note(note_type):
+    nt = str(note_type or "").lower().strip()
+    return (
+        "op" in nt or
+        "operation" in nt or
+        "operative" in nt
+    )
 
 def _confidence_for_note_type(note_type):
     nt = str(note_type or "").lower().strip()
-
-    if "brief op note" in nt:
-        return 0.96
-    if "op note" in nt:
+    if nt in {
+        "op note",
+        "operation notes",
+        "brief op notes",
+        "operative note",
+        "operation note",
+        "brief operative note",
+        "brief op note"
+    }:
         return 0.95
-    if "operative" in nt or "operation" in nt:
-        return 0.94
-    if "clinic" in nt or "progress" in nt or "h&p" in nt:
-        return 0.88
-    return 0.84
+    if "op" in nt or "operative" in nt or "operation" in nt:
+        return 0.93
+    return 0.90
 
+def window_around(text, start, end, width):
+    left = max(0, start - width)
+    right = min(len(text), end + width)
+    return text[left:right].strip()
 
-def _valid_bmi_value(val):
-    try:
-        x = float(val)
-    except Exception:
-        return False
-    return 10.0 <= x <= 80.0
-
-
-def extract_bmi(note: SectionedNote) -> List[Candidate]:
+def extract_bmi(note):
     """
-    Returns at most one BMI candidate per note.
+    High-precision BMI extraction:
+    - only from operative / operation notes
+    - requires explicit numeric BMI mention
+    - rejects threshold/comparison language
+    - rounds to 1 decimal
+    Returns at most one candidate per note.
     """
+    if not _is_operation_note(note.note_type):
+        return []
+
     section_order = _section_order(note)
-
-    best_candidate = None
-    best_score = -1.0
 
     for section in section_order:
         raw_text = note.sections.get(section, "") or ""
@@ -162,66 +146,39 @@ def extract_bmi(note: SectionedNote) -> List[Candidate]:
             continue
 
         text = _normalize_text(raw_text)
-        if not text:
-            continue
 
         for rx in BMI_PATTERNS:
             for m in rx.finditer(text):
-                raw_val = m.group(1)
-
-                if not _valid_bmi_value(raw_val):
+                try:
+                    bmi_val = float(m.group(1))
+                except ValueError:
                     continue
 
-                bmi_val = float(raw_val)
-                ctx = window_around(text, m.start(), m.end(), 180)
-
-                if not ctx:
+                if bmi_val < 10 or bmi_val > 80:
                     continue
+
+                ctx = window_around(text, m.start(), m.end(), 140)
 
                 if THRESHOLD_FALSE_POS.search(ctx):
                     continue
 
-                if CONDITIONAL_FALSE_POS.search(ctx):
-                    ctx_l = ctx.lower()
-                    if ("morbid obesity" not in ctx_l) and ("obesity" not in ctx_l):
-                        continue
-
-                if NON_MEASURED_FALSE_POS.search(ctx):
+                if CONDITIONAL_FALSE_POS.search(ctx) and "bmi of" not in ctx.lower():
                     continue
 
-                score = _confidence_for_note_type(note.note_type)
-                ctx_l = ctx.lower()
+                bmi_val = round(bmi_val, 1)
 
-                if "morbid obesity" in ctx_l:
-                    score += 0.04
-                elif "obesity" in ctx_l:
-                    score += 0.02
+                return [
+                    Candidate(
+                        field="BMI",
+                        value=bmi_val,
+                        status="measured",
+                        evidence=ctx,
+                        section=section,
+                        note_type=note.note_type,
+                        note_id=note.note_id,
+                        note_date=note.note_date,
+                        confidence=_confidence_for_note_type(note.note_type),
+                    )
+                ]
 
-                if section in {
-                    "PREOPERATIVE DIAGNOSES",
-                    "PREOPERATIVE DIAGNOSIS",
-                    "POSTOPERATIVE DIAGNOSES",
-                    "POSTOPERATIVE DIAGNOSIS",
-                }:
-                    score += 0.03
-
-                cand = Candidate(
-                    field="BMI",
-                    value=bmi_val,
-                    status="measured",
-                    evidence=ctx,
-                    section=section,
-                    note_type=note.note_type,
-                    note_id=note.note_id,
-                    note_date=note.note_date,
-                    confidence=score,
-                )
-
-                if best_candidate is None or score > best_score:
-                    best_candidate = cand
-                    best_score = score
-
-    if best_candidate is None:
-        return []
-
-    return [best_candidate]
+    return []
