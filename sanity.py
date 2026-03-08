@@ -2,6 +2,7 @@ import os
 from glob import glob
 from datetime import datetime
 import pandas as pd
+import re
 
 BASE_DIR = "/home/apokol/Breast_Restore"
 MERGE_KEY = "MRN"
@@ -19,6 +20,11 @@ NOTE_GLOBS = [
     BASE_DIR + "/**/HPI11526*Operation Notes.csv",
     BASE_DIR + "/**/HPI11526*operation notes.csv",
 ]
+
+BMI_SNIPPET_RX = re.compile(
+    r".{0,80}\b(?:morbid\s+obesity|obesity|BMI|body\s+mass\s+index)\b.{0,120}",
+    re.IGNORECASE
+)
 
 
 def read_csv_robust(path):
@@ -109,6 +115,13 @@ def to_date_str(x):
     if dt is None:
         return ""
     return dt.strftime("%Y-%m-%d")
+
+
+def to_int_safe(x):
+    try:
+        return int(float(str(x).strip()))
+    except Exception:
+        return None
 
 
 def choose_best_bmi_recon_rows(struct_df):
@@ -275,19 +288,21 @@ def load_structured_encounters():
     return pd.concat(rows, ignore_index=True)
 
 
-def load_operation_notes():
+def load_and_reconstruct_op_notes():
     note_files = []
     for g in NOTE_GLOBS:
         note_files.extend(glob(g, recursive=True))
     note_files = sorted(set(note_files))
 
-    all_rows = []
+    all_notes_rows = []
 
     for fp in note_files:
         df = clean_cols(read_csv_robust(fp))
         df = normalize_mrn(df)
 
+        note_text_col = pick_col(df, ["NOTE_TEXT", "NOTE TEXT", "NOTE_TEXT_FULL", "TEXT", "NOTE"])
         note_id_col = pick_col(df, ["NOTE_ID", "NOTE ID"])
+        line_col = pick_col(df, ["LINE"], required=False)
         note_type_col = pick_col(df, ["NOTE_TYPE", "NOTE TYPE"], required=False)
         date_col = pick_col(
             df,
@@ -295,59 +310,129 @@ def load_operation_notes():
             required=False
         )
 
-        tmp = pd.DataFrame()
-        tmp[MERGE_KEY] = df[MERGE_KEY].astype(str).str.strip()
-        tmp["NOTE_ID"] = df[note_id_col].astype(str).str.strip()
-        tmp["NOTE_TYPE"] = df[note_type_col].astype(str).str.strip() if note_type_col else ""
-        tmp["NOTE_DATE_RAW"] = df[date_col].astype(str).str.strip() if date_col else ""
-        tmp["NOTE_DATE"] = tmp["NOTE_DATE_RAW"].apply(to_date_str)
-        all_rows.append(tmp)
+        df[note_text_col] = df[note_text_col].fillna("").astype(str)
+        df[note_id_col] = df[note_id_col].fillna("").astype(str)
 
-    if not all_rows:
-        return pd.DataFrame(columns=[MERGE_KEY, "NOTE_ID", "NOTE_TYPE", "NOTE_DATE_RAW", "NOTE_DATE"])
+        if line_col:
+            df[line_col] = df[line_col].fillna("").astype(str)
+        if note_type_col:
+            df[note_type_col] = df[note_type_col].fillna("").astype(str)
+        if date_col:
+            df[date_col] = df[date_col].fillna("").astype(str)
 
-    notes = pd.concat(all_rows, ignore_index=True)
-    notes = notes.drop_duplicates(subset=[MERGE_KEY, "NOTE_ID", "NOTE_TYPE", "NOTE_DATE"])
-    return notes
+        keep_cols = [MERGE_KEY, note_id_col, note_text_col]
+        if line_col:
+            keep_cols.append(line_col)
+        if note_type_col:
+            keep_cols.append(note_type_col)
+        if date_col:
+            keep_cols.append(date_col)
+
+        tmp = df[keep_cols].copy()
+        tmp = tmp.rename(columns={
+            note_id_col: "NOTE_ID",
+            note_text_col: "NOTE_TEXT",
+        })
+
+        if line_col and line_col != "LINE":
+            tmp = tmp.rename(columns={line_col: "LINE"})
+        if note_type_col and note_type_col != "NOTE_TYPE":
+            tmp = tmp.rename(columns={note_type_col: "NOTE_TYPE"})
+        if date_col and date_col != "NOTE_DATE_OF_SERVICE":
+            tmp = tmp.rename(columns={date_col: "NOTE_DATE_OF_SERVICE"})
+
+        if "LINE" not in tmp.columns:
+            tmp["LINE"] = ""
+        if "NOTE_TYPE" not in tmp.columns:
+            tmp["NOTE_TYPE"] = ""
+        if "NOTE_DATE_OF_SERVICE" not in tmp.columns:
+            tmp["NOTE_DATE_OF_SERVICE"] = ""
+
+        all_notes_rows.append(tmp)
+
+    notes_raw = pd.concat(all_notes_rows, ignore_index=True)
+
+    def join_note(group):
+        tmp = group.copy()
+        tmp["_LINE_NUM_"] = tmp["LINE"].apply(to_int_safe)
+        tmp = tmp.sort_values(by=["_LINE_NUM_"], na_position="last")
+        return "\n".join(tmp["NOTE_TEXT"].tolist()).strip()
+
+    reconstructed = []
+    grouped = notes_raw.groupby([MERGE_KEY, "NOTE_ID"], dropna=False)
+
+    for (mrn, nid), g in grouped:
+        mrn = str(mrn).strip()
+        nid = str(nid).strip()
+        if not nid:
+            continue
+
+        full_text = join_note(g)
+        if not full_text:
+            continue
+
+        note_type = g["NOTE_TYPE"].astype(str).iloc[0] if "NOTE_TYPE" in g.columns else ""
+        note_date = g["NOTE_DATE_OF_SERVICE"].astype(str).iloc[0] if "NOTE_DATE_OF_SERVICE" in g.columns else ""
+
+        reconstructed.append({
+            "MRN": mrn,
+            "NOTE_ID": nid,
+            "NOTE_TYPE": str(note_type).strip(),
+            "NOTE_DATE": to_date_str(note_date),
+            "NOTE_TEXT": full_text
+        })
+
+    return pd.DataFrame(reconstructed)
 
 
 struct_df = load_structured_encounters()
 bmi_anchor_map = choose_best_bmi_recon_rows(struct_df)
-notes_df = load_operation_notes()
+notes_df = load_and_reconstruct_op_notes()
 
 rows = []
 
 for mrn, info in bmi_anchor_map.items():
     recon_date = info.get("recon_date", "")
 
-    note_subset = notes_df[
-        (notes_df[MERGE_KEY] == mrn) &
-        (notes_df["NOTE_DATE"] == recon_date)
+    same_day = notes_df[
+        (notes_df["MRN"] == mrn) &
+        (notes_df["NOTE_DATE"] == recon_date) &
+        (notes_df["NOTE_TYPE"].astype(str).str.upper().isin(["OP NOTE", "BRIEF OP NOTE", "BRIEF OP NOTES"]))
     ].copy()
 
-    op_matches = note_subset[note_subset["NOTE_TYPE"].str.upper() == "OP NOTE"]
-    brief_matches = note_subset[note_subset["NOTE_TYPE"].str.upper() == "BRIEF OP NOTE"]
+    if len(same_day) == 0:
+        rows.append({
+            "MRN": mrn,
+            "RECON_DATE": recon_date,
+            "NOTE_ID": "",
+            "NOTE_TYPE": "",
+            "BMI_TEXT_FOUND": 0,
+            "BMI_SNIPPET": ""
+        })
+        continue
 
-    rows.append({
-        "MRN": mrn,
-        "RECON_DATE": recon_date,
-        "OP_NOTE_DATE_MATCH": 1 if len(op_matches) > 0 else 0,
-        "OP_NOTE_IDS": "; ".join(sorted(op_matches["NOTE_ID"].astype(str).unique().tolist())) if len(op_matches) > 0 else "",
-        "BRIEF_OP_NOTE_DATE_MATCH": 1 if len(brief_matches) > 0 else 0,
-        "BRIEF_OP_NOTE_IDS": "; ".join(sorted(brief_matches["NOTE_ID"].astype(str).unique().tolist())) if len(brief_matches) > 0 else "",
-    })
+    for _, row in same_day.iterrows():
+        text = str(row["NOTE_TEXT"])
+        m = BMI_SNIPPET_RX.search(text.replace("\n", " "))
+
+        rows.append({
+            "MRN": mrn,
+            "RECON_DATE": recon_date,
+            "NOTE_ID": row["NOTE_ID"],
+            "NOTE_TYPE": row["NOTE_TYPE"],
+            "BMI_TEXT_FOUND": 1 if m else 0,
+            "BMI_SNIPPET": m.group(0).strip() if m else ""
+        })
 
 out = pd.DataFrame(rows)
 
-print("\nEXACT DATE MATCH AUDIT\n")
+print("\nRECON-DATE OP NOTE BMI TEXT AUDIT\n")
 print(out.head(50).to_string(index=False))
 
 print("\nSUMMARY")
-print("Total MRNs with recon anchor:", len(out))
-print("MRNs with exact-date OP NOTE:", int(out["OP_NOTE_DATE_MATCH"].sum()))
-print("MRNs with exact-date BRIEF OP NOTE:", int(out["BRIEF_OP_NOTE_DATE_MATCH"].sum()))
-print("MRNs with either exact-date OP NOTE or BRIEF OP NOTE:",
-      int(((out["OP_NOTE_DATE_MATCH"] == 1) | (out["BRIEF_OP_NOTE_DATE_MATCH"] == 1)).sum()))
+print("Total rows audited:", len(out))
+print("Rows with BMI text found:", int(out["BMI_TEXT_FOUND"].sum()))
+print("Rows without BMI text found:", int((out["BMI_TEXT_FOUND"] == 0).sum()))
 
-out.to_csv("_outputs/recon_date_exact_opnote_audit.csv", index=False)
-print("\nSaved: _outputs/recon_date_exact_opnote_audit.csv")
+out.to_csv("_outputs/recon_date_opnote_bmi_text_audit.csv", index=False)
+print("\nSaved: _outputs/recon_date_opnote_bmi_text_audit.csv")
