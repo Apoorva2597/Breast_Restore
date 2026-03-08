@@ -1,33 +1,37 @@
 # ----------------------------------------------
 # UPDATE (Smoking extraction improvement)
 #
-# Expanded phrase detection for smoking status.
-# Captures common oncology clinic documentation:
+# Robust smoking status extraction for oncology
+# clinic notes. Handles narrative and structured
+# documentation including:
 #
 # Current:
-#   "current smoker"
-#   "smokes"
+#   current smoker
+#   smokes
+#   active smoker
 #
 # Former:
-#   "former smoker"
-#   "quit smoking"
-#   "quit smoking 7 years ago"
-#   "previous history of tobacco use"
-#   "smoking status: former"
+#   former smoker
+#   quit smoking
+#   quit tobacco
+#   smoking status: former
+#   previous history of tobacco use
 #
 # Never:
-#   "never smoked"
-#   "never smoker"
-#   "never tobacco user"
-#   "lifetime nonsmoker"
-#   "nonsmoker"
-#   "non-smoker"
-#   "denies tobacco"
+#   never smoker
+#   never smoked
+#   never tobacco user
+#   lifetime nonsmoker
+#   nonsmoker / non-smoker
+#   denies smoking
+#   denies tobacco
+#   denies tobacco use
+#   no history of tobacco use
 #
-# Output labels match gold dataset:
+# Output labels:
 #   Current / Former / Never
 #
-# Python 3.6.8 compatible.
+# Python 3.6.8 compatible
 # ----------------------------------------------
 
 import re
@@ -37,32 +41,42 @@ from models import Candidate
 CURRENT_PATTERNS = [
     r"current smoker",
     r"\bsmokes\b",
-    r"active smoker"
+    r"active smoker",
 ]
 
 FORMER_PATTERNS = [
     r"former smoker",
     r"quit smoking",
     r"quit tobacco",
-    r"smoking status:\s*former",
+    r"smoking status\s*:\s*former",
     r"previous history of tobacco",
 ]
 
 NEVER_PATTERNS = [
-    r"never smoked",
     r"never smoker",
+    r"never smoked",
     r"never tobacco",
     r"never tobacco user",
     r"lifetime nonsmoker",
-    r"nonsmoker",
-    r"non-smoker",
-    r"denies tobacco"
+    r"\bnonsmoker\b",
+    r"\bnon[- ]smoker\b",
+    r"denies smoking",
+    r"denies tobacco",
+    r"denies tobacco use",
+    r"no history of tobacco",
 ]
 
 
 CURRENT_REGEX = [re.compile(p, re.IGNORECASE) for p in CURRENT_PATTERNS]
 FORMER_REGEX = [re.compile(p, re.IGNORECASE) for p in FORMER_PATTERNS]
 NEVER_REGEX = [re.compile(p, re.IGNORECASE) for p in NEVER_PATTERNS]
+
+
+def normalize_text(text):
+    text = text.lower()
+    text = text.replace("\n", " ")
+    text = re.sub(r"\s+", " ", text)
+    return text
 
 
 def extract_smoking(note):
@@ -75,6 +89,8 @@ def extract_smoking(note):
 
         if not text:
             continue
+
+        text = normalize_text(text)
 
         label = None
         evidence = None
