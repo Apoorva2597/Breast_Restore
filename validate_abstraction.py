@@ -1,6 +1,5 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-
 """
 validate_abstraction.py
 
@@ -9,12 +8,7 @@ Compares only rows where gold is non-missing.
 Uses type-aware comparison for categorical, numeric, and binary fields.
 Includes race normalization so builder-standardized race values can be
 compared fairly against gold race labels.
-
-UPDATE:
-- BMI is now evaluated by rounding BOTH gold and predicted BMI values
-  to the nearest integer before comparison.
-- This is intended for narrative-vs-structured BMI comparison, where
-  operative note BMI is often rounded while structured vitals are more precise.
+Adds a second BMI metric using nearest-integer comparison.
 
 Compatible with Python 3.6.8.
 """
@@ -25,7 +19,6 @@ import pandas as pd
 
 MASTER_FILE = "_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv"
 GOLD_FILE = "gold_cleaned_for_cedar.csv"
-
 MRN = "MRN"
 
 CATEGORICAL_VARS = [
@@ -52,22 +45,18 @@ BINARY_VARS = [
 
 ALL_VARIABLES = CATEGORICAL_VARS + NUMERIC_VARS + BINARY_VARS
 
-
 # ---------------------------------------------------
 # Safe CSV reader
 # ---------------------------------------------------
-
 def safe_read_csv(path):
     try:
         return pd.read_csv(path, encoding="utf-8", dtype=str)
     except Exception:
         return pd.read_csv(path, encoding="latin1", dtype=str)
 
-
 # ---------------------------------------------------
 # Helpers
 # ---------------------------------------------------
-
 def clean_string_series(series):
     series = series.copy()
     series = series.astype(str)
@@ -84,14 +73,12 @@ def clean_string_series(series):
     })
     return series
 
-
 def normalize_categorical(series):
     series = clean_string_series(series)
     series = series.astype("object")
     mask = series.notna()
     series.loc[mask] = series.loc[mask].astype(str).str.strip().str.lower()
     return series
-
 
 def normalize_binary(series):
     series = clean_string_series(series)
@@ -108,16 +95,13 @@ def normalize_binary(series):
 
     return series.apply(conv)
 
-
 def normalize_numeric(series):
     series = clean_string_series(series)
     return pd.to_numeric(series, errors="coerce")
 
-
 # ---------------------------------------------------
 # Race normalization
 # ---------------------------------------------------
-
 def normalize_race_token(token):
     s = str(token).strip().lower()
 
@@ -161,7 +145,6 @@ def normalize_race_token(token):
 
     return str(token).strip()
 
-
 def collapse_race_value(x):
     if pd.isna(x):
         return pd.NA
@@ -203,16 +186,13 @@ def collapse_race_value(x):
 
     return "Multiracial"
 
-
 def normalize_race_series(series):
     series = clean_string_series(series)
     return series.apply(collapse_race_value)
 
-
 # ---------------------------------------------------
 # Metrics
 # ---------------------------------------------------
-
 def compute_categorical_metrics(pred, gold):
     pred = normalize_categorical(pred)
     gold = normalize_categorical(gold)
@@ -228,7 +208,6 @@ def compute_categorical_metrics(pred, gold):
     matches = (pred == gold).sum()
     accuracy = float(matches) / float(total)
     return accuracy, int(matches), int(total)
-
 
 def compute_race_metrics(pred, gold):
     pred = normalize_race_series(pred)
@@ -246,7 +225,6 @@ def compute_race_metrics(pred, gold):
     accuracy = float(matches) / float(total)
     return accuracy, int(matches), int(total)
 
-
 def compute_binary_metrics(pred, gold):
     pred = normalize_binary(pred)
     gold = normalize_binary(gold)
@@ -262,7 +240,6 @@ def compute_binary_metrics(pred, gold):
     matches = (pred == gold).sum()
     accuracy = float(matches) / float(total)
     return accuracy, int(matches), int(total)
-
 
 def compute_numeric_metrics(pred, gold, tolerance=None):
     pred = normalize_numeric(pred)
@@ -284,7 +261,6 @@ def compute_numeric_metrics(pred, gold, tolerance=None):
     accuracy = float(matches) / float(total)
     return accuracy, int(matches), int(total)
 
-
 def compute_age_floor_round_metrics(pred, gold):
     pred = normalize_numeric(pred)
     gold = normalize_numeric(gold)
@@ -299,11 +275,9 @@ def compute_age_floor_round_metrics(pred, gold):
 
     matches = ((gold == pred) | (gold == pred - 1) | (gold == pred + 1)).sum()
     accuracy = float(matches) / float(total)
-
     return accuracy, int(matches), int(total)
 
-
-def compute_bmi_integer_metrics(pred, gold):
+def compute_bmi_integer_round_metrics(pred, gold):
     pred = normalize_numeric(pred)
     gold = normalize_numeric(gold)
 
@@ -315,22 +289,15 @@ def compute_bmi_integer_metrics(pred, gold):
     if total == 0:
         return 0.0, 0, 0
 
-    pred_round = pred.round(0)
-    gold_round = gold.round(0)
-
-    matches = (pred_round == gold_round).sum()
+    matches = (pred.round(0) == gold.round(0)).sum()
     accuracy = float(matches) / float(total)
-
     return accuracy, int(matches), int(total)
-
 
 # ---------------------------------------------------
 # Main
 # ---------------------------------------------------
-
 def main():
     print("Loading files...")
-
     master = safe_read_csv(MASTER_FILE)
     gold = safe_read_csv(GOLD_FILE)
 
@@ -358,7 +325,6 @@ def main():
     merged = pd.merge(master, gold, on=MRN, how="inner", suffixes=("_pred", "_gold"))
 
     print("Merged rows:", len(merged))
-
     if len(merged) == 0:
         print("ERROR: No rows matched on MRN.")
         sys.exit(1)
@@ -378,28 +344,61 @@ def main():
 
         if v == "Race":
             acc, matches, total = compute_race_metrics(pred, goldv)
+            results.append({
+                "variable": v,
+                "accuracy": acc,
+                "matches": matches,
+                "total_compared": total
+            })
+            continue
 
-        elif v in CATEGORICAL_VARS:
+        if v in CATEGORICAL_VARS:
             acc, matches, total = compute_categorical_metrics(pred, goldv)
+            results.append({
+                "variable": v,
+                "accuracy": acc,
+                "matches": matches,
+                "total_compared": total
+            })
+            continue
 
-        elif v in BINARY_VARS:
+        if v in BINARY_VARS:
             acc, matches, total = compute_binary_metrics(pred, goldv)
+            results.append({
+                "variable": v,
+                "accuracy": acc,
+                "matches": matches,
+                "total_compared": total
+            })
+            continue
 
-        elif v == "Age":
+        if v == "Age":
             acc, matches, total = compute_age_floor_round_metrics(pred, goldv)
+            results.append({
+                "variable": v,
+                "accuracy": acc,
+                "matches": matches,
+                "total_compared": total
+            })
+            continue
 
-        elif v == "BMI":
-            acc, matches, total = compute_bmi_integer_metrics(pred, goldv)
+        if v == "BMI":
+            acc, matches, total = compute_numeric_metrics(pred, goldv, tolerance=0.2)
+            results.append({
+                "variable": "BMI",
+                "accuracy": acc,
+                "matches": matches,
+                "total_compared": total
+            })
 
-        else:
-            acc, matches, total = 0.0, 0, 0
-
-        results.append({
-            "variable": v,
-            "accuracy": acc,
-            "matches": matches,
-            "total_compared": total
-        })
+            bmi_round_acc, bmi_round_matches, bmi_round_total = compute_bmi_integer_round_metrics(pred, goldv)
+            results.append({
+                "variable": "BMI_round_integer",
+                "accuracy": bmi_round_acc,
+                "matches": bmi_round_matches,
+                "total_compared": bmi_round_total
+            })
+            continue
 
     df = pd.DataFrame(results)
 
@@ -414,7 +413,6 @@ def main():
 
     print("\nValidation complete.")
     print("Results saved to", out_path)
-
 
 if __name__ == "__main__":
     main()
