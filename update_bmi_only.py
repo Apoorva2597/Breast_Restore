@@ -3,24 +3,23 @@
 #
 # BMI-only updater for the existing master file.
 #
-# Purpose:
-# - Load the already-built master file
-# - Recompute ONLY BMI using reconstruction-anchored logic
-# - Use staged fallback:
-#     1) search notes in +/-14 day window
-#        a) same-day peri-op explicit BMI
-#        b) nearest peri-op explicit BMI
-#        c) nearest peri-op computed BMI
-#     2) if NO BMI candidate found at all in +/-14 day window,
-#        search again in +/-21 day window using the same hierarchy
-# - NEW:
-#     if no standard structured recon anchor exists, build a BACKUP anchor
-#     from structured encounter rows using CPT/procedure/date logic
-# - Update only BMI and Obesity columns
-# - Write a BMI-only evidence file for QA
+# Final staged BMI logic:
+#   Stage 1: anchor day only
+#   Stage 2: +/- 7 days (only if nothing found in Stage 1)
+#   Stage 3: +/- 14 days (only if nothing found in Stage 2)
 #
-# Inputs:
-#   /home/apokol/Breast_Restore/_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv
+# Within each stage, candidate priority is:
+#   1) same-day peri-op explicit BMI
+#   2) nearest peri-op explicit BMI
+#   3) nearest peri-op computed BMI from height/weight
+#
+# Anchor logic:
+#   - Primary anchor from structured RECONSTRUCTION_DATE + ADMIT_DATE
+#   - Backup anchor from CPT/procedure/date logic if primary anchor missing
+#
+# Updates only:
+#   - BMI
+#   - Obesity
 #
 # Outputs:
 #   /home/apokol/Breast_Restore/_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv
@@ -58,10 +57,11 @@ NOTE_GLOBS = [
     "{0}/**/HPI11526*operation notes.csv".format(BASE_DIR),
 ]
 
-WINDOW_STAGE1_BEFORE = 14
-WINDOW_STAGE1_AFTER = 14
-WINDOW_STAGE2_BEFORE = 21
-WINDOW_STAGE2_AFTER = 21
+STAGE_WINDOWS = [
+    ("day0", 0, 0),
+    ("pm7", 7, 7),
+    ("pm14", 14, 14),
+]
 
 from models import SectionedNote  # noqa: E402
 from extractors.bmi import extract_bmi  # noqa: E402
@@ -313,10 +313,6 @@ def _is_recon_like_row(row, has_preferred_cpt):
     return False
 
 def choose_best_bmi_anchor_rows(struct_df):
-    """
-    Primary anchor:
-    requires RECONSTRUCTION_DATE_STRUCT + ADMIT_DATE_STRUCT
-    """
     bmi_best = {}
     if len(struct_df) == 0:
         return bmi_best
@@ -382,19 +378,6 @@ def choose_best_bmi_anchor_rows(struct_df):
     return bmi_best
 
 def choose_backup_bmi_anchor_rows(struct_df, existing_anchor_map):
-    """
-    Backup anchor:
-    for MRNs with no primary anchor, use best available structured date from a
-    recon-like encounter row, prioritizing:
-      1) operation encounter date
-      2) clinic encounter date
-      3) inpatient encounter date
-
-    Date preference within row:
-      RECONSTRUCTION_DATE_STRUCT
-      ADMIT_DATE_STRUCT
-      STRUCT_DATE_RAW
-    """
     backup = {}
     if len(struct_df) == 0:
         return backup
@@ -656,13 +639,15 @@ def note_in_window(note_dt, recon_dt, before_days, after_days):
         return False
     return (dd >= (-1 * before_days) and dd <= after_days)
 
-def collect_bmi_candidates_for_window(notes_df, bmi_anchor_map, before_days, after_days, evidence_rows):
+def collect_bmi_candidates_for_window(notes_df, bmi_anchor_map, stage_name, before_days, after_days, eligible_mrns, evidence_rows):
     best_bmi_by_mrn = {}
     notes_with_any_candidate = set()
 
     for _, row in notes_df.iterrows():
         mrn = clean_cell(row.get(MERGE_KEY, ""))
         if not mrn:
+            continue
+        if mrn not in eligible_mrns:
             continue
 
         bmi_anchor = bmi_anchor_map.get(mrn)
@@ -698,6 +683,7 @@ def collect_bmi_candidates_for_window(notes_df, bmi_anchor_map, before_days, aft
                 "STATUS": "",
                 "CONFIDENCE": "",
                 "SECTION": "",
+                "STAGE_USED": stage_name,
                 "WINDOW_USED": "{0}_{1}".format(before_days, after_days),
                 "ANCHOR_TYPE": bmi_anchor.get("anchor_type", ""),
                 "ANCHOR_DATE": bmi_anchor.get("anchor_date", ""),
@@ -735,6 +721,7 @@ def collect_bmi_candidates_for_window(notes_df, bmi_anchor_map, before_days, aft
                 "STATUS": getattr(c, "status", ""),
                 "CONFIDENCE": getattr(c, "confidence", ""),
                 "SECTION": getattr(c, "section", ""),
+                "STAGE_USED": stage_name,
                 "WINDOW_USED": "{0}_{1}".format(before_days, after_days),
                 "ANCHOR_TYPE": bmi_anchor.get("anchor_type", ""),
                 "ANCHOR_DATE": bmi_anchor.get("anchor_date", ""),
@@ -777,41 +764,57 @@ def main():
     print("Reconstructed notes: {0}".format(len(notes_df)))
 
     evidence_rows = []
+    final_best_bmi = {}
 
-    print("Stage 1: searching BMI in +/-14 day window...")
+    # Stage 1: anchor day only
+    stage1_mrns = set(bmi_anchor_map.keys())
+    print("Stage 1: searching BMI on anchor day only...")
     best_stage1, found_stage1, evidence_rows = collect_bmi_candidates_for_window(
         notes_df=notes_df,
         bmi_anchor_map=bmi_anchor_map,
-        before_days=WINDOW_STAGE1_BEFORE,
-        after_days=WINDOW_STAGE1_AFTER,
+        stage_name="day0",
+        before_days=0,
+        after_days=0,
+        eligible_mrns=stage1_mrns,
         evidence_rows=evidence_rows
     )
-    print("MRNs with any BMI candidate in +/-14 days: {0}".format(len(found_stage1)))
-
-    fallback_mrns = set()
-    for mrn in bmi_anchor_map.keys():
-        if mrn not in found_stage1:
-            fallback_mrns.add(mrn)
-
-    print("Stage 2 fallback: searching BMI in +/-21 day window ONLY for MRNs with no candidate in +/-14 days...")
-    print("Fallback MRNs: {0}".format(len(fallback_mrns)))
-
-    notes_stage2 = notes_df[notes_df[MERGE_KEY].astype(str).str.strip().isin(fallback_mrns)].copy()
-
-    best_stage2, found_stage2, evidence_rows = collect_bmi_candidates_for_window(
-        notes_df=notes_stage2,
-        bmi_anchor_map=bmi_anchor_map,
-        before_days=WINDOW_STAGE2_BEFORE,
-        after_days=WINDOW_STAGE2_AFTER,
-        evidence_rows=evidence_rows
-    )
-    print("MRNs with any BMI candidate in +/-21 fallback: {0}".format(len(found_stage2)))
-
-    final_best_bmi = {}
+    print("MRNs with any BMI candidate on anchor day: {0}".format(len(found_stage1)))
     for mrn, cand in best_stage1.items():
         final_best_bmi[mrn] = cand
 
+    # Stage 2: +/-7 only if stage1 missing
+    stage2_mrns = set([m for m in bmi_anchor_map.keys() if m not in final_best_bmi])
+    print("Stage 2: searching BMI in +/-7 days ONLY for MRNs with no day-0 candidate...")
+    print("Eligible MRNs: {0}".format(len(stage2_mrns)))
+    best_stage2, found_stage2, evidence_rows = collect_bmi_candidates_for_window(
+        notes_df=notes_df,
+        bmi_anchor_map=bmi_anchor_map,
+        stage_name="pm7",
+        before_days=7,
+        after_days=7,
+        eligible_mrns=stage2_mrns,
+        evidence_rows=evidence_rows
+    )
+    print("MRNs with any BMI candidate in +/-7 days: {0}".format(len(found_stage2)))
     for mrn, cand in best_stage2.items():
+        if mrn not in final_best_bmi:
+            final_best_bmi[mrn] = cand
+
+    # Stage 3: +/-14 only if still missing
+    stage3_mrns = set([m for m in bmi_anchor_map.keys() if m not in final_best_bmi])
+    print("Stage 3: searching BMI in +/-14 days ONLY for MRNs with no candidate in earlier stages...")
+    print("Eligible MRNs: {0}".format(len(stage3_mrns)))
+    best_stage3, found_stage3, evidence_rows = collect_bmi_candidates_for_window(
+        notes_df=notes_df,
+        bmi_anchor_map=bmi_anchor_map,
+        stage_name="pm14",
+        before_days=14,
+        after_days=14,
+        eligible_mrns=stage3_mrns,
+        evidence_rows=evidence_rows
+    )
+    print("MRNs with any BMI candidate in +/-14 days: {0}".format(len(found_stage3)))
+    for mrn, cand in best_stage3.items():
         if mrn not in final_best_bmi:
             final_best_bmi[mrn] = cand
 
