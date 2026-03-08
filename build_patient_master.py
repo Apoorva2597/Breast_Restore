@@ -13,15 +13,18 @@
 #   2) /home/apokol/Breast_Restore/_outputs/rule_hit_evidence_FINAL_NO_GOLD.csv
 #
 # UPDATE:
-# - BMI anchoring revised.
-# - BMI is now searched across ALL OP NOTE / BRIEF OP NOTE notes nearest the
-#   structured reconstruction date, instead of locking to one single note.
-# - BMI note window priority:
-#     (1) same-day OP NOTE / BRIEF OP NOTE
-#     (2) all OP NOTE / BRIEF OP NOTE within +/- 1 day
-#     (3) all OP NOTE / BRIEF OP NOTE within +/- 3 days
-# - This preserves surgery anchoring while preventing blank BMI when the
-#   nearest single operative note lacks the BMI text.
+# - BMI anchoring widened to peri-reconstruction notes.
+# - BMI is now searched across ALL notes in the best available date window
+#   around the structured reconstruction date:
+#     (1) same day
+#     (2) +/- 1 day
+#     (3) +/- 3 days
+# - Within that window, note types are prioritized as:
+#     OP NOTE / BRIEF OP NOTE / operative / operation
+#     then anesthesia / pre-op
+#     then progress / clinic / H&P / physical exam style notes
+# - This keeps BMI reconstruction-timed while no longer assuming the BMI
+#   must be written inside the OP NOTE text itself.
 #
 # Python 3.6.8 compatible
 
@@ -71,7 +74,6 @@ from extractors.comorbidities import extract_comorbidities  # noqa: E402
 from extractors.pbs import extract_pbs  # noqa: E402
 from extractors.mastectomy import extract_mastectomy  # noqa: E402
 from extractors.cancer_treatment import extract_cancer_treatment  # noqa: E402
-
 
 # -----------------------
 # Robust CSV read
@@ -213,6 +215,21 @@ def abs_day_diff(d1, d2):
 def is_operation_note_type(note_type):
     nt = clean_cell(note_type).upper()
     return nt in {"OP NOTE", "BRIEF OP NOTE"} or ("OPERATIVE" in nt) or ("OP NOTE" in nt) or ("BRIEF OP NOTE" in nt)
+
+
+def bmi_note_type_priority(note_type):
+    nt = clean_cell(note_type).lower()
+
+    if ("op note" in nt) or ("brief op note" in nt) or ("operative" in nt) or ("operation" in nt):
+        return 1
+
+    if ("anesthesia" in nt) or ("pre-op" in nt) or ("pre op" in nt) or ("preprocedure" in nt) or ("pre-procedure" in nt):
+        return 2
+
+    if ("progress" in nt) or ("clinic" in nt) or ("h&p" in nt) or ("history and physical" in nt) or ("physical exam" in nt):
+        return 3
+
+    return 9
 
 
 # -----------------------
@@ -950,8 +967,10 @@ def enrich_master_with_structured_demo(master, notes_df, evidence_rows):
 def choose_bmi_candidate_note_ids_by_mrn(notes_df, bmi_anchor_map):
     """
     For each MRN with structured reconstruction date anchor, return ALL candidate
-    OP NOTE / BRIEF OP NOTE NOTE_IDs in the best available date window:
+    note NOTE_IDs in the best available date window:
       same day > +/-1 day > +/-3 days
+
+    Within that best window, keep notes with the best note-type priority.
     """
     out = {}
 
@@ -960,7 +979,10 @@ def choose_bmi_candidate_note_ids_by_mrn(notes_df, bmi_anchor_map):
 
     tmp = notes_df.copy()
     tmp["NOTE_DATE_PARSED"] = tmp["NOTE_DATE"].apply(parse_date_safe)
-    tmp = tmp[tmp["NOTE_TYPE"].apply(is_operation_note_type)].copy()
+    tmp["BMI_NOTE_TYPE_PRIORITY"] = tmp["NOTE_TYPE"].apply(bmi_note_type_priority)
+
+    # keep note types we are willing to consider for BMI
+    tmp = tmp[tmp["BMI_NOTE_TYPE_PRIORITY"] < 9].copy()
 
     if len(tmp) == 0:
         return out
@@ -986,7 +1008,8 @@ def choose_bmi_candidate_note_ids_by_mrn(notes_df, bmi_anchor_map):
                     "NOTE_ID": str(row["NOTE_ID"]).strip(),
                     "NOTE_DATE": row["NOTE_DATE"],
                     "NOTE_TYPE": row["NOTE_TYPE"],
-                    "DAY_DIFF": dd
+                    "DAY_DIFF": dd,
+                    "NOTE_TYPE_PRIORITY": row["BMI_NOTE_TYPE_PRIORITY"]
                 })
 
         if not rows:
@@ -1010,6 +1033,9 @@ def choose_bmi_candidate_note_ids_by_mrn(notes_df, bmi_anchor_map):
             match_tier = "within_3_days"
 
         if chosen_rows:
+            best_pri = min([r["NOTE_TYPE_PRIORITY"] for r in chosen_rows])
+            chosen_rows = [r for r in chosen_rows if r["NOTE_TYPE_PRIORITY"] == best_pri]
+
             out[mrn] = {
                 "note_ids": set([r["NOTE_ID"] for r in chosen_rows]),
                 "match_tier": match_tier,
@@ -1042,7 +1068,7 @@ def main():
     print("Structured reconstruction-date BMI anchor rows found for MRNs: {0}".format(len(bmi_anchor_map)))
 
     bmi_candidate_note_map = choose_bmi_candidate_note_ids_by_mrn(notes_df, bmi_anchor_map)
-    print("BMI candidate OP NOTE / BRIEF OP NOTE windows found for MRNs: {0}".format(len(bmi_candidate_note_map)))
+    print("BMI candidate peri-reconstruction notes found for MRNs: {0}".format(len(bmi_candidate_note_map)))
 
     print("Running rule-based extractors...")
     extractor_fns = [
