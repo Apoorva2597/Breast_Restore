@@ -9,67 +9,86 @@ OUTPUT_FILE = "/home/apokol/Breast_Restore/_outputs/validation_summary.csv"
 
 MRN_COL = "MRN"
 
-
+# -----------------------------------
+# Helpers
+# -----------------------------------
 def clean_cols(df):
     df.columns = [str(c).strip().replace("\ufeff", "") for c in df.columns]
     return df
 
-
 def normalize_mrn(df):
-    for k in ["MRN","mrn","Patient_MRN","PAT_MRN","PATIENT_MRN"]:
+    for k in ["MRN", "mrn", "Patient_MRN", "PAT_MRN", "PATIENT_MRN"]:
         if k in df.columns:
             if k != MRN_COL:
-                df = df.rename(columns={k:MRN_COL})
+                df = df.rename(columns={k: MRN_COL})
             break
-
+    if MRN_COL not in df.columns:
+        raise RuntimeError("MRN column not found.")
     df[MRN_COL] = df[MRN_COL].astype(str).str.strip()
     return df
-
 
 def is_missing_val(x):
     if pd.isna(x):
         return True
-
     s = str(x).strip().lower()
-
-    return s in ["","nan","none","null","na"]
-
+    return s in ["", "nan", "none", "null", "na"]
 
 def to_float(x):
     try:
         if is_missing_val(x):
             return np.nan
         return float(x)
-    except:
+    except Exception:
         return np.nan
 
+def to_binary01(x):
+    if pd.isna(x):
+        return np.nan
+    s = str(x).strip().lower()
+    if s in ["1", "1.0", "true", "yes", "y"]:
+        return 1
+    if s in ["0", "0.0", "false", "no", "n"]:
+        return 0
+    try:
+        f = float(s)
+        if f == 1.0:
+            return 1
+        if f == 0.0:
+            return 0
+    except Exception:
+        pass
+    return np.nan
 
-def generic_string_compare(gold_series,pred_series):
+def obesity_from_bmi(x):
+    if pd.isna(x):
+        return np.nan
+    return 1 if float(x) >= 30.0 else 0
 
+def compare_generic(gold_series, pred_series):
     gold_missing = gold_series.apply(is_missing_val)
     pred_missing = pred_series.apply(is_missing_val)
 
     comparable = (~gold_missing) & (~pred_missing)
+    total_compared = int(comparable.sum())
 
-    total = int(comparable.sum())
-
-    if total == 0:
-        return 0.0,0,0
+    if total_compared == 0:
+        return 0.0, 0, 0
 
     gold_clean = gold_series[comparable].astype(str).str.strip().str.lower()
     pred_clean = pred_series[comparable].astype(str).str.strip().str.lower()
 
     matches = int((gold_clean == pred_clean).sum())
+    acc = float(matches) / float(total_compared)
 
-    acc = matches / total
+    return acc, matches, total_compared
 
-    return round(acc,6),matches,total
-
-
+# -----------------------------------
+# Load data
+# -----------------------------------
 print("Loading files...")
 
-master = pd.read_csv(MASTER_FILE,dtype=str)
-gold = pd.read_csv(GOLD_FILE,dtype=str)
+master = pd.read_csv(MASTER_FILE, dtype=str)
+gold = pd.read_csv(GOLD_FILE, dtype=str)
 
 master = clean_cols(master)
 gold = clean_cols(gold)
@@ -77,133 +96,147 @@ gold = clean_cols(gold)
 master = normalize_mrn(master)
 gold = normalize_mrn(gold)
 
-print("Master rows:",len(master))
-print("Gold rows:",len(gold))
+print("Master rows: {0}".format(len(master)))
+print("Gold rows: {0}".format(len(gold)))
 
 print("Merging directly on MRN...")
-
-df = gold.merge(master,on=MRN_COL,how="left",suffixes=("_gold","_pred"))
-
-print("Merged rows:",len(df))
+df = gold.merge(master, on=MRN_COL, how="left", suffixes=("_gold", "_pred"))
+print("Merged rows: {0}".format(len(df)))
 
 results = []
 
-variables = [
-"Race",
-"Ethnicity",
-"SmokingStatus",
-"Age",
-"Diabetes",
-"Hypertension",
-"CardiacDisease",
-"VenousThromboembolism",
-"Steroid",
-"PBS_Lumpectomy",
-"Radiation",
-"Chemo"
+# -----------------------------------
+# Standard direct-string variables
+# -----------------------------------
+direct_vars = [
+    "Race",
+    "Ethnicity",
+    "SmokingStatus",
+    "Age",
+    "Diabetes",
+    "Hypertension",
+    "CardiacDisease",
+    "VenousThromboembolism",
+    "Steroid",
+    "PBS_Lumpectomy",
+    "Radiation",
+    "Chemo",
 ]
 
-for var in variables:
+for var in direct_vars:
+    gold_col = var + "_gold"
+    pred_col = var + "_pred"
 
-    g = var+"_gold"
-    p = var+"_pred"
-
-    if g not in df.columns or p not in df.columns:
+    if gold_col not in df.columns or pred_col not in df.columns:
         continue
 
-    acc,match,total = generic_string_compare(df[g],df[p])
+    acc, matches, total_compared = compare_generic(df[gold_col], df[pred_col])
 
     results.append({
-        "variable":var,
-        "accuracy":acc,
-        "matches":match,
-        "total_compared":total
+        "variable": var,
+        "accuracy": round(acc, 6),
+        "matches": matches,
+        "total_compared": total_compared
     })
 
-
-# -----------------------
-# BMI ORIGINAL METRIC
-# -----------------------
-
+# -----------------------------------
+# BMI metrics
+# -----------------------------------
 if "BMI_gold" in df.columns and "BMI_pred" in df.columns:
 
     df["BMI_gold_num"] = df["BMI_gold"].apply(to_float)
     df["BMI_pred_num"] = df["BMI_pred"].apply(to_float)
 
-    comp = (~df["BMI_gold_num"].isna()) & (~df["BMI_pred_num"].isna())
+    bmi_comp = (~df["BMI_gold_num"].isna()) & (~df["BMI_pred_num"].isna())
+    bmi_total = int(bmi_comp.sum())
 
-    total = int(comp.sum())
+    if bmi_total > 0:
+        diff_abs = (df.loc[bmi_comp, "BMI_pred_num"] - df.loc[bmi_comp, "BMI_gold_num"]).abs()
 
-    if total > 0:
+        # exact
+        bmi_exact_matches = int((diff_abs == 0).sum())
+        bmi_exact_acc = float(bmi_exact_matches) / float(bmi_total)
 
-        diff = (df.loc[comp,"BMI_gold_num"] - df.loc[comp,"BMI_pred_num"]).abs()
+        # close tolerance ±0.5
+        bmi_close_matches = int((diff_abs <= 0.5).sum())
+        bmi_close_acc = float(bmi_close_matches) / float(bmi_total)
 
-        exact = int((diff == 0).sum())
-
-        acc = exact / total
-
-        results.append({
-        "variable":"BMI",
-        "accuracy":round(acc,6),
-        "matches":exact,
-        "total_compared":total
-        })
-
-
-# -----------------------
-# BMI CLOSE ±0.5
-# -----------------------
-
-        close = int((diff <= 0.5).sum())
+        # rounded integer match
+        gold_round = df.loc[bmi_comp, "BMI_gold_num"].round(0)
+        pred_round = df.loc[bmi_comp, "BMI_pred_num"].round(0)
+        bmi_round_matches = int((gold_round == pred_round).sum())
+        bmi_round_acc = float(bmi_round_matches) / float(bmi_total)
 
         results.append({
-        "variable":"BMI_close_0_5",
-        "accuracy":round(close/total,6),
-        "matches":close,
-        "total_compared":total
+            "variable": "BMI",
+            "accuracy": round(bmi_exact_acc, 6),
+            "matches": bmi_exact_matches,
+            "total_compared": bmi_total
         })
-
-
-# -----------------------
-# BMI INTEGER ROUND
-# -----------------------
-
-        g_round = df.loc[comp,"BMI_gold_num"].round(0)
-        p_round = df.loc[comp,"BMI_pred_num"].round(0)
-
-        round_matches = int((g_round == p_round).sum())
 
         results.append({
-        "variable":"BMI_round_integer",
-        "accuracy":round(round_matches/total,6),
-        "matches":round_matches,
-        "total_compared":total
+            "variable": "BMI_close_0_5",
+            "accuracy": round(bmi_close_acc, 6),
+            "matches": bmi_close_matches,
+            "total_compared": bmi_total
         })
-
-
-# -----------------------
-# OBESITY FROM BMI
-# -----------------------
-
-        gold_ob = (df.loc[comp,"BMI_gold_num"] >= 30).astype(int)
-        pred_ob = (df.loc[comp,"BMI_pred_num"] >= 30).astype(int)
-
-        ob_match = int((gold_ob == pred_ob).sum())
 
         results.append({
-        "variable":"Obesity_from_BMI",
-        "accuracy":round(ob_match/total,6),
-        "matches":ob_match,
-        "total_compared":total
+            "variable": "BMI_round_integer",
+            "accuracy": round(bmi_round_acc, 6),
+            "matches": bmi_round_matches,
+            "total_compared": bmi_total
         })
 
+        # obesity from BMI
+        df.loc[bmi_comp, "Obesity_gold_from_BMI"] = df.loc[bmi_comp, "BMI_gold_num"].apply(obesity_from_bmi)
+        df.loc[bmi_comp, "Obesity_pred_from_BMI"] = df.loc[bmi_comp, "BMI_pred_num"].apply(obesity_from_bmi)
 
-summary = pd.DataFrame(results)
+        obesity_matches = int(
+            (
+                df.loc[bmi_comp, "Obesity_gold_from_BMI"] ==
+                df.loc[bmi_comp, "Obesity_pred_from_BMI"]
+            ).sum()
+        )
+        obesity_acc = float(obesity_matches) / float(bmi_total)
+
+        results.append({
+            "variable": "Obesity_from_BMI",
+            "accuracy": round(obesity_acc, 6),
+            "matches": obesity_matches,
+            "total_compared": bmi_total
+        })
+
+# -----------------------------------
+# Optional: compare existing Obesity column if gold has one
+# -----------------------------------
+if "Obesity_gold" in df.columns and "Obesity_pred" in df.columns:
+    gold_ob = df["Obesity_gold"].apply(to_binary01)
+    pred_ob = df["Obesity_pred"].apply(to_binary01)
+
+    ob_comp = (~gold_ob.isna()) & (~pred_ob.isna())
+    ob_total = int(ob_comp.sum())
+
+    if ob_total > 0:
+        ob_matches = int((gold_ob[ob_comp] == pred_ob[ob_comp]).sum())
+        ob_acc = float(ob_matches) / float(ob_total)
+
+        results.append({
+            "variable": "Obesity_column_direct",
+            "accuracy": round(ob_acc, 6),
+            "matches": ob_matches,
+            "total_compared": ob_total
+        })
+
+# -----------------------------------
+# Output
+# -----------------------------------
+summary_df = pd.DataFrame(results)
 
 print("\nValidation Results\n")
-print(summary)
+print(summary_df)
 
-summary.to_csv(OUTPUT_FILE,index=False)
+summary_df.to_csv(OUTPUT_FILE, index=False)
 
 print("\nValidation complete.")
-print("Results saved to",OUTPUT_FILE)
+print("Results saved to {0}".format(OUTPUT_FILE))
