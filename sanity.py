@@ -3,38 +3,13 @@
 import pandas as pd
 import numpy as np
 
-MASTER_FILE = "/home/apokol/Breast_Restore/_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv"
-GOLD_FILE = "/home/apokol/Breast_Restore/gold_cleaned_for_cedar.csv"
-OUTPUT_FILE = "/home/apokol/Breast_Restore/_outputs/bmi_gold_vs_pred.csv"
+BASE = "/home/apokol/Breast_Restore/_outputs"
+
+VALIDATION_FILE = BASE + "/bmi_gold_vs_pred.csv"
+EVIDENCE_FILE = BASE + "/bmi_only_evidence.csv"
 
 MRN_COL = "MRN"
-GOLD_COL = "BMI"
-PRED_COL = "BMI"
 
-print("Loading files...")
-
-master = pd.read_csv(MASTER_FILE, dtype=str)
-gold = pd.read_csv(GOLD_FILE, dtype=str)
-
-master.columns = master.columns.str.strip()
-gold.columns = gold.columns.str.strip()
-
-master[MRN_COL] = master[MRN_COL].astype(str).str.strip()
-gold[MRN_COL] = gold[MRN_COL].astype(str).str.strip()
-
-print("Merging gold and predictions...")
-
-df = gold[[MRN_COL, GOLD_COL]].merge(
-    master[[MRN_COL, PRED_COL]],
-    on=MRN_COL,
-    how="left",
-    suffixes=("_gold", "_pred")
-)
-
-df.rename(columns={
-    GOLD_COL + "_gold": "BMI_gold",
-    PRED_COL + "_pred": "BMI_pred"
-}, inplace=True)
 
 def to_float(x):
     try:
@@ -42,44 +17,92 @@ def to_float(x):
     except:
         return np.nan
 
+
+def obesity(bmi):
+    if pd.isna(bmi):
+        return np.nan
+    return 1 if bmi >= 30 else 0
+
+
+print("Loading files...")
+
+df = pd.read_csv(VALIDATION_FILE)
+evid = pd.read_csv(EVIDENCE_FILE)
+
 df["BMI_gold"] = df["BMI_gold"].apply(to_float)
 df["BMI_pred"] = df["BMI_pred"].apply(to_float)
 
-df["gold_missing"] = df["BMI_gold"].isna()
-df["pred_missing"] = df["BMI_pred"].isna()
+df["gold_obesity"] = df["BMI_gold"].apply(obesity)
+df["pred_obesity"] = df["BMI_pred"].apply(obesity)
 
-df["difference"] = abs(df["BMI_gold"] - df["BMI_pred"])
+# remove rows where prediction missing
+df = df[~df["BMI_pred"].isna()]
 
-df["exact_match"] = df["BMI_gold"] == df["BMI_pred"]
+# obesity mismatches
+mis = df[df["gold_obesity"] != df["pred_obesity"]].copy()
 
-df["integer_match"] = (
-    df["BMI_gold"].round(0) == df["BMI_pred"].round(0)
-)
+print("")
+print("Total obesity mismatches:", len(mis))
+print("")
 
-print("\nSUMMARY\n")
+rows = []
 
-total = len(df)
-gold_missing = df["gold_missing"].sum()
-pred_missing = df["pred_missing"].sum()
-both_missing = ((df["gold_missing"]) & (df["pred_missing"])).sum()
-exact_match = df["exact_match"].sum()
-integer_match = df["integer_match"].sum()
+for _, r in mis.iterrows():
 
-print("Total rows:", total)
-print("Gold missing:", gold_missing)
-print("Pred missing:", pred_missing)
-print("Both missing:", both_missing)
-print("Exact matches:", exact_match)
-print("Integer matches:", integer_match)
+    mrn = str(r[MRN_COL]).strip()
+    pred = r["BMI_pred"]
 
-valid_diff = df["difference"].dropna()
+    ev = evid[
+        (evid["MRN"].astype(str) == mrn) &
+        (evid["VALUE"].astype(float) == pred)
+    ]
 
-if len(valid_diff) > 0:
-    print("Mean absolute difference:", round(valid_diff.mean(), 2))
-    print("Median difference:", round(valid_diff.median(), 2))
-    print("Max difference:", round(valid_diff.max(), 2))
+    if len(ev) == 0:
+        rows.append({
+            "MRN": mrn,
+            "BMI_gold": r["BMI_gold"],
+            "BMI_pred": r["BMI_pred"],
+            "gold_obesity": r["gold_obesity"],
+            "pred_obesity": r["pred_obesity"],
+            "note_type": "",
+            "note_date": "",
+            "anchor_date": "",
+            "stage": "",
+            "snippet": ""
+        })
+        continue
 
-df.to_csv(OUTPUT_FILE, index=False)
+    ev = ev.iloc[0]
 
-print("\nQA table written to:")
-print(OUTPUT_FILE)
+    rows.append({
+        "MRN": mrn,
+        "BMI_gold": r["BMI_gold"],
+        "BMI_pred": r["BMI_pred"],
+        "gold_obesity": r["gold_obesity"],
+        "pred_obesity": r["pred_obesity"],
+        "note_type": ev.get("NOTE_TYPE", ""),
+        "note_date": ev.get("NOTE_DATE", ""),
+        "anchor_date": ev.get("ANCHOR_DATE", ""),
+        "stage": ev.get("STAGE_USED", ""),
+        "snippet": ev.get("EVIDENCE", "")
+    })
+
+out = pd.DataFrame(rows)
+
+print("Preview:\n")
+
+for _, r in out.iterrows():
+
+    print(
+        r["MRN"],
+        "| gold_bmi:", r["BMI_gold"],
+        "| pred_bmi:", r["BMI_pred"],
+        "| gold_ob:", r["gold_obesity"],
+        "| pred_ob:", r["pred_obesity"]
+    )
+
+print("\nTotal mismatches:", len(out))
+
+out.to_csv(BASE + "/qa_obesity_mismatches.csv", index=False)
+
+print("\nSaved to:", BASE + "/qa_obesity_mismatches.csv")
