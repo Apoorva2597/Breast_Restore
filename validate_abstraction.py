@@ -109,56 +109,6 @@ def normalize_categorical(series):
         .str.lower()
     )
 
-    # ---------------------------
-    # Smoking normalization
-    # ---------------------------
-
-    def normalize_smoking(val):
-
-        if pd.isna(val):
-            return pd.NA
-
-        s = str(val).strip().lower()
-
-        if s in [
-            "current",
-            "current smoker",
-            "smoker",
-            "active smoker",
-            "smokes",
-            "currently smoking"
-        ]:
-            return "current"
-
-        if s in [
-            "former",
-            "former smoker",
-            "ex-smoker",
-            "quit smoking",
-            "quit tobacco",
-            "stopped smoking",
-            "history of tobacco use",
-            "prior tobacco use"
-        ]:
-            return "former"
-
-        if s in [
-            "never",
-            "never smoker",
-            "never smoked",
-            "non-smoker",
-            "nonsmoker",
-            "lifetime nonsmoker",
-            "denies smoking",
-            "denies tobacco",
-            "no tobacco use"
-        ]:
-            return "never"
-
-        return s
-
-    series = series.apply(normalize_smoking)
-
     return series
 
 
@@ -251,6 +201,7 @@ def collapse_race_value(x):
         return pd.NA
 
     pieces = []
+
     tmp = raw.replace(";", ",")
 
     for part in tmp.split(","):
@@ -406,7 +357,11 @@ def compute_age_floor_round_metrics(pred, gold):
     if total == 0:
         return 0.0, 0, 0
 
-    matches = ((gold == pred) | (gold == pred - 1) | (gold == pred + 1)).sum()
+    matches = (
+        (gold == pred) |
+        (gold == pred - 1) |
+        (gold == pred + 1)
+    ).sum()
 
     accuracy = float(matches) / float(total)
 
@@ -501,7 +456,13 @@ def main():
 
     print("Merging directly on MRN...")
 
-    merged = pd.merge(master, gold, on=MRN, how="inner", suffixes=("_pred", "_gold"))
+    merged = pd.merge(
+        master,
+        gold,
+        on=MRN,
+        how="inner",
+        suffixes=("_pred", "_gold")
+    )
 
     print("Merged rows:", len(merged))
 
@@ -548,15 +509,72 @@ def main():
             "total_compared": total
         })
 
-    if not os.path.exists("_outputs"):
-        os.makedirs("_outputs")
+
+    # -----------------------------------------------
+    # Supplemental BMI / obesity validation
+    # -----------------------------------------------
+
+    if "BMI_pred" in merged.columns and "BMI_gold" in merged.columns:
+
+        pred_bmi = merged["BMI_pred"]
+        gold_bmi = merged["BMI_gold"]
+
+        acc, matches, total = compute_numeric_metrics(pred_bmi, gold_bmi, tolerance=0.5)
+
+        results.append({
+            "variable": "BMI_close_0_5",
+            "accuracy": acc,
+            "matches": matches,
+            "total_compared": total
+        })
+
+        acc, matches, total = compute_numeric_metrics(pred_bmi, gold_bmi, tolerance=1.0)
+
+        results.append({
+            "variable": "BMI_close_1_0",
+            "accuracy": acc,
+            "matches": matches,
+            "total_compared": total
+        })
+
+        acc, matches, total = compute_bmi_round_integer_metrics(pred_bmi, gold_bmi)
+
+        results.append({
+            "variable": "BMI_round_integer",
+            "accuracy": acc,
+            "matches": matches,
+            "total_compared": total
+        })
+
+        acc, matches, total = compute_obesity_from_bmi_metrics(pred_bmi, gold_bmi, tolerance=None)
+
+        results.append({
+            "variable": "Obesity_from_BMI",
+            "accuracy": acc,
+            "matches": matches,
+            "total_compared": total
+        })
+
+        acc, matches, total = compute_obesity_from_bmi_metrics(pred_bmi, gold_bmi, tolerance=0.5)
+
+        results.append({
+            "variable": "Obesity_from_BMI_tol_0_5",
+            "accuracy": acc,
+            "matches": matches,
+            "total_compared": total
+        })
+
 
     df = pd.DataFrame(results)
 
     print("\nValidation Results\n")
     print(df)
 
+    if not os.path.exists("_outputs"):
+        os.makedirs("_outputs")
+
     out_path = "_outputs/validation_summary.csv"
+
     df.to_csv(out_path, index=False)
 
     print("\nValidation complete.")
