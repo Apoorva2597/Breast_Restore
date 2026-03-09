@@ -17,6 +17,7 @@ UPDATE:
 Added supplemental BMI / obesity validation metrics WITHOUT changing
 existing finalized validation behavior:
 - BMI_close_0_5
+- BMI_close_1_0
 - BMI_round_integer
 - Obesity_from_BMI
 - Obesity_from_BMI_tol_0_5
@@ -507,6 +508,14 @@ def main():
         acc, matches, total = compute_numeric_metrics(pred_bmi, gold_bmi, tolerance=0.5)
         results.append({
             "variable": "BMI_close_0_5",
+            "accuracy": acc,
+            "matches": matches,
+            "total_compared": total
+        })
+
+        acc, matches, total = compute_numeric_metrics(pred_bmi, gold_bmi, tolerance=1.0)
+        results.append({
+            "variable": "BMI_close_1_0",
             "accuracy": acc,
             "matches": matches,
             "total_compared": total
