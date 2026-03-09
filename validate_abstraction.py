@@ -13,6 +13,14 @@ Uses type-aware comparison for categorical, numeric, and binary fields.
 Includes race normalization so builder-standardized race values can be
 compared fairly against gold race labels.
 
+UPDATE:
+Added supplemental BMI / obesity validation metrics WITHOUT changing
+existing finalized validation behavior:
+- BMI_close_0_5
+- BMI_round_integer
+- Obesity_from_BMI
+- Obesity_from_BMI_tol_0_5
+
 Compatible with Python 3.6.8.
 """
 
@@ -354,6 +362,61 @@ def compute_age_floor_round_metrics(pred, gold):
 
 
 # ---------------------------------------------------
+# BMI / Obesity supplemental metrics
+# ---------------------------------------------------
+
+def compute_bmi_round_integer_metrics(pred, gold):
+
+    pred = normalize_numeric(pred)
+    gold = normalize_numeric(gold)
+
+    mask = gold.notna()
+
+    pred = pred[mask]
+    gold = gold[mask]
+
+    total = len(gold)
+
+    if total == 0:
+        return 0.0, 0, 0
+
+    matches = (pred.round(0) == gold.round(0)).sum()
+
+    accuracy = float(matches) / float(total)
+
+    return accuracy, int(matches), int(total)
+
+
+def compute_obesity_from_bmi_metrics(pred, gold, tolerance=None):
+
+    pred = normalize_numeric(pred)
+    gold = normalize_numeric(gold)
+
+    mask = gold.notna()
+
+    pred = pred[mask]
+    gold = gold[mask]
+
+    total = len(gold)
+
+    if total == 0:
+        return 0.0, 0, 0
+
+    gold_ob = (gold >= 30).astype(int)
+    pred_ob = (pred >= 30).astype(int)
+
+    if tolerance is None:
+        matches = (pred_ob == gold_ob).sum()
+    else:
+        close_mask = (pred - gold).abs() <= tolerance
+        matches = ((pred_ob == gold_ob) | close_mask).sum()
+
+    accuracy = float(matches) / float(total)
+
+    return accuracy, int(matches), int(total)
+
+
+# ---------------------------------------------------
 # Main
 # ---------------------------------------------------
 
@@ -367,8 +430,19 @@ def main():
     print("Master rows:", len(master))
     print("Gold rows:", len(gold))
 
+    if MRN not in master.columns:
+        print("ERROR: master file missing MRN column")
+        sys.exit(1)
+
+    if MRN not in gold.columns:
+        print("ERROR: gold file missing MRN column")
+        sys.exit(1)
+
     master[MRN] = master[MRN].astype(str).str.strip()
     gold[MRN] = gold[MRN].astype(str).str.strip()
+
+    master = master[master[MRN] != ""].copy()
+    gold = gold[gold[MRN] != ""].copy()
 
     master = master.drop_duplicates(subset=[MRN])
     gold = gold.drop_duplicates(subset=[MRN])
@@ -379,6 +453,10 @@ def main():
 
     print("Merged rows:", len(merged))
 
+    if len(merged) == 0:
+        print("ERROR: No rows matched on MRN.")
+        sys.exit(1)
+
     results = []
 
     for v in ALL_VARIABLES:
@@ -387,6 +465,7 @@ def main():
         gold_col = v + "_gold"
 
         if pred_col not in merged.columns or gold_col not in merged.columns:
+            print("Skipping variable:", v)
             continue
 
         pred = merged[pred_col]
@@ -417,6 +496,46 @@ def main():
             "total_compared": total
         })
 
+    # -----------------------------------------------
+    # Supplemental BMI / obesity validation
+    # -----------------------------------------------
+    if "BMI_pred" in merged.columns and "BMI_gold" in merged.columns:
+
+        pred_bmi = merged["BMI_pred"]
+        gold_bmi = merged["BMI_gold"]
+
+        acc, matches, total = compute_numeric_metrics(pred_bmi, gold_bmi, tolerance=0.5)
+        results.append({
+            "variable": "BMI_close_0_5",
+            "accuracy": acc,
+            "matches": matches,
+            "total_compared": total
+        })
+
+        acc, matches, total = compute_bmi_round_integer_metrics(pred_bmi, gold_bmi)
+        results.append({
+            "variable": "BMI_round_integer",
+            "accuracy": acc,
+            "matches": matches,
+            "total_compared": total
+        })
+
+        acc, matches, total = compute_obesity_from_bmi_metrics(pred_bmi, gold_bmi, tolerance=None)
+        results.append({
+            "variable": "Obesity_from_BMI",
+            "accuracy": acc,
+            "matches": matches,
+            "total_compared": total
+        })
+
+        acc, matches, total = compute_obesity_from_bmi_metrics(pred_bmi, gold_bmi, tolerance=0.5)
+        results.append({
+            "variable": "Obesity_from_BMI_tol_0_5",
+            "accuracy": acc,
+            "matches": matches,
+            "total_compared": total
+        })
+
     df = pd.DataFrame(results)
 
     print("\nValidation Results\n")
@@ -426,7 +545,6 @@ def main():
         os.makedirs("_outputs")
 
     out_path = "_outputs/validation_summary.csv"
-
     df.to_csv(out_path, index=False)
 
     print("\nValidation complete.")
