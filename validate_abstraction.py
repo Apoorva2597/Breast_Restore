@@ -75,6 +75,7 @@ def safe_read_csv(path):
 # ---------------------------------------------------
 
 def clean_string_series(series):
+
     series = series.copy()
     series = series.astype(str)
     series = series.str.strip()
@@ -107,6 +108,56 @@ def normalize_categorical(series):
         .str.strip()
         .str.lower()
     )
+
+    # ---------------------------
+    # Smoking normalization
+    # ---------------------------
+
+    def normalize_smoking(val):
+
+        if pd.isna(val):
+            return pd.NA
+
+        s = str(val).strip().lower()
+
+        if s in [
+            "current",
+            "current smoker",
+            "smoker",
+            "active smoker",
+            "smokes",
+            "currently smoking"
+        ]:
+            return "current"
+
+        if s in [
+            "former",
+            "former smoker",
+            "ex-smoker",
+            "quit smoking",
+            "quit tobacco",
+            "stopped smoking",
+            "history of tobacco use",
+            "prior tobacco use"
+        ]:
+            return "former"
+
+        if s in [
+            "never",
+            "never smoker",
+            "never smoked",
+            "non-smoker",
+            "nonsmoker",
+            "lifetime nonsmoker",
+            "denies smoking",
+            "denies tobacco",
+            "no tobacco use"
+        ]:
+            return "never"
+
+        return s
+
+    series = series.apply(normalize_smoking)
 
     return series
 
@@ -497,62 +548,13 @@ def main():
             "total_compared": total
         })
 
-    # -----------------------------------------------
-    # Supplemental BMI / obesity validation
-    # -----------------------------------------------
-    if "BMI_pred" in merged.columns and "BMI_gold" in merged.columns:
-
-        pred_bmi = merged["BMI_pred"]
-        gold_bmi = merged["BMI_gold"]
-
-        acc, matches, total = compute_numeric_metrics(pred_bmi, gold_bmi, tolerance=0.5)
-        results.append({
-            "variable": "BMI_close_0_5",
-            "accuracy": acc,
-            "matches": matches,
-            "total_compared": total
-        })
-
-        acc, matches, total = compute_numeric_metrics(pred_bmi, gold_bmi, tolerance=1.0)
-        results.append({
-            "variable": "BMI_close_1_0",
-            "accuracy": acc,
-            "matches": matches,
-            "total_compared": total
-        })
-
-        acc, matches, total = compute_bmi_round_integer_metrics(pred_bmi, gold_bmi)
-        results.append({
-            "variable": "BMI_round_integer",
-            "accuracy": acc,
-            "matches": matches,
-            "total_compared": total
-        })
-
-        acc, matches, total = compute_obesity_from_bmi_metrics(pred_bmi, gold_bmi, tolerance=None)
-        results.append({
-            "variable": "Obesity_from_BMI",
-            "accuracy": acc,
-            "matches": matches,
-            "total_compared": total
-        })
-
-        acc, matches, total = compute_obesity_from_bmi_metrics(pred_bmi, gold_bmi, tolerance=0.5)
-        results.append({
-            "variable": "Obesity_from_BMI_tol_0_5",
-            "accuracy": acc,
-            "matches": matches,
-            "total_compared": total
-        })
-
+    if not os.path.exists("_outputs"):
+        os.makedirs("_outputs")
 
     df = pd.DataFrame(results)
 
     print("\nValidation Results\n")
     print(df)
-
-    if not os.path.exists("_outputs"):
-        os.makedirs("_outputs")
 
     out_path = "_outputs/validation_summary.csv"
     df.to_csv(out_path, index=False)
