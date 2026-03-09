@@ -2,6 +2,7 @@
 # qa_smoking_mismatches.py
 #
 # Finds smoking mismatches vs gold and shows the note evidence used.
+# MRN is used internally but NOT written to the output file.
 
 import pandas as pd
 
@@ -68,7 +69,6 @@ for _, r in mismatches.iterrows():
         e = ev.iloc[0]
 
         rows.append({
-            "MRN": mrn,
             "Gold": r["Smoking_gold"],
             "Pred": r["Smoking_pred"],
             "Note_Date": clean(e.get("NOTE_DATE")),
