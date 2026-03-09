@@ -219,7 +219,7 @@ def extract_smoking(note: SectionedNote) -> List[Candidate]:
         # so default to Current rather than Former.
         # --------------------------------------------------
         for m in GENERIC_QUIT_PATTERN.finditer(text):
-            return _candidate(note, section, "Current", text, m.start(), m.end(), 0.90)
+            return _candidate(note, section, "Former", text, m.start(), m.end(), 0.90)
 
         # --------------------------------------------------
         # Never smoker patterns
