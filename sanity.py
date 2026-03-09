@@ -2,18 +2,26 @@
 # -*- coding: utf-8 -*-
 
 """
-qa_obesity_mismatch_evidence.py
+qa_obesity_mismatch_evidence_tol_0_5.py
 
-Finds obesity mismatches based on:
-    gold_obesity = BMI_gold >= 30
-    pred_obesity = BMI_pred >= 30
+Shows ONLY the obesity mismatches that remain AFTER applying the
+same ±0.5 BMI tolerance logic used in:
 
-Then links each mismatch to the BMI evidence row so you can inspect:
+    Obesity_from_BMI_tol_0_5
+
+So borderline cases like:
+    gold 30.3 vs pred 29.9
+will NOT appear here.
+
+Outputs:
 - MRN
-- BMI gold / pred
-- obesity gold / pred
+- BMI_gold
+- BMI_pred
+- gold_obesity
+- pred_obesity
+- diff_abs
 - note metadata
-- snippet used for BMI extraction
+- BMI snippet/evidence
 
 Python 3.6.8 compatible.
 """
@@ -24,9 +32,10 @@ import pandas as pd
 MASTER_FILE = "_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv"
 GOLD_FILE = "gold_cleaned_for_cedar.csv"
 EVIDENCE_FILE = "_outputs/bmi_only_evidence.csv"
-OUTPUT_FILE = "_outputs/qa_obesity_mismatches_with_evidence.csv"
+OUTPUT_FILE = "_outputs/qa_obesity_mismatches_tol_0_5_with_evidence.csv"
 
 MRN = "MRN"
+BMI_TOL = 0.5
 
 
 def safe_read_csv(path):
@@ -58,17 +67,6 @@ def clean_string_series(series):
 def normalize_numeric(series):
     series = clean_string_series(series)
     return pd.to_numeric(series, errors="coerce")
-
-
-def compute_obesity_from_bmi(series):
-    return (series >= 30).astype(int)
-
-
-def safe_float(x):
-    try:
-        return float(x)
-    except Exception:
-        return None
 
 
 def choose_best_evidence_row(group):
@@ -158,34 +156,48 @@ def main():
     merged["BMI_pred_num"] = normalize_numeric(merged["BMI_pred"])
     merged["BMI_gold_num"] = normalize_numeric(merged["BMI_gold"])
 
-    # gold-present only, same as validator
+    # same denominator rule as validator: GOLD PRESENT ONLY
     mask = merged["BMI_gold_num"].notna()
     subset = merged.loc[mask].copy()
 
-    subset["gold_obesity"] = compute_obesity_from_bmi(subset["BMI_gold_num"])
-    subset["pred_obesity"] = compute_obesity_from_bmi(subset["BMI_pred_num"].fillna(-999999))
+    subset["gold_obesity"] = (subset["BMI_gold_num"] >= 30).astype(int)
 
-    mismatches = subset[subset["gold_obesity"] != subset["pred_obesity"]].copy()
-    mismatches["diff_abs"] = (mismatches["BMI_pred_num"] - mismatches["BMI_gold_num"]).abs()
+    # if pred missing, treat as non-match and unresolved
+    subset["pred_obesity"] = (subset["BMI_pred_num"] >= 30).fillna(False).astype(int)
 
-    print("Obesity mismatches found:", len(mismatches))
+    subset["diff_abs"] = (subset["BMI_pred_num"] - subset["BMI_gold_num"]).abs()
+
+    # strict obesity mismatch
+    strict_mismatch = (subset["gold_obesity"] != subset["pred_obesity"])
+
+    # close BMI within tolerance
+    close_bmi = (subset["diff_abs"] <= BMI_TOL)
+
+    # unresolved after tolerance:
+    # still obesity mismatch AND not close enough on BMI
+    unresolved = subset[strict_mismatch & (~close_bmi.fillna(False))].copy()
+
+    print("Strict obesity mismatches:", int(strict_mismatch.sum()))
+    print("Resolved by tolerance <= 0.5:", int((strict_mismatch & close_bmi.fillna(False)).sum()))
+    print("Remaining obesity mismatches after tolerance:", len(unresolved))
 
     rows = []
 
-    for _, row in mismatches.iterrows():
+    for _, row in unresolved.iterrows():
 
         mrn = str(row[MRN]).strip()
         pred_bmi = row["BMI_pred_num"]
 
         ev_sub = evid[evid[MRN] == mrn].copy()
 
-        if len(ev_sub) > 0 and pred_bmi == pred_bmi:
+        if len(ev_sub) > 0 and pd.notna(pred_bmi):
             if "VALUE" in ev_sub.columns:
                 ev_sub["VALUE_num"] = pd.to_numeric(ev_sub["VALUE"], errors="coerce")
                 ev_sub = ev_sub[ev_sub["VALUE_num"] == pred_bmi].copy()
 
         if len(ev_sub) > 0:
             best = choose_best_evidence_row(ev_sub)
+            note_id = best.get("NOTE_ID", "")
             note_type = best.get("NOTE_TYPE", "")
             note_date = best.get("NOTE_DATE", "")
             anchor_date = best.get("ANCHOR_DATE", "")
@@ -194,8 +206,8 @@ def main():
             confidence = best.get("CONFIDENCE", "")
             section = best.get("SECTION", "")
             snippet = best.get("EVIDENCE", "")
-            note_id = best.get("NOTE_ID", "")
         else:
+            note_id = ""
             note_type = ""
             note_date = ""
             anchor_date = ""
@@ -204,7 +216,6 @@ def main():
             confidence = ""
             section = ""
             snippet = "NO_MATCHING_BMI_EVIDENCE_FOUND"
-            note_id = ""
 
         rows.append({
             "MRN": mrn,
@@ -247,13 +258,14 @@ def main():
             "BMI_pred",
             "gold_obesity",
             "pred_obesity",
+            "diff_abs",
             "NOTE_TYPE",
             "NOTE_DATE",
             "ANCHOR_DATE",
             "STAGE_USED"
         ]].to_string(index=False))
     else:
-        print("No obesity mismatches found.")
+        print("No remaining obesity mismatches after tolerance.")
 
 
 if __name__ == "__main__":
