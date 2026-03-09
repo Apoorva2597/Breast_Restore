@@ -1,4 +1,3 @@
-python - <<'PY'
 import pandas as pd
 
 master = pd.read_csv("_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv", dtype=str)
@@ -17,4 +16,4 @@ pred_bmi = pd.to_numeric(merged["BMI_pred"], errors="coerce")
 
 print("gold present only:", gold_bmi.notna().sum())
 print("gold and pred present:", (gold_bmi.notna() & pred_bmi.notna()).sum())
-PY
+
