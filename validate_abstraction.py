@@ -543,6 +543,7 @@ def main():
             "accuracy": acc,
             "matches": matches,
             "total_compared": total
+        })
 
         acc, matches, total = compute_obesity_from_bmi_metrics(pred_bmi, gold_bmi, tolerance=1.0)
         results.append({
