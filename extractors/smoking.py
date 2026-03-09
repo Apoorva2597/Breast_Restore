@@ -6,48 +6,49 @@ from models import Candidate, SectionedNote
 from .utils import window_around
 
 # ----------------------------------------------
-# Smoking extraction with 3-month rule
+# Smoking extraction
 #
-# Data dictionary rule:
-# Patients who smoked within the past 3 months
-# are considered CURRENT smokers.
+# Dataset rule:
+# Patients reported as having smoked in the past
+# 3 months are considered Current smokers.
 #
-# Key handling:
-#   quit smoking 2 months ago   -> Current
-#   quit smoking 6 weeks ago    -> Current
-#   quit smoking 4 months ago   -> Former
-#   quit smoking (no time, recent context) -> Current
-#   years since quitting / quit date years ago -> Former
-#
-# Output labels:
-#   Current / Former / Never
+# Strategy:
+# 1. Prefer explicit current-use statements
+# 2. Then explicit former-use with quit date / years since quitting
+# 3. Then explicit never-use statements
+# 4. Then lower-confidence screening/template answers
 #
 # Python 3.6.8 compatible
 # ----------------------------------------------
 
 CURRENT_PATTERNS = [
     re.compile(r"\bcurrent smoker\b", re.IGNORECASE),
-    re.compile(r"\bsmokes\b", re.IGNORECASE),
     re.compile(r"\bactive smoker\b", re.IGNORECASE),
     re.compile(r"\bsmoking currently\b", re.IGNORECASE),
     re.compile(r"\bcurrently smoking\b", re.IGNORECASE),
+    re.compile(r"\bcurrently smokes\b", re.IGNORECASE),
+    re.compile(r"\bsmokes\b", re.IGNORECASE),
     re.compile(r"\bsmokes\s+\d+", re.IGNORECASE),
     re.compile(r"\bsmokes\s+(?:a\s+)?(?:couple|few)\s+cig", re.IGNORECASE),
     re.compile(r"\bcigarettes?\s+per\s+(?:day|week)\b", re.IGNORECASE),
-    re.compile(r"\bpacks?/?day\b", re.IGNORECASE),
+    re.compile(r"\bpacks?\s*/?\s*day\b", re.IGNORECASE),
+    re.compile(r"\bpack[- ]years?\b", re.IGNORECASE),
+    re.compile(r"\bsmoked\s+\d+\s+packs?\b", re.IGNORECASE),
     re.compile(r"\btobacco use\s*[:\-]?\s*current\b", re.IGNORECASE),
+    re.compile(r"\bcomment\s*[:\-]?\s*smokes\b", re.IGNORECASE),
 ]
 
 FORMER_PATTERNS = [
     re.compile(r"\bformer smoker\b", re.IGNORECASE),
-    re.compile(r"\bsmoking status\s*:\s*former\b", re.IGNORECASE),
+    re.compile(r"\bsmoking status\s*[:\-]?\s*former\b", re.IGNORECASE),
+    re.compile(r"\bhistory smoking status\s*[:\-]?\s*former smoker\b", re.IGNORECASE),
     re.compile(r"\bprevious history of tobacco use\b", re.IGNORECASE),
     re.compile(r"\bhistory of tobacco use\b", re.IGNORECASE),
     re.compile(r"\bprior tobacco use\b", re.IGNORECASE),
     re.compile(r"\bex[- ]smoker\b", re.IGNORECASE),
     re.compile(r"\byears?\s+since\s+quitting\b", re.IGNORECASE),
     re.compile(r"\bquit date\s*[:\-]?\s*(?:19|20)\d{2}\b", re.IGNORECASE),
-    re.compile(r"\bquit\s+(?:smoking|tobacco)[^\.]{0,40}?\d+\s*(?:year|years)\b", re.IGNORECASE),
+    re.compile(r"\bquit\s+(?:smoking|tobacco)[^\.]{0,60}?\d+\s*(?:year|years)\b", re.IGNORECASE),
 ]
 
 NEVER_PATTERNS = [
@@ -64,11 +65,9 @@ NEVER_PATTERNS = [
     re.compile(r"\bno tobacco use\b", re.IGNORECASE),
     re.compile(r"\bnever used tobacco\b", re.IGNORECASE),
     re.compile(r"\bsmokeless tobacco\s+(?:never used|none)\b", re.IGNORECASE),
-    re.compile(r"\bactive tobacco use\?\s*no\b", re.IGNORECASE),
-    re.compile(r"\bcurrently smoking\?\s*no\b", re.IGNORECASE),
 ]
 
-# Detect quit time expressions
+# Quit time expressions
 QUIT_TIME_PATTERN = re.compile(
     r"(quit|stopped)\s+(smoking|tobacco)[^\.]{0,60}?(\d+)\s*(day|days|week|weeks|month|months|year|years)",
     re.IGNORECASE
@@ -76,11 +75,6 @@ QUIT_TIME_PATTERN = re.compile(
 
 GENERIC_QUIT_PATTERN = re.compile(
     r"\b(quit smoking|quit tobacco|stopped smoking|stopped tobacco)\b",
-    re.IGNORECASE
-)
-
-SINCE_LAST_VISIT_QUIT_PATTERN = re.compile(
-    r"\b(?:since\s+(?:our|the)\s+last\s+visit[^\.]{0,80}?)?(?:has\s+)?(?:quit|stopped)\s+(?:smoking|tobacco)\b",
     re.IGNORECASE
 )
 
@@ -95,9 +89,29 @@ QUIT_DATE_YEAR_PATTERN = re.compile(
 )
 
 RECENT_QUIT_CONTEXT_PATTERN = re.compile(
-    r"\b(?:trying\s+to\s+quit|plans\s+to\s+quit|encouraged\s+to\s+quit|recently\s+quit|since\s+last\s+visit[^\.]{0,80}?quit)\b",
+    r"\b(?:since\s+(?:our|the)\s+last\s+visit[^\.]{0,80}?quit|recently\s+quit|trying\s+to\s+quit|plans\s+to\s+quit|encouraged\s+to\s+quit)\b",
     re.IGNORECASE
 )
+
+# Lower-confidence screening/template phrases
+SCREENING_NEVER_PATTERNS = [
+    re.compile(r"\bactive tobacco use\?\s*no\b", re.IGNORECASE),
+    re.compile(r"\bcurrently smoking\?\s*no\b", re.IGNORECASE),
+    re.compile(r"\bactive tobacco use\s*[:\-]?\s*no\b", re.IGNORECASE),
+    re.compile(r"\bcurrent tobacco use\s*[:\-]?\s*no\b", re.IGNORECASE),
+]
+
+FAMILY_HISTORY_PATTERN = re.compile(
+    r"\bfamily history\b|\bmother\b|\bfather\b|\bgrandmother\b|\bgrandfather\b|\baunt\b|\buncle\b|\bsister\b|\bbrother\b",
+    re.IGNORECASE
+)
+
+SOCIAL_HISTORY_HEADERS = [
+    re.compile(r"\bsocial history\b", re.IGNORECASE),
+    re.compile(r"\bsubstance use history\b", re.IGNORECASE),
+    re.compile(r"\btobacco use\b", re.IGNORECASE),
+    re.compile(r"\bsmoking status\b", re.IGNORECASE),
+]
 
 PREFERRED_SECTIONS = {
     "SOCIAL HISTORY",
@@ -116,7 +130,7 @@ def _normalize_text(text):
     text = text.replace("\r", " ")
     text = text.replace("\n", " ")
     text = re.sub(r"\s+", " ", text)
-    return text
+    return text.strip()
 
 
 def _quit_within_three_months(match):
@@ -125,34 +139,121 @@ def _quit_within_three_months(match):
 
     if unit.startswith("day"):
         return number <= 90
-
     if unit.startswith("week"):
         return number <= 12
-
     if unit.startswith("month"):
         return number <= 3
-
     if unit.startswith("year"):
         return False
-
     return False
 
 
 def _candidate(note, section, value, text, start, end, confidence):
     ctx = window_around(text, start, end, 120)
-    return [
-        Candidate(
-            field="SmokingStatus",
-            value=value,
-            status="present",
-            evidence=ctx,
-            section=section,
-            note_type=note.note_type,
-            note_id=note.note_id,
-            note_date=note.note_date,
-            confidence=confidence,
-        )
-    ]
+    return Candidate(
+        field="SmokingStatus",
+        value=value,
+        status="present",
+        evidence=ctx,
+        section=section,
+        note_type=note.note_type,
+        note_id=note.note_id,
+        note_date=note.note_date,
+        confidence=confidence,
+    )
+
+
+def _section_priority(section_name):
+    s = str(section_name or "").upper().strip()
+    if s == "SOCIAL HISTORY":
+        return 0
+    if s == "HISTORY":
+        return 1
+    if s == "FULL":
+        return 2
+    return 3
+
+
+def _is_family_history_context(text, start, end):
+    left = max(0, start - 160)
+    right = min(len(text), end + 160)
+    ctx = text[left:right]
+    return FAMILY_HISTORY_PATTERN.search(ctx) is not None
+
+
+def _find_best(patterns, text, note, section, value, confidence, suppress_family=True):
+    best = None
+    best_key = None
+
+    for rx in patterns:
+        for m in rx.finditer(text):
+            if suppress_family and _is_family_history_context(text, m.start(), m.end()):
+                continue
+
+            cand = _candidate(note, section, value, text, m.start(), m.end(), confidence)
+            # earlier hit is slightly preferred
+            key = (m.start(), -confidence)
+
+            if best is None or key < best_key:
+                best = cand
+                best_key = key
+
+    return best
+
+
+def _find_quit_time_candidate(text, note, section):
+    best = None
+    best_key = None
+
+    for m in QUIT_TIME_PATTERN.finditer(text):
+        if _is_family_history_context(text, m.start(), m.end()):
+            continue
+
+        if _quit_within_three_months(m):
+            value = "Current"
+        else:
+            value = "Former"
+
+        cand = _candidate(note, section, value, text, m.start(), m.end(), 0.94)
+        key = (m.start(),)
+
+        if best is None or key < best_key:
+            best = cand
+            best_key = key
+
+    return best
+
+
+def _find_years_since_quit_candidate(text, note, section):
+    for m in YEARS_SINCE_QUITTING_PATTERN.finditer(text):
+        if _is_family_history_context(text, m.start(), m.end()):
+            continue
+        return _candidate(note, section, "Former", text, m.start(), m.end(), 0.94)
+    return None
+
+
+def _find_quit_date_year_candidate(text, note, section):
+    for m in QUIT_DATE_YEAR_PATTERN.finditer(text):
+        if _is_family_history_context(text, m.start(), m.end()):
+            continue
+        return _candidate(note, section, "Former", text, m.start(), m.end(), 0.94)
+    return None
+
+
+def _find_recent_quit_context_candidate(text, note, section):
+    for m in RECENT_QUIT_CONTEXT_PATTERN.finditer(text):
+        if _is_family_history_context(text, m.start(), m.end()):
+            continue
+        return _candidate(note, section, "Current", text, m.start(), m.end(), 0.91)
+    return None
+
+
+def _find_generic_quit_candidate(text, note, section):
+    for m in GENERIC_QUIT_PATTERN.finditer(text):
+        if _is_family_history_context(text, m.start(), m.end()):
+            continue
+        return _candidate(note, section, "Former", text, m.start(), m.end(), 0.89)
+    return None
 
 
 def extract_smoking(note: SectionedNote) -> List[Candidate]:
@@ -166,6 +267,8 @@ def extract_smoking(note: SectionedNote) -> List[Candidate]:
         if s not in section_order and s not in SUPPRESS_SECTIONS:
             section_order.append(s)
 
+    all_candidates = []
+
     for section in section_order:
         raw_text = note.sections.get(section, "") or ""
         if not raw_text:
@@ -173,68 +276,61 @@ def extract_smoking(note: SectionedNote) -> List[Candidate]:
 
         text = _normalize_text(raw_text)
 
-        # --------------------------------------------------
-        # Highest-priority explicit current smoking patterns
-        # --------------------------------------------------
-        for rx in CURRENT_PATTERNS:
-            for m in rx.finditer(text):
-                return _candidate(note, section, "Current", text, m.start(), m.end(), 0.95)
+        # 1. Explicit current use
+        cand = _find_best(CURRENT_PATTERNS, text, note, section, "Current", 0.95, suppress_family=True)
+        if cand is not None:
+            all_candidates.append(cand)
 
-        # --------------------------------------------------
-        # Quit expressions with explicit time
-        # --------------------------------------------------
-        for m in QUIT_TIME_PATTERN.finditer(text):
-            if _quit_within_three_months(m):
-                value = "Current"
-                conf = 0.94
-            else:
-                value = "Former"
-                conf = 0.94
-            return _candidate(note, section, value, text, m.start(), m.end(), conf)
+        # 2. Quit with explicit time (3-month rule)
+        cand = _find_quit_time_candidate(text, note, section)
+        if cand is not None:
+            all_candidates.append(cand)
 
-        # --------------------------------------------------
-        # Years since quitting -> Former
-        # --------------------------------------------------
-        for m in YEARS_SINCE_QUITTING_PATTERN.finditer(text):
-            return _candidate(note, section, "Former", text, m.start(), m.end(), 0.94)
+        # 3. Strong former indicators
+        cand = _find_years_since_quit_candidate(text, note, section)
+        if cand is not None:
+            all_candidates.append(cand)
 
-        # --------------------------------------------------
-        # Quit date year -> Former
-        # --------------------------------------------------
-        for m in QUIT_DATE_YEAR_PATTERN.finditer(text):
-            return _candidate(note, section, "Former", text, m.start(), m.end(), 0.94)
+        cand = _find_quit_date_year_candidate(text, note, section)
+        if cand is not None:
+            all_candidates.append(cand)
 
-        # --------------------------------------------------
-        # Generic quit statements with recent context -> Current
-        # --------------------------------------------------
-        for m in SINCE_LAST_VISIT_QUIT_PATTERN.finditer(text):
-            return _candidate(note, section, "Current", text, m.start(), m.end(), 0.93)
+        cand = _find_best(FORMER_PATTERNS, text, note, section, "Former", 0.92, suppress_family=True)
+        if cand is not None:
+            all_candidates.append(cand)
 
-        for m in RECENT_QUIT_CONTEXT_PATTERN.finditer(text):
-            return _candidate(note, section, "Current", text, m.start(), m.end(), 0.92)
+        # 4. Explicit never
+        cand = _find_best(NEVER_PATTERNS, text, note, section, "Never", 0.90, suppress_family=True)
+        if cand is not None:
+            all_candidates.append(cand)
 
-        # --------------------------------------------------
-        # Generic quit statements without time
-        # Dataset rule / QA indicates these are often recent,
-        # so default to Current rather than Former.
-        # --------------------------------------------------
-        for m in GENERIC_QUIT_PATTERN.finditer(text):
-            return _candidate(note, section, "Former", text, m.start(), m.end(), 0.90)
+        # 5. Recent quit context without exact duration
+        cand = _find_recent_quit_context_candidate(text, note, section)
+        if cand is not None:
+            all_candidates.append(cand)
 
-        # --------------------------------------------------
-        # Never smoker patterns
-        # --------------------------------------------------
-        for rx in NEVER_PATTERNS:
-            for m in rx.finditer(text):
-                return _candidate(note, section, "Never", text, m.start(), m.end(), 0.90)
+        # 6. Generic quit defaults to Former
+        cand = _find_generic_quit_candidate(text, note, section)
+        if cand is not None:
+            all_candidates.append(cand)
 
-        # --------------------------------------------------
-        # Former smoker patterns
-        # These come after quit logic so explicit recent quit
-        # statements are not incorrectly forced to Former.
-        # --------------------------------------------------
-        for rx in FORMER_PATTERNS:
-            for m in rx.finditer(text):
-                return _candidate(note, section, "Former", text, m.start(), m.end(), 0.89)
+        # 7. Lower-confidence screening/template never
+        cand = _find_best(SCREENING_NEVER_PATTERNS, text, note, section, "Never", 0.70, suppress_family=True)
+        if cand is not None:
+            all_candidates.append(cand)
 
-    return []
+    if not all_candidates:
+        return []
+
+    def sort_key(c):
+        # current > former/never when explicit smoking is documented in same note
+        value_priority = 0 if c.value == "Current" else 1 if c.value == "Former" else 2
+        return (
+            value_priority,
+            _section_priority(c.section),
+            -float(getattr(c, "confidence", 0.0) or 0.0),
+            len(getattr(c, "evidence", "") or "")
+        )
+
+    best = sorted(all_candidates, key=sort_key)[0]
+    return [best]
