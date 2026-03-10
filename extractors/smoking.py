@@ -63,6 +63,8 @@ CHECKBOX_CHARS = [
     u"\uf0fc",
 ]
 
+BOX = r"(?:\s*[:\-]?\s*(?:checkbox_token\s*)?)?"
+
 CURRENT_PATTERNS = [
     re.compile(r"\bcurrent smoker\b", re.IGNORECASE),
     re.compile(r"\bactive smoker\b", re.IGNORECASE),
@@ -85,6 +87,9 @@ CURRENT_PATTERNS = [
     re.compile(r"\bsmokes\s+every\s+once\s+in\s+a\s+while\b", re.IGNORECASE),
     re.compile(r"\bcomment\s*[:\-]?\s*states\s+she\s+smokes\b", re.IGNORECASE),
     re.compile(r"\btobacco use\s*[:\-]?\s*current\b", re.IGNORECASE),
+    re.compile(r"\bsmoking status\s*[:\-]?\s*current every day smoker\b", re.IGNORECASE),
+    re.compile(r"\bsmoking status\s*[:\-]?\s*current some day smoker\b", re.IGNORECASE),
+    re.compile(r"\bsmoking status\s*[:\-]?\s*current smoker\b", re.IGNORECASE),
 ]
 
 FORMER_PATTERNS = [
@@ -111,6 +116,7 @@ NEVER_PATTERNS = [
     re.compile(r"\bno smoking\b", re.IGNORECASE),
     re.compile(r"\bdoes not smoke or use nicotine\b", re.IGNORECASE),
     re.compile(r"\bnever used tobacco\b", re.IGNORECASE),
+    re.compile(r"\bsmoking status\s*[:\-]?\s*never(?:\s+smoker)?\b", re.IGNORECASE),
 ]
 
 SCREENING_NEVER_PATTERNS = [
@@ -120,6 +126,8 @@ SCREENING_NEVER_PATTERNS = [
     re.compile(r"\bactive tobacco use\s*[:\-]?\s*no\b", re.IGNORECASE),
     re.compile(r"\bcurrent tobacco use\s*[:\-]?\s*no\b", re.IGNORECASE),
     re.compile(r"\bno tobacco use\b", re.IGNORECASE),
+    re.compile(r"\bcurrently smoking\s*[:\-]?\s*no\b", re.IGNORECASE),
+    re.compile(r"\bsmoking now\s*[:\-]?\s*no\b", re.IGNORECASE),
 ]
 
 QUIT_TIME_PATTERN = re.compile(
@@ -173,7 +181,7 @@ QUESTIONNAIRE_QUIT_PATTERN = re.compile(
 )
 
 QUESTIONNAIRE_FALSE_CURRENT_PATTERN = re.compile(
-    r"\b(is patient currently smoking\?\s*no|currently smoking\?\s*no|active tobacco use\?\s*no|current tobacco use\?\s*no|if active smoker\b|was patient advised by provider to quit smoking\?|was patient referred to mhealthy\?)\b",
+    r"\b(is patient currently smoking\?\s*no|currently smoking\?\s*no|active tobacco use\?\s*no|current tobacco use\?\s*no|if active smoker\b|was patient advised by provider to quit smoking\?|was patient referred to mhealthy\?|currently smoking\s*[:\-]?\s*no|smoking now\s*[:\-]?\s*no|not currently smoking)\b",
     re.IGNORECASE
 )
 
@@ -185,6 +193,39 @@ FAMILY_HISTORY_PATTERN = re.compile(
 # explicit structured social-history windows
 STRUCTURED_BLOCK_START_PATTERN = re.compile(
     r"\b(?:social history|social & substance use history|substance use topics|social history main topics|history smoking status|smoking status|tobacco use)\b",
+    re.IGNORECASE
+)
+
+STRUCTURED_CURRENT_RX = re.compile(
+    r"\bsmoking status" + BOX + r"(current every day smoker|current some day smoker|current smoker|current)\b",
+    re.IGNORECASE
+)
+STRUCTURED_FORMER_RX = re.compile(
+    r"\bsmoking status" + BOX + r"(former smoker|former)\b",
+    re.IGNORECASE
+)
+STRUCTURED_NEVER_RX = re.compile(
+    r"\bsmoking status" + BOX + r"(never smoker|never)\b",
+    re.IGNORECASE
+)
+STRUCTURED_SMOKELESS_NEVER_RX = re.compile(
+    r"\bsmokeless tobacco" + BOX + r"never used\b",
+    re.IGNORECASE
+)
+STRUCTURED_PASSIVE_NEVER_RX = re.compile(
+    r"\bpassive smoke exposure\s*[:\-]?\s*never smoker\b",
+    re.IGNORECASE
+)
+STRUCTURED_COMMENT_CURRENT_RX = re.compile(
+    r"\bcomment\s*[:\-]?\s*(?:states?\s+)?(?:she|he|pt|patient)\s+smokes\b",
+    re.IGNORECASE
+)
+STRUCTURED_PACKS_DAY_RX = re.compile(
+    r"\bpacks?/day\s*[:\-]?\s*[0-9]+(?:\.[0-9]+)?\b",
+    re.IGNORECASE
+)
+STRUCTURED_TYPES_CIG_RX = re.compile(
+    r"\btypes?\s*[:\-]?\s*cigarettes\b",
     re.IGNORECASE
 )
 
@@ -203,7 +244,7 @@ SUPPRESS_SECTIONS = {
 def _normalize_text(text):
     text = text or ""
     for ch in CHECKBOX_CHARS:
-        text = text.replace(ch, " ")
+        text = text.replace(ch, " checkbox_token ")
     text = text.replace("\xa0", " ")
     text = text.replace("\r", " ")
     text = text.replace("\n", " ")
@@ -452,120 +493,69 @@ def _find_generic_quit_candidate(text, note, section):
     return None
 
 
-def _local_window_has(text, anchor_start, anchor_end, pattern, left=80, right=180):
-    s = max(0, anchor_start - left)
-    e = min(len(text), anchor_end + right)
-    ctx = text[s:e]
-    return pattern.search(ctx) is not None, s, e
-
-
 def _find_structured_block_candidates(text, note, section):
-    """
-    Recover structured EHR smoking blocks like:
-      Tobacco Use: History Smoking status Never Smoker Smokeless tobacco Never Used
-      Smoking status Current Every Day Smoker
-      Tobacco comment exposed to second hand smoke ...
-    """
     candidates = []
-
-    current_rx = re.compile(
-        r"\b(current every day smoker|current some day smoker|current smoker|light tobacco smoker|day smoker)\b",
-        re.IGNORECASE
-    )
-    former_rx = re.compile(
-        r"\b(former smoker|ex[- ]smoker)\b",
-        re.IGNORECASE
-    )
-    never_rx = re.compile(
-        r"\b(never smoker|never smoked|nonsmoker|non[- ]smoker)\b",
-        re.IGNORECASE
-    )
-    smokeless_never_rx = re.compile(
-        r"\bsmokeless tobacco\s*[:\-]?\s*never used\b",
-        re.IGNORECASE
-    )
-    tobacco_not_on_file_rx = re.compile(
-        r"\btobacco use\s*[:\-]?\s*(history|not on file)\b",
-        re.IGNORECASE
-    )
-    passive_smoke_rx = re.compile(
-        r"\bpassive smoke exposure\s*[:\-]?\s*never smoker\b",
-        re.IGNORECASE
-    )
 
     for m in STRUCTURED_BLOCK_START_PATTERN.finditer(text):
         s = m.start()
-        e = min(len(text), m.end() + 260)
+        e = min(len(text), m.end() + 320)
         chunk = text[s:e]
 
         if _is_family_history_context(text, s, e):
             continue
 
-        m2 = current_rx.search(chunk)
+        m2 = STRUCTURED_CURRENT_RX.search(chunk)
         if m2 is not None:
             start = s + m2.start()
             end = s + m2.end()
             if not _is_questionnaire_false_current_context(text, start, end):
-                candidates.append(_candidate(note, section, "Current", text, start, end, 0.995))
+                candidates.append(_candidate(note, section, "Current", text, start, end, 0.997))
 
-        m2 = former_rx.search(chunk)
+        m2 = STRUCTURED_FORMER_RX.search(chunk)
         if m2 is not None:
             start = s + m2.start()
             end = s + m2.end()
-            candidates.append(_candidate(note, section, "Former", text, start, end, 0.992))
+            candidates.append(_candidate(note, section, "Former", text, start, end, 0.995))
 
-        m2 = never_rx.search(chunk)
+        m2 = STRUCTURED_NEVER_RX.search(chunk)
+        if m2 is not None:
+            start = s + m2.start()
+            end = s + m2.end()
+            candidates.append(_candidate(note, section, "Never", text, start, end, 0.994))
+
+        m2 = STRUCTURED_SMOKELESS_NEVER_RX.search(chunk)
+        if m2 is not None and STRUCTURED_NEVER_RX.search(chunk) is not None:
+            start = s + m2.start()
+            end = s + m2.end()
+            candidates.append(_candidate(note, section, "Never", text, start, end, 0.992))
+
+        m2 = STRUCTURED_PASSIVE_NEVER_RX.search(chunk)
         if m2 is not None:
             start = s + m2.start()
             end = s + m2.end()
             candidates.append(_candidate(note, section, "Never", text, start, end, 0.991))
 
-        # structured "not on file" alone should not force a smoking class
-        # but paired with smokeless never or explicit never smoker it is okay
-        m2 = smokeless_never_rx.search(chunk)
-        if m2 is not None:
-            has_never, _, _ = _local_window_has(chunk, m2.start(), m2.end(), never_rx, left=120, right=120)
-            if has_never:
-                start = s + m2.start()
-                end = s + m2.end()
-                candidates.append(_candidate(note, section, "Never", text, start, end, 0.989))
-
-        # passive smoke exposure = never smoker, not current/former smoker
-        m2 = passive_smoke_rx.search(chunk)
+        m2 = STRUCTURED_COMMENT_CURRENT_RX.search(chunk)
         if m2 is not None:
             start = s + m2.start()
             end = s + m2.end()
-            candidates.append(_candidate(note, section, "Never", text, start, end, 0.988))
+            candidates.append(_candidate(note, section, "Current", text, start, end, 0.996))
 
-        # explicit comment in structured block can indicate current
-        comment_current_rx = re.compile(
-            r"\bcomment\s*[:\-]?\s*states\s+she\s+smokes\b|\bsmokes\s+every\s+once\s+in\s+a\s+while\s+currently\b",
-            re.IGNORECASE
-        )
-        m2 = comment_current_rx.search(chunk)
-        if m2 is not None:
-            start = s + m2.start()
-            end = s + m2.end()
-            candidates.append(_candidate(note, section, "Current", text, start, end, 0.994))
+        if STRUCTURED_PACKS_DAY_RX.search(chunk) is not None and STRUCTURED_TYPES_CIG_RX.search(chunk) is not None:
+            if STRUCTURED_FORMER_RX.search(chunk) is None and STRUCTURED_NEVER_RX.search(chunk) is None:
+                m_pack = STRUCTURED_PACKS_DAY_RX.search(chunk)
+                start = s + m_pack.start()
+                end = s + m_pack.end()
+                candidates.append(_candidate(note, section, "Current", text, start, end, 0.990))
 
-        # explicit "does not smoke" / "no smoking" in nearby social history window
-        structured_never_rx = re.compile(
-            r"\b(does not smoke|doesn't smoke|no smoking|does not smoke or use nicotine|denies use of tobacco products|denies tobacco use|denies tobacco)\b",
-            re.IGNORECASE
-        )
-        m2 = structured_never_rx.search(chunk)
-        if m2 is not None:
-            start = s + m2.start()
-            end = s + m2.end()
-            candidates.append(_candidate(note, section, "Never", text, start, end, 0.987))
-
-    # also allow direct global structured matches not necessarily anchored by start term
+    # direct whole-text structured matches
     direct_structured = [
-        (re.compile(r"\bsmoking status\s*[:\-]?\s*current every day smoker\b", re.IGNORECASE), "Current", 0.996),
-        (re.compile(r"\bsmoking status\s*[:\-]?\s*current some day smoker\b", re.IGNORECASE), "Current", 0.996),
-        (re.compile(r"\bsmoking status\s*[:\-]?\s*former smoker\b", re.IGNORECASE), "Former", 0.995),
-        (re.compile(r"\bsmoking status\s*[:\-]?\s*never smoker\b", re.IGNORECASE), "Never", 0.995),
-        (re.compile(r"\bsmokeless tobacco\s*[:\-]?\s*never used\b", re.IGNORECASE), "Never", 0.985),
+        (STRUCTURED_CURRENT_RX, "Current", 0.998),
+        (STRUCTURED_FORMER_RX, "Former", 0.996),
+        (STRUCTURED_NEVER_RX, "Never", 0.996),
+        (STRUCTURED_SMOKELESS_NEVER_RX, "Never", 0.989),
+        (STRUCTURED_PASSIVE_NEVER_RX, "Never", 0.990),
+        (STRUCTURED_COMMENT_CURRENT_RX, "Current", 0.995),
     ]
 
     for rx, value, conf in direct_structured:
