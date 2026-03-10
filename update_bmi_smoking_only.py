@@ -19,8 +19,12 @@
 #       Stage 3: +/- 14 days
 #   Historical fallback:
 #       allow any note ON OR BEFORE reconstruction date
-#       and now keep Current / Former / Never if extractor resolves it
-#       from quit timing or explicit evidence
+#       and keep Current / Former / Never if extractor resolves it
+#
+# Smoking ranking update:
+#   Uses hierarchical evidence ranking:
+#       explicit current > quantified current > recent quit/current >
+#       quit date/former > explicit never > weak screening/template
 #
 # Anchor logic:
 #   - Primary anchor from structured RECONSTRUCTION_DATE + ADMIT_DATE
@@ -630,6 +634,86 @@ def smoking_value_priority(val):
         return 2
     return 9
 
+def smoking_evidence_priority(cand):
+    """
+    Lower is better.
+
+    Expected extractor statuses from smoking.py:
+      explicit_current
+      computed_recent_quit
+      strong_former
+      explicit_never
+      generic_quit
+      screening_never
+
+    This function also includes fallbacks so the updater does not break
+    if an older extractor version is still in use.
+    """
+    status = clean_cell(getattr(cand, "status", "")).lower()
+    value = clean_cell(getattr(cand, "value", ""))
+    evidence = clean_cell(getattr(cand, "evidence", "")).lower()
+
+    if value == "Current":
+        if status == "explicit_current":
+            return 0
+        if (
+            "current smoker" in evidence or
+            "currently smoking" in evidence or
+            "still smoking" in evidence or
+            "continues to smoke" in evidence or
+            re.search(r"\bsmokes?\b", evidence) is not None or
+            re.search(r"\bcigarettes?\s+(?:a|per)\s+(?:day|week)\b", evidence) is not None or
+            re.search(r"\bpacks?/day\b", evidence) is not None
+        ):
+            return 0
+        if status == "computed_recent_quit":
+            return 2
+        return 3
+
+    if value == "Former":
+        if status == "strong_former":
+            if (
+                "quit date" in evidence or
+                "years since quitting" in evidence or
+                "last attempt to quit" in evidence or
+                "quit " in evidence or
+                "stopped " in evidence
+            ):
+                return 4
+            return 5
+        if status == "generic_quit":
+            return 6
+        if (
+            "quit date" in evidence or
+            "years since quitting" in evidence or
+            "former smoker" in evidence
+        ):
+            return 5
+        return 6
+
+    if value == "Never":
+        if status == "explicit_never":
+            return 7
+        if (
+            "never smoker" in evidence or
+            "never smoked" in evidence or
+            "never used tobacco" in evidence or
+            "denies tobacco" in evidence or
+            "denies smoking" in evidence
+        ):
+            return 7
+        if status == "screening_never":
+            return 8
+        if (
+            "current tobacco use: no" in evidence or
+            "active tobacco use: no" in evidence or
+            "currently smoking? no" in evidence
+        ):
+            return 8
+        return 8
+
+    return 9
+
 def choose_best_candidate(existing, new, recon_dt, source_file):
     # Generic selection used by BMI and any non-smoking fields.
     if existing is None:
@@ -668,25 +752,32 @@ def choose_best_smoking_candidate(existing, new, recon_dt, source_file):
     if nw_rank is None:
         return existing
 
-    ex_val = clean_cell(getattr(existing, "value", ""))
-    nw_val = clean_cell(getattr(new, "value", ""))
-
-    ex_pri = smoking_value_priority(ex_val)
-    nw_pri = smoking_value_priority(nw_val)
-
-    # Prefer better temporal/note rank first.
+    # 1) Keep the current temporal strategy first.
+    #    Current is still restricted by stage windows outside this function.
     if nw_rank < ex_rank:
         return new
     if ex_rank < nw_rank:
         return existing
 
-    # If same note/window rank, prefer Current > Former > Never.
+    # 2) Within the same temporal/note rank, use evidence hierarchy.
+    ex_epri = smoking_evidence_priority(existing)
+    nw_epri = smoking_evidence_priority(new)
+
+    if nw_epri < ex_epri:
+        return new
+    if ex_epri < nw_epri:
+        return existing
+
+    # 3) Then use label priority as a secondary tiebreak.
+    ex_pri = smoking_value_priority(getattr(existing, "value", ""))
+    nw_pri = smoking_value_priority(getattr(new, "value", ""))
+
     if nw_pri < ex_pri:
         return new
     if ex_pri < nw_pri:
         return existing
 
-    # Then confidence.
+    # 4) Then confidence.
     ex_conf = float(getattr(existing, "confidence", 0.0) or 0.0)
     nw_conf = float(getattr(new, "confidence", 0.0) or 0.0)
     if nw_conf > ex_conf:
@@ -694,7 +785,7 @@ def choose_best_smoking_candidate(existing, new, recon_dt, source_file):
     if ex_conf > nw_conf:
         return existing
 
-    # Then prefer note closest to recon, pre-op favored over post-op.
+    # 5) Then prefer note closest to recon, pre-op favored over post-op.
     ex_note_dt = parse_date_safe(getattr(existing, "note_date", ""))
     nw_note_dt = parse_date_safe(getattr(new, "note_date", ""))
 
@@ -974,7 +1065,6 @@ def collect_smoking_historical_candidates(notes_df, anchor_map, eligible_mrns, e
         if not candidates:
             continue
 
-        # Updated: keep Current too, not just Former/Never.
         hist_candidates = []
         for c in candidates:
             val = clean_cell(getattr(c, "value", ""))
