@@ -5,45 +5,23 @@
 #
 # IMPORTANT:
 # - BMI logic is intentionally left unchanged.
-# - Smoking logic now includes:
-#   (1) staged extractor-based search
-#   (2) unresolved-patient full-note fallback
-#   (3) final patient-level structured smoking override
-# - This version adds checkbox-aware regex support for Epic-style exports:
-#       Smoking status □ Never Smoker
-#       Smoking status □ Former Smoker
-#       Smoking status □ Current Every Day Smoker
-#       Smokeless tobacco □ Never Used
+# - Smoking logic revised to match the actual clinical question:
+#     * Current  -> time-sensitive at/near reconstruction
+#     * Former   -> stable historical status unless recent quit makes it Current
+#     * Never    -> stable historical status, not recon-tied
+#
+# Smoking flow:
+#   1) Current search near recon:
+#        day0 -> +/-7 -> +/-14
+#   2) Stable status search (Former/Never) across ANY pre-recon notes
+#        using extractor + full-note fallback + structured override candidates
+#   3) Unresolved fallback full-note search for any remaining MRNs
+#   4) Structured override only for still-unresolved MRNs
 #
 # BMI logic:
 #   Stage 1: anchor day only
 #   Stage 2: +/- 7 days (only if nothing found in Stage 1)
 #   Stage 3: +/- 14 days (only if nothing found in Stage 2)
-#
-# Smoking logic:
-#   Current:
-#       Stage 1: anchor day only
-#       Stage 2: +/- 7 days
-#       Stage 3: +/- 14 days
-#   Historical fallback:
-#       allow any note ON OR BEFORE reconstruction date
-#       and keep Current / Former / Never if extractor resolves it
-#   Final unresolved fallback:
-#       only for MRNs still unresolved after the above stages,
-#       scan full notes on/before reconstruction date with focused rules
-#   Final patient-level override:
-#       after all stages, scan all pre-recon notes for strongest structured
-#       smoking-status evidence and replace weaker earlier assignments only if
-#       the structured evidence is clearly stronger.
-#
-# Anchor logic:
-#   - Primary anchor from structured RECONSTRUCTION_DATE + ADMIT_DATE
-#   - Backup anchor from CPT/procedure/date logic if primary anchor missing
-#
-# Updates only:
-#   - BMI
-#   - Obesity
-#   - SmokingStatus
 #
 # Outputs:
 #   /home/apokol/Breast_Restore/_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv
@@ -1305,42 +1283,31 @@ def should_apply_patient_override(existing, override):
         return True
 
     ex_val = clean_cell(getattr(existing, "value", ""))
-    ov_val = clean_cell(getattr(override, "value", ""))
-
     ex_status = clean_cell(getattr(existing, "status", ""))
-    ov_status = clean_cell(getattr(override, "status", ""))
-
     ex_conf = safe_float(getattr(existing, "confidence", 0.0), 0.0)
+
+    ov_status = clean_cell(getattr(override, "status", ""))
     ov_conf = safe_float(getattr(override, "confidence", 0.0), 0.0)
 
-    weak_prefixes = (
-        "fallback_",
-    )
-    if ex_status.startswith(weak_prefixes):
+    if ex_status.startswith("fallback_"):
         return True
 
-    if ov_status in {"override_structured_current", "override_recent_quit_current"}:
-        if ex_val != "Current" and ov_conf >= ex_conf:
-            return True
+    if ov_status in {"override_structured_current", "override_recent_quit_current"} and ex_val != "Current" and ov_conf >= ex_conf:
+        return True
 
-    if ov_status == "override_structured_former":
-        if ex_val == "Never":
-            return True
-        if ex_val == "Current" and ex_status in {"fallback_current_narrative", "fallback_quantified_current", "computed"}:
-            return True
-        if ex_conf < 0.995:
-            return True
+    if ov_status == "override_structured_former" and ex_val in {"Never", ""}:
+        return True
 
-    if ov_status == "override_structured_never":
-        if ex_val == "Former" and ex_status in {"computed", "fallback_former", "fallback_structured_former"}:
-            return True
-        if ex_conf < 0.995:
-            return True
+    if ov_status == "override_structured_never" and ex_val == "":
+        return True
 
     return False
 
-def run_patient_level_structured_smoking_override(notes_df, anchor_map, final_best_smoking, evidence_rows):
-    mrns = sorted(set(anchor_map.keys()).intersection(set(notes_df[MERGE_KEY].astype(str).str.strip().tolist())))
+def run_patient_level_structured_smoking_override(notes_df, anchor_map, final_best_smoking, evidence_rows, eligible_mrns=None):
+    if eligible_mrns is None:
+        mrns = sorted(set(anchor_map.keys()).intersection(set(notes_df[MERGE_KEY].astype(str).str.strip().tolist())))
+    else:
+        mrns = sorted(set(eligible_mrns))
 
     override_count = 0
 
@@ -1417,6 +1384,143 @@ def run_patient_level_structured_smoking_override(notes_df, anchor_map, final_be
     return final_best_smoking, evidence_rows, override_count
 
 
+# -----------------------
+# Stable smoking helpers
+# -----------------------
+def smoking_evidence_text(cand):
+    return clean_cell(getattr(cand, "evidence", "")).lower()
+
+def smoking_note_day_diff(cand, recon_dt):
+    note_dt = parse_date_safe(getattr(cand, "note_date", ""))
+    if note_dt is None or recon_dt is None:
+        return None
+    return days_between(note_dt, recon_dt)
+
+def is_smokeless_only_never(cand):
+    val = clean_cell(getattr(cand, "value", ""))
+    if val != "Never":
+        return False
+
+    txt = smoking_evidence_text(cand)
+    if "smokeless tobacco" not in txt:
+        return False
+
+    strong_never_terms = [
+        "never smoker",
+        "never smoked",
+        "nonsmoker",
+        "non-smoker",
+        "passive smoke exposure"
+    ]
+    for term in strong_never_terms:
+        if term in txt:
+            return False
+    return True
+
+def former_support_strength(cand):
+    txt = smoking_evidence_text(cand)
+    status = clean_cell(getattr(cand, "status", "")).lower()
+    conf = safe_float(getattr(cand, "confidence", 0.0), 0.0)
+
+    if status == "override_structured_former":
+        return 0
+    if status == "fallback_structured_former":
+        return 1
+
+    if "smoking status" in txt and "former smoker" in txt and (
+        "quit date" in txt or
+        "years since quitting" in txt or
+        "last attempt to quit" in txt or
+        "quit " in txt
+    ):
+        return 2
+
+    if "former smoker" in txt and (
+        "quit date" in txt or
+        "years since quitting" in txt or
+        "last attempt to quit" in txt or
+        "quit " in txt
+    ):
+        return 3
+
+    if "former smoker" in txt:
+        return 4
+
+    if status == "fallback_former":
+        return 5
+
+    if conf >= 0.97:
+        return 6
+
+    return 20
+
+def never_support_strength(cand):
+    txt = smoking_evidence_text(cand)
+    status = clean_cell(getattr(cand, "status", "")).lower()
+    conf = safe_float(getattr(cand, "confidence", 0.0), 0.0)
+
+    if is_smokeless_only_never(cand):
+        return 99
+
+    if status == "override_structured_never":
+        return 10
+    if status == "fallback_structured_never":
+        return 11
+
+    if "smoking status" in txt and ("never smoker" in txt or "never smoked" in txt):
+        return 12
+
+    if "passive smoke exposure" in txt and "never smoker" in txt:
+        return 13
+
+    if "never smoker" in txt or "never smoked" in txt or "nonsmoker" in txt or "non-smoker" in txt:
+        return 14
+
+    if status == "fallback_never":
+        return 15
+
+    if conf >= 0.97:
+        return 16
+
+    return 30
+
+def stable_smoking_rank(cand, recon_dt, source_file):
+    val = clean_cell(getattr(cand, "value", ""))
+    conf = safe_float(getattr(cand, "confidence", 0.0), 0.0)
+    dd = smoking_note_day_diff(cand, recon_dt)
+    post_penalty = 1 if dd is not None and dd > 0 else 0
+    abs_dd = abs(dd) if dd is not None else 99999
+    bucket = note_type_bucket(getattr(cand, "note_type", ""), source_file)
+
+    if val == "Former":
+        support = former_support_strength(cand)
+        val_pri = 0
+    elif val == "Never":
+        support = never_support_strength(cand)
+        val_pri = 1
+    else:
+        support = 99
+        val_pri = 9
+
+    bucket_ord = 0 if bucket in ("brief_op", "operation", "preop", "anesthesia", "hp", "clinic") else 1
+
+    return (support, val_pri, -conf, post_penalty, abs_dd, bucket_ord)
+
+def choose_best_stable_smoking_candidate(existing, new, recon_dt, source_file):
+    if existing is None:
+        return new
+
+    ex_rank = stable_smoking_rank(existing, recon_dt, source_file)
+    nw_rank = stable_smoking_rank(new, recon_dt, source_file)
+
+    if nw_rank < ex_rank:
+        return new
+    return existing
+
+
+# -----------------------
+# BMI collection
+# -----------------------
 def collect_bmi_candidates_for_window(notes_df, anchor_map, stage_name, before_days, after_days, eligible_mrns, evidence_rows):
     best_by_mrn = {}
     notes_with_any_candidate = set()
@@ -1511,6 +1615,10 @@ def collect_bmi_candidates_for_window(notes_df, anchor_map, stage_name, before_d
 
     return best_by_mrn, notes_with_any_candidate, evidence_rows
 
+
+# -----------------------
+# Smoking current collection (time-sensitive)
+# -----------------------
 def collect_smoking_current_candidates_for_window(notes_df, anchor_map, stage_name, before_days, after_days, eligible_mrns, evidence_rows):
     best_by_mrn = {}
     notes_with_any_candidate = set()
@@ -1609,7 +1717,11 @@ def collect_smoking_current_candidates_for_window(notes_df, anchor_map, stage_na
 
     return best_by_mrn, notes_with_any_candidate, evidence_rows
 
-def collect_smoking_historical_candidates(notes_df, anchor_map, eligible_mrns, evidence_rows):
+
+# -----------------------
+# Stable smoking collection (Former/Never)
+# -----------------------
+def collect_smoking_stable_status_candidates(notes_df, anchor_map, eligible_mrns, evidence_rows):
     best_by_mrn = {}
     notes_with_any_candidate = set()
 
@@ -1633,6 +1745,8 @@ def collect_smoking_historical_candidates(notes_df, anchor_map, eligible_mrns, e
         if not note_on_or_before_recon(note_dt, recon_dt):
             continue
 
+        pooled_candidates = []
+
         snote = build_sectioned_note(
             note_text=row["NOTE_TEXT"],
             note_type=row["NOTE_TYPE"],
@@ -1641,7 +1755,7 @@ def collect_smoking_historical_candidates(notes_df, anchor_map, eligible_mrns, e
         )
 
         try:
-            candidates = extract_smoking(snote)
+            pooled_candidates.extend(extract_smoking(snote))
         except Exception as e:
             evidence_rows.append({
                 MERGE_KEY: mrn,
@@ -1653,38 +1767,71 @@ def collect_smoking_historical_candidates(notes_df, anchor_map, eligible_mrns, e
                 "STATUS": "",
                 "CONFIDENCE": "",
                 "SECTION": "",
-                "STAGE_USED": "historical_preop",
+                "STAGE_USED": "stable_preop",
                 "WINDOW_USED": "preop_any",
                 "ANCHOR_TYPE": anchor.get("anchor_type", ""),
                 "ANCHOR_DATE": anchor.get("anchor_date", ""),
                 "EVIDENCE": "extract_smoking failed: {0}".format(repr(e))
             })
+
+        try:
+            pooled_candidates.extend(fallback_extract_smoking_from_full_note(row, recon_dt))
+        except Exception as e:
+            evidence_rows.append({
+                MERGE_KEY: mrn,
+                "NOTE_ID": row["NOTE_ID"],
+                "NOTE_DATE": row["NOTE_DATE"],
+                "NOTE_TYPE": row["NOTE_TYPE"],
+                "FIELD": "EXTRACTOR_ERROR",
+                "VALUE": "",
+                "STATUS": "",
+                "CONFIDENCE": "",
+                "SECTION": "",
+                "STAGE_USED": "stable_preop",
+                "WINDOW_USED": "preop_any",
+                "ANCHOR_TYPE": anchor.get("anchor_type", ""),
+                "ANCHOR_DATE": anchor.get("anchor_date", ""),
+                "EVIDENCE": "fallback_extract_smoking_from_full_note failed: {0}".format(repr(e))
+            })
+
+        try:
+            pooled_candidates.extend(extract_structured_override_candidates_from_note(row))
+        except Exception as e:
+            evidence_rows.append({
+                MERGE_KEY: mrn,
+                "NOTE_ID": row["NOTE_ID"],
+                "NOTE_DATE": row["NOTE_DATE"],
+                "NOTE_TYPE": row["NOTE_TYPE"],
+                "FIELD": "EXTRACTOR_ERROR",
+                "VALUE": "",
+                "STATUS": "",
+                "CONFIDENCE": "",
+                "SECTION": "",
+                "STAGE_USED": "stable_preop",
+                "WINDOW_USED": "preop_any",
+                "ANCHOR_TYPE": anchor.get("anchor_type", ""),
+                "ANCHOR_DATE": anchor.get("anchor_date", ""),
+                "EVIDENCE": "extract_structured_override_candidates_from_note failed: {0}".format(repr(e))
+            })
+
+        if not pooled_candidates:
             continue
 
-        if not candidates:
-            continue
-
-        hist_candidates = []
-        for c in candidates:
+        stable_candidates = []
+        for c in pooled_candidates:
             val = clean_cell(getattr(c, "value", ""))
-            status = clean_cell(getattr(c, "status", "")).lower()
-            conf = safe_float(getattr(c, "confidence", 0.0), 0.0)
+            if val not in {"Former", "Never"}:
+                continue
+            if is_smokeless_only_never(c):
+                continue
+            stable_candidates.append(c)
 
-            # Strong historical fix:
-            # keep all Current, but only allow Former/Never if evidence is strong.
-            if val == "Current":
-                hist_candidates.append(c)
-            elif conf >= 0.95:
-                hist_candidates.append(c)
-            elif status.startswith("override_") or status.startswith("fallback_structured_"):
-                hist_candidates.append(c)
-
-        if not hist_candidates:
+        if not stable_candidates:
             continue
 
         notes_with_any_candidate.add(mrn)
 
-        for c in hist_candidates:
+        for c in stable_candidates:
             note_day_diff = days_between(parse_date_safe(getattr(c, "note_date", "")), recon_dt)
             evid = (
                 "{0} | SMOKING_RECON_DATE={1} | SMOKING_NOTE_DAY_DIFF={2} | "
@@ -1709,7 +1856,7 @@ def collect_smoking_historical_candidates(notes_df, anchor_map, eligible_mrns, e
                 "STATUS": getattr(c, "status", ""),
                 "CONFIDENCE": getattr(c, "confidence", ""),
                 "SECTION": getattr(c, "section", ""),
-                "STAGE_USED": "historical_preop",
+                "STAGE_USED": "stable_preop",
                 "WINDOW_USED": "preop_any",
                 "ANCHOR_TYPE": anchor.get("anchor_type", ""),
                 "ANCHOR_DATE": anchor.get("anchor_date", ""),
@@ -1717,10 +1864,14 @@ def collect_smoking_historical_candidates(notes_df, anchor_map, eligible_mrns, e
             })
 
             existing = best_by_mrn.get(mrn)
-            best_by_mrn[mrn] = choose_best_smoking_candidate(existing, c, recon_dt, row.get("SOURCE_FILE", ""))
+            best_by_mrn[mrn] = choose_best_stable_smoking_candidate(existing, c, recon_dt, row.get("SOURCE_FILE", ""))
 
     return best_by_mrn, notes_with_any_candidate, evidence_rows
 
+
+# -----------------------
+# Final unresolved fallback
+# -----------------------
 def collect_smoking_unresolved_fallback(notes_df, anchor_map, eligible_mrns, evidence_rows):
     best_by_mrn = {}
     notes_with_any_candidate = set()
@@ -1772,6 +1923,9 @@ def collect_smoking_unresolved_fallback(notes_df, anchor_map, eligible_mrns, evi
         notes_with_any_candidate.add(mrn)
 
         for c in candidates:
+            if is_smokeless_only_never(c):
+                continue
+
             note_day_diff = days_between(parse_date_safe(getattr(c, "note_date", "")), recon_dt)
             evid = (
                 "{0} | SMOKING_RECON_DATE={1} | SMOKING_NOTE_DAY_DIFF={2} | "
@@ -1804,7 +1958,7 @@ def collect_smoking_unresolved_fallback(notes_df, anchor_map, eligible_mrns, evi
             })
 
             existing = best_by_mrn.get(mrn)
-            best_by_mrn[mrn] = choose_best_smoking_candidate(existing, c, recon_dt, row.get("SOURCE_FILE", ""))
+            best_by_mrn[mrn] = choose_best_stable_smoking_candidate(existing, c, recon_dt, row.get("SOURCE_FILE", ""))
 
     return best_by_mrn, notes_with_any_candidate, evidence_rows
 
@@ -1949,17 +2103,17 @@ def main():
         if mrn not in final_best_smoking:
             final_best_smoking[mrn] = cand
 
-    smoke_hist_mrns = set([m for m in anchor_map.keys() if m not in final_best_smoking])
-    print("Stage 4: searching SmokingStatus in any note on or before reconstruction date...")
-    print("Eligible MRNs: {0}".format(len(smoke_hist_mrns)))
-    smoke_best_hist, smoke_found_hist, evidence_rows = collect_smoking_historical_candidates(
+    smoke_stable_mrns = set([m for m in anchor_map.keys() if m not in final_best_smoking])
+    print("Stage 4: searching stable SmokingStatus (Former/Never) in any pre-recon note...")
+    print("Eligible MRNs: {0}".format(len(smoke_stable_mrns)))
+    smoke_best_stable, smoke_found_stable, evidence_rows = collect_smoking_stable_status_candidates(
         notes_df=notes_df,
         anchor_map=anchor_map,
-        eligible_mrns=smoke_hist_mrns,
+        eligible_mrns=smoke_stable_mrns,
         evidence_rows=evidence_rows
     )
-    print("MRNs with any SmokingStatus candidate in historical preop notes: {0}".format(len(smoke_found_hist)))
-    for mrn, cand in smoke_best_hist.items():
+    print("MRNs with any stable SmokingStatus candidate in preop notes: {0}".format(len(smoke_found_stable)))
+    for mrn, cand in smoke_best_stable.items():
         if mrn not in final_best_smoking:
             final_best_smoking[mrn] = cand
 
@@ -1977,12 +2131,14 @@ def main():
         if mrn not in final_best_smoking:
             final_best_smoking[mrn] = cand
 
-    print("Stage 6: patient-level structured smoking override...")
+    smoke_override_mrns = set([m for m in anchor_map.keys() if m not in final_best_smoking])
+    print("Stage 6: patient-level structured smoking override ONLY for still-unresolved MRNs...")
     final_best_smoking, evidence_rows, override_count = run_patient_level_structured_smoking_override(
         notes_df=notes_df,
         anchor_map=anchor_map,
         final_best_smoking=final_best_smoking,
-        evidence_rows=evidence_rows
+        evidence_rows=evidence_rows,
+        eligible_mrns=smoke_override_mrns
     )
     print("MRNs overridden by patient-level structured smoking logic: {0}".format(override_count))
 
