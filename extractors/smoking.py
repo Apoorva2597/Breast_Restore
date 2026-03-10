@@ -323,8 +323,7 @@ def extract_smoking(note: SectionedNote) -> List[Candidate]:
         return []
 
     def sort_key(c):
-        # current > former/never when explicit smoking is documented in same note
-        value_priority = 0 if c.value == "Current" else 1 if c.value == "Former" else 2
+        value_priority = 0 if c.value == "Former" else 1 if c.value == "Current" else 2
         return (
             value_priority,
             _section_priority(c.section),
