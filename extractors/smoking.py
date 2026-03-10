@@ -54,6 +54,7 @@ CURRENT_PATTERNS = [
     re.compile(r"\btrying to quit\b[^\.]{0,100}\b(?:smok|cigarette|tobacco)\b", re.IGNORECASE),
     re.compile(r"\bcomment\s*[:\-]?\s*states?\s+she\s+smokes?\b", re.IGNORECASE),
     re.compile(r"\bsmokes?\s+every\s+once\s+in\s+a\s+while\b", re.IGNORECASE),
+    re.compile(r"\bsmokes?\s+every\s+once\s+in\s+a\s+while\s+currently\b", re.IGNORECASE),
     re.compile(r"\btobacco use\s*[:\-]?\s*current\b", re.IGNORECASE),
 ]
 
@@ -65,6 +66,10 @@ FORMER_PATTERNS = [
     re.compile(r"\bformer user\b", re.IGNORECASE),
     re.compile(r"\bquit smoking about\s+[0-9]+(?:\.\d+)?\s+years?\s+ago\b", re.IGNORECASE),
     re.compile(r"\breports?\s+(?:she|he)\s+quit\s+smoking\b", re.IGNORECASE),
+    re.compile(r"\bformer smoker who quit in [A-Za-z]+\s+(?:19|20)\d{2}\b", re.IGNORECASE),
+    re.compile(r"\bremote history of tobacco use\b", re.IGNORECASE),
+    re.compile(r"\bquit as a teenager\b", re.IGNORECASE),
+    re.compile(r"\bquit in [A-Za-z]+\s+(?:19|20)\d{2}\b", re.IGNORECASE),
 ]
 
 NEVER_PATTERNS = [
@@ -81,14 +86,21 @@ NEVER_PATTERNS = [
     re.compile(r"\bsmokeless tobacco\s*[:\-]?\s*never used\b", re.IGNORECASE),
     re.compile(r"\btobacco use\s*[:\-]?\s*never\b", re.IGNORECASE),
     re.compile(r"\bdenies use of tobacco products\b", re.IGNORECASE),
+    re.compile(r"\bdenies use of tobacco\b", re.IGNORECASE),
     re.compile(r"\bdoes not smoke\b", re.IGNORECASE),
     re.compile(r"\bno smoking\b", re.IGNORECASE),
     re.compile(r"\bdoes not smoke or use nicotine\b", re.IGNORECASE),
     re.compile(r"\bdoes not drink alcohol or smoke\b", re.IGNORECASE),
     re.compile(r"\bdoes not drink alcohol or use tobacco\b", re.IGNORECASE),
     re.compile(r"\bdenied the use of tobacco\b", re.IGNORECASE),
+    re.compile(r"\bdenies tobacco or drug use\b", re.IGNORECASE),
+    re.compile(r"\bdenies tobacco or alcohol use\b", re.IGNORECASE),
     re.compile(r"\bdenied the use of tobacco,\s*alcohol\s*or\s*illicit drug use\b", re.IGNORECASE),
     re.compile(r"\bdenies use of tobacco,\s*alcohol\s*or\s*recreational drug use\b", re.IGNORECASE),
+    re.compile(r"\bdenies use of tobacco,\s*alcohol\s*or\s*illicit drug use\b", re.IGNORECASE),
+    re.compile(r"\bno history of tobacco\b", re.IGNORECASE),
+    re.compile(r"\bno history of tobacco use\b", re.IGNORECASE),
+    re.compile(r"\bpassive smoke exposure\s*[-:]\s*never smoker\b", re.IGNORECASE),
 ]
 
 SCREENING_NEVER_PATTERNS = [
@@ -183,6 +195,16 @@ NEGATED_CURRENT_CONTEXT = re.compile(
     re.IGNORECASE
 )
 
+COUNSELING_ONLY_PATTERN = re.compile(
+    r"\b(avoid tobacco use|avoid smoking|encouraged to avoid tobacco use|counseled to avoid tobacco use)\b",
+    re.IGNORECASE
+)
+
+PASSIVE_SMOKE_PATTERN = re.compile(
+    r"\bpassive smoke exposure\b",
+    re.IGNORECASE
+)
+
 FAMILY_HISTORY_PATTERN = re.compile(
     r"\bfamily history\b|\bmother\b|\bfather\b|\bgrandmother\b|\bgrandfather\b|\baunt\b|\buncle\b|\bsister\b|\bbrother\b",
     re.IGNORECASE
@@ -200,6 +222,10 @@ PREFERRED_SECTIONS = {
     "SUBSTANCE AND SEXUAL ACTIVITY",
     "TOBACCO USE",
     "SOCIAL HISTORY/TOBACCO USE",
+    "SOCIAL HISTORY MAIN TOPICS",
+    "SOCIAL & SUBSTANCE USE HISTORY",
+    "SOCIAL & SUBSTANCE USE TOPICS",
+    "SUBSTANCE USE TOPICS",
 }
 
 SUPPRESS_SECTIONS = {
@@ -302,6 +328,14 @@ def _section_priority(section_name):
         return 1
     if s == "SOCIAL HISTORY/TOBACCO USE":
         return 1
+    if s == "SOCIAL HISTORY MAIN TOPICS":
+        return 1
+    if s == "SOCIAL & SUBSTANCE USE HISTORY":
+        return 1
+    if s == "SOCIAL & SUBSTANCE USE TOPICS":
+        return 2
+    if s == "SUBSTANCE USE TOPICS":
+        return 2
     if s == "SUBSTANCE AND SEXUAL ACTIVITY":
         return 2
     if s == "HISTORY":
@@ -332,38 +366,39 @@ def _evidence_priority(cand):
     return 9
 
 
+def _local_context(text, start, end, pad=180):
+    left = max(0, start - pad)
+    right = min(len(text), end + pad)
+    return text[left:right]
+
+
 def _is_family_history_context(text, start, end):
-    left = max(0, start - 180)
-    right = min(len(text), end + 180)
-    ctx = text[left:right]
+    ctx = _local_context(text, start, end, 180)
     return FAMILY_HISTORY_PATTERN.search(ctx) is not None
 
 
 def _is_questionnaire_quit_context(text, start, end):
-    left = max(0, start - 200)
-    right = min(len(text), end + 200)
-    ctx = text[left:right]
+    ctx = _local_context(text, start, end, 200)
     return QUESTIONNAIRE_QUIT_PATTERN.search(ctx) is not None
 
 
 def _is_questionnaire_false_current_context(text, start, end):
-    left = max(0, start - 220)
-    right = min(len(text), end + 220)
-    ctx = text[left:right]
+    ctx = _local_context(text, start, end, 220)
     return QUESTIONNAIRE_FALSE_CURRENT_PATTERN.search(ctx) is not None
 
 
 def _is_negated_current_context(text, start, end):
-    left = max(0, start - 160)
-    right = min(len(text), end + 160)
-    ctx = text[left:right]
+    ctx = _local_context(text, start, end, 160)
     return NEGATED_CURRENT_CONTEXT.search(ctx) is not None
 
 
+def _is_counseling_only_context(text, start, end):
+    ctx = _local_context(text, start, end, 160)
+    return COUNSELING_ONLY_PATTERN.search(ctx) is not None
+
+
 def _has_only_pack_history_context(text, start, end):
-    left = max(0, start - 120)
-    right = min(len(text), end + 120)
-    ctx = text[left:right]
+    ctx = _local_context(text, start, end, 120)
     return PACK_HISTORY_PATTERN.search(ctx) is not None
 
 
@@ -372,11 +407,20 @@ def _add_candidates_from_patterns(patterns, text, note, section, value, confiden
         for m in rx.finditer(text):
             if suppress_family and _is_family_history_context(text, m.start(), m.end()):
                 continue
+
+            if _is_counseling_only_context(text, m.start(), m.end()):
+                continue
+
+            if PASSIVE_SMOKE_PATTERN.search(_local_context(text, m.start(), m.end(), 120)) is not None:
+                if value == "Current":
+                    continue
+
             if value == "Current":
                 if _is_questionnaire_false_current_context(text, m.start(), m.end()):
                     continue
                 if _is_negated_current_context(text, m.start(), m.end()):
                     continue
+
             out_list.append(_candidate(note, section, value, text, m.start(), m.end(), confidence, source_type))
 
 
@@ -480,9 +524,7 @@ def _find_generic_quit_candidates(text, note, section, out_list):
         if _is_questionnaire_quit_context(text, m.start(), m.end()):
             continue
 
-        left = max(0, m.start() - 160)
-        right = min(len(text), m.end() + 160)
-        ctx = text[left:right]
+        ctx = _local_context(text, m.start(), m.end(), 160)
 
         if re.search(r"\b(recently|since last visit|last visit|today|this week)\b", ctx, re.IGNORECASE):
             out_list.append(_candidate(note, section, "Current", text, m.start(), m.end(), 0.91, "computed_recent_quit"))
@@ -552,7 +594,7 @@ def _find_structured_tobacco_block_candidates(text, note, section, out_list):
 def _find_quantified_current_candidates(text, note, section, out_list):
     patterns = [
         re.compile(r"\bpacks?/day\s*[:\-]?\s*[0-9]+(?:\.[0-9]+)?\b", re.IGNORECASE),
-        re.compile(r"\b[0-9]+(?:\.[0-9]+)?\s*pack[- ]years?\b", re.IGNORECASE),
+        re.compile(r"\b[0-9]+(?:\.\d+)?\s*pack[- ]years?\b", re.IGNORECASE),
         re.compile(r"\btypes?\s*:\s*cigarettes\b", re.IGNORECASE),
     ]
 
@@ -560,9 +602,7 @@ def _find_quantified_current_candidates(text, note, section, out_list):
         for m in rx.finditer(text):
             if _is_family_history_context(text, m.start(), m.end()):
                 continue
-            left = max(0, m.start() - 180)
-            right = min(len(text), m.end() + 180)
-            ctx = text[left:right]
+            ctx = _local_context(text, m.start(), m.end(), 180)
 
             if re.search(r"\bnever smoker\b", ctx, re.IGNORECASE):
                 continue
