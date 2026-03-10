@@ -917,6 +917,11 @@ def main():
     if "SmokingStatus" not in master.columns:
         master["SmokingStatus"] = pd.NA
 
+    # IMPORTANT: clear prior updater results before writing this run
+    master["BMI"] = pd.NA
+    master["Obesity"] = pd.NA
+    master["SmokingStatus"] = pd.NA
+
     for mrn, cand in final_best_bmi.items():
         mask = (master[MERGE_KEY].astype(str).str.strip() == mrn)
         if not mask.any():
