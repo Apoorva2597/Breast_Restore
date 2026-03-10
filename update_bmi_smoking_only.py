@@ -5,14 +5,10 @@
 #
 # IMPORTANT:
 # - BMI logic is intentionally left unchanged.
-# - Smoking logic includes a final unresolved-patient fallback pass
-#   that scans full notes on/before reconstruction date for strong,
-#   repeated smoking patterns seen in QA.
-# - NEW in this revision:
-#     * stronger normalization for structured EHR smoking blocks
-#     * flexible matching across checkbox/spacing artifacts
-#     * stronger capture of Never / Former / Current in templated blocks
-#     * keeps counseling-only tobacco language suppressed
+# - Smoking logic now includes:
+#   (1) staged extractor-based search
+#   (2) unresolved-patient full-note fallback
+#   (3) final patient-level structured smoking override
 #
 # BMI logic:
 #   Stage 1: anchor day only
@@ -27,11 +23,13 @@
 #   Historical fallback:
 #       allow any note ON OR BEFORE reconstruction date
 #       and keep Current / Former / Never if extractor resolves it
-#       from quit timing or explicit evidence
 #   Final unresolved fallback:
 #       only for MRNs still unresolved after the above stages,
-#       scan full notes on/before recon date with focused high-yield
-#       smoking rules for structured EHR blocks and repeated negation phrases.
+#       scan full notes on/before reconstruction date with focused rules
+#   Final patient-level override:
+#       after all stages, scan all pre-recon notes for strongest structured
+#       smoking-status evidence and replace weaker earlier assignments only if
+#       the structured evidence is clearly stronger.
 #
 # Anchor logic:
 #   - Primary anchor from structured RECONSTRUCTION_DATE + ADMIT_DATE
@@ -194,6 +192,12 @@ def days_between(dt1, dt2):
     if dt1 is None or dt2 is None:
         return None
     return (dt1.date() - dt2.date()).days
+
+def safe_float(x, default=0.0):
+    try:
+        return float(str(x).strip())
+    except Exception:
+        return default
 
 
 # -----------------------
@@ -735,16 +739,62 @@ def note_on_or_before_recon(note_dt, recon_dt):
 # -----------------------
 # Smoking full-note unresolved fallback
 # -----------------------
-FB_NEGATED_CURRENT = re.compile(
-    r"\b(not currently smoking|no current tobacco use|not smoking currently)\b",
+FB_STRUCT_CURRENT = re.compile(
+    r"\bsmoking status\s*[:\-]?\s*(current every day smoker|current some day smoker|current smoker|current)\b",
     re.IGNORECASE
 )
-
-FB_COUNSELING_ONLY = re.compile(
-    r"\b(avoid tobacco use|avoid smoking|encouraged to avoid tobacco use|counseled to avoid tobacco use)\b",
+FB_STRUCT_FORMER = re.compile(
+    r"\bsmoking status\s*[:\-]?\s*(former smoker|former)\b",
     re.IGNORECASE
 )
-
+FB_STRUCT_NEVER = re.compile(
+    r"\bsmoking status\s*[:\-]?\s*(never smoker|never)\b",
+    re.IGNORECASE
+)
+FB_STRUCT_SMOKELESS_NEVER = re.compile(
+    r"\bsmokeless tobacco\s*[:\-]?\s*never used\b",
+    re.IGNORECASE
+)
+FB_STRUCT_COMMENT_CURRENT = re.compile(
+    r"\bcomment\s*[:\-]?\s*(?:states?\s+)?(?:she|he|pt|patient)\s+smokes?\b",
+    re.IGNORECASE
+)
+FB_CURRENT_PATTERNS = [
+    re.compile(r"\bcurrent every day smoker\b", re.IGNORECASE),
+    re.compile(r"\bcurrent some day smoker\b", re.IGNORECASE),
+    re.compile(r"\bcurrent smoker\b", re.IGNORECASE),
+    re.compile(r"\bevery day smoker\b", re.IGNORECASE),
+    re.compile(r"\bsome day smoker\b", re.IGNORECASE),
+    re.compile(r"\bsmokes?\s+every\s+once\s+in\s+a\s+while\b", re.IGNORECASE),
+    re.compile(r"\bsmokes?\s+every\s+once\s+in\s+a\s+while\s+currently\b", re.IGNORECASE),
+]
+FB_FORMER_PATTERNS = [
+    re.compile(r"\bformer smoker\b", re.IGNORECASE),
+    re.compile(r"\bex[- ]smoker\b", re.IGNORECASE),
+    re.compile(r"\bquit as a teenager\b", re.IGNORECASE),
+    re.compile(r"\bremote history of tobacco use\b", re.IGNORECASE),
+    re.compile(r"\bformer smoker who quit in [A-Za-z]+\s+(?:19|20)\d{2}\b", re.IGNORECASE),
+    re.compile(r"\bquit in [A-Za-z]+\s+(?:19|20)\d{2}\b", re.IGNORECASE),
+]
+FB_NEVER_PATTERNS = [
+    re.compile(r"\bnever smoker\b", re.IGNORECASE),
+    re.compile(r"\bnever smoked\b", re.IGNORECASE),
+    re.compile(r"\bnonsmoker\b", re.IGNORECASE),
+    re.compile(r"\bnon[- ]smoker\b", re.IGNORECASE),
+    re.compile(r"\bdoes not smoke\b", re.IGNORECASE),
+    re.compile(r"\bdoesn't smoke\b", re.IGNORECASE),
+    re.compile(r"\bdoes not smoke or use nicotine\b", re.IGNORECASE),
+    re.compile(r"\bdoesn't smoke or use nicotine\b", re.IGNORECASE),
+    re.compile(r"\bdoes not drink alcohol or smoke\b", re.IGNORECASE),
+    re.compile(r"\bdoesn't drink alcohol or smoke\b", re.IGNORECASE),
+    re.compile(r"\bdenies tobacco use\b", re.IGNORECASE),
+    re.compile(r"\bdenies tobacco or alcohol use\b", re.IGNORECASE),
+    re.compile(r"\bdenies tobacco or drug use\b", re.IGNORECASE),
+    re.compile(r"\bdenies use of tobacco products\b", re.IGNORECASE),
+    re.compile(r"\bno history of tobacco\b", re.IGNORECASE),
+    re.compile(r"\bno history of tobacco use\b", re.IGNORECASE),
+    re.compile(r"\bno smoking\b", re.IGNORECASE),
+]
 FB_QUIT_DATE = re.compile(
     r"\bquit date\s*[:\-]?\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4}|[0-9]{1,2}/[0-9]{4}|(?:19|20)[0-9]{2})\b",
     re.IGNORECASE
@@ -773,46 +823,6 @@ FB_QUIT_DAYS_AGO = re.compile(
     r"\b(?:quit|stopped)\s+(?:smoking|tobacco)\s+(?:about\s+|approximately\s+|approx\.?\s*)?([0-9]+(?:\.\d+)?)\s+days?\s+ago\b",
     re.IGNORECASE
 )
-
-FB_CURRENT_PATTERNS = [
-    re.compile(r"\bcurrent every day smoker\b", re.IGNORECASE),
-    re.compile(r"\bcurrent some day smoker\b", re.IGNORECASE),
-    re.compile(r"\bcurrent smoker\b", re.IGNORECASE),
-    re.compile(r"\bevery day smoker\b", re.IGNORECASE),
-    re.compile(r"\bsome day smoker\b", re.IGNORECASE),
-    re.compile(r"\bsmokes?\s+every\s+once\s+in\s+a\s+while\b", re.IGNORECASE),
-    re.compile(r"\bsmokes?\s+every\s+once\s+in\s+a\s+while\s+currently\b", re.IGNORECASE),
-]
-
-FB_FORMER_PATTERNS = [
-    re.compile(r"\bformer smoker\b", re.IGNORECASE),
-    re.compile(r"\bex[- ]smoker\b", re.IGNORECASE),
-    re.compile(r"\bquit as a teenager\b", re.IGNORECASE),
-    re.compile(r"\bremote history of tobacco use\b", re.IGNORECASE),
-    re.compile(r"\bformer smoker who quit in [A-Za-z]+\s+(?:19|20)\d{2}\b", re.IGNORECASE),
-    re.compile(r"\bquit in [A-Za-z]+\s+(?:19|20)\d{2}\b", re.IGNORECASE),
-]
-
-FB_NEVER_PATTERNS = [
-    re.compile(r"\bnever smoker\b", re.IGNORECASE),
-    re.compile(r"\bnever smoked\b", re.IGNORECASE),
-    re.compile(r"\bnonsmoker\b", re.IGNORECASE),
-    re.compile(r"\bnon[- ]smoker\b", re.IGNORECASE),
-    re.compile(r"\bdoes not smoke\b", re.IGNORECASE),
-    re.compile(r"\bdoesn't smoke\b", re.IGNORECASE),
-    re.compile(r"\bdoes not smoke or use nicotine\b", re.IGNORECASE),
-    re.compile(r"\bdoesn't smoke or use nicotine\b", re.IGNORECASE),
-    re.compile(r"\bdoes not drink alcohol or smoke\b", re.IGNORECASE),
-    re.compile(r"\bdoesn't drink alcohol or smoke\b", re.IGNORECASE),
-    re.compile(r"\bdenies tobacco use\b", re.IGNORECASE),
-    re.compile(r"\bdenies tobacco or alcohol use\b", re.IGNORECASE),
-    re.compile(r"\bdenies tobacco or drug use\b", re.IGNORECASE),
-    re.compile(r"\bdenies use of tobacco products\b", re.IGNORECASE),
-    re.compile(r"\bno history of tobacco\b", re.IGNORECASE),
-    re.compile(r"\bno history of tobacco use\b", re.IGNORECASE),
-    re.compile(r"\bno smoking\b", re.IGNORECASE),
-]
-
 FB_PACKS_DAY = re.compile(
     r"\bpacks?/day\s*[:\-]?\s*[0-9]+(?:\.[0-9]+)?\b",
     re.IGNORECASE
@@ -825,70 +835,18 @@ FB_TYPES_CIG = re.compile(
     r"\btypes?\s*:\s*cigarettes\b",
     re.IGNORECASE
 )
-FB_STRUCT_COMMENT_CURRENT = re.compile(
-    r"\bcomment\s*[:\-]?\s*(?:states?\s+)?(?:she|he|pt|patient)\s+smokes?\b",
-    re.IGNORECASE
-)
 FB_PASSIVE_NEVER = re.compile(
     r"\bpassive smoke exposure\s*[-:]\s*never smoker\b",
     re.IGNORECASE
 )
-
-# flexible structured block patterns on normalized text
-FB_BLOCK_CURRENT = re.compile(
-    r"\bsmoking\s+status\b.{0,80}?\b(current every day smoker|current some day smoker|current smoker|current)\b",
-    re.IGNORECASE | re.DOTALL
-)
-FB_BLOCK_FORMER = re.compile(
-    r"\bsmoking\s+status\b.{0,80}?\bformer smoker\b",
-    re.IGNORECASE | re.DOTALL
-)
-FB_BLOCK_NEVER = re.compile(
-    r"\bsmoking\s+status\b.{0,80}?\bnever smoker\b",
-    re.IGNORECASE | re.DOTALL
-)
-FB_BLOCK_SMOKELESS_NEVER = re.compile(
-    r"\bsmokeless\s+tobacco\b.{0,50}?\bnever used\b",
-    re.IGNORECASE | re.DOTALL
-)
-FB_BLOCK_NOT_ON_FILE = re.compile(
-    r"\bsmoking\s+status\b.{0,50}?\bnot on file\b",
-    re.IGNORECASE | re.DOTALL
-)
-FB_BLOCK_TOB_USE_HISTORY = re.compile(
-    r"\btobacco\s+use\b.{0,30}?\bhistory\b",
-    re.IGNORECASE | re.DOTALL
-)
-FB_BLOCK_SOCIAL_HISTORY = re.compile(
-    r"\bsocial\s+history\b",
+FB_COUNSELING_ONLY = re.compile(
+    r"\b(avoid tobacco use|avoid smoking|encouraged to avoid tobacco use|counseled to avoid tobacco use)\b",
     re.IGNORECASE
 )
-
-def normalize_for_smoking_fallback(text):
-    s = clean_cell(text)
-    if not s:
-        return ""
-
-    # common checkbox / weird separators / unicode artifacts
-    weird_chars = [
-        u"\u25a1", u"\u25a0", u"\u2610", u"\u2611", u"\u00a0",
-        u"\uf0a3", u"\uf0b7", u"\uf0d8", u"\uf0fc", u"\ufffd"
-    ]
-    for ch in weird_chars:
-        s = s.replace(ch, " ")
-
-    # normalize punctuation-ish separators
-    s = s.replace("|", " ")
-    s = s.replace("_", " ")
-    s = s.replace("—", " ")
-    s = s.replace("–", " ")
-    s = s.replace("•", " ")
-    s = s.replace("·", " ")
-
-    # collapse whitespace but keep enough continuity for block regex
-    s = re.sub(r"[\r\n\t]+", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+FB_NEGATED_CURRENT = re.compile(
+    r"\b(not currently smoking|no current tobacco use|not smoking currently)\b",
+    re.IGNORECASE
+)
 
 def _parse_quit_date_fallback(raw):
     s = clean_cell(raw)
@@ -944,23 +902,15 @@ def _find_first(rx, text):
         return None
 
 def fallback_extract_smoking_from_full_note(row, recon_dt):
-    raw_text = clean_cell(row.get("NOTE_TEXT", ""))
-    if not raw_text:
-        return []
-
-    note_dt = parse_date_safe(row.get("NOTE_DATE", ""))
-    text = normalize_for_smoking_fallback(raw_text)
+    text = clean_cell(row.get("NOTE_TEXT", ""))
     if not text:
         return []
 
+    note_dt = parse_date_safe(row.get("NOTE_DATE", ""))
     candidates = []
     full_section = "FULL_NOTE_FALLBACK"
 
-    # keep counseling-only phrases from firing Never by themselves
-    counseling_only = FB_COUNSELING_ONLY.search(text) is not None
-
-    # 1. strongest structured current
-    m = _find_first(FB_BLOCK_CURRENT, text)
+    m = _find_first(FB_STRUCT_CURRENT, text)
     if m is not None:
         ctx = _fb_window(text, m.start(), m.end(), 150)
         if FB_NEGATED_CURRENT.search(ctx) is None:
@@ -968,8 +918,7 @@ def fallback_extract_smoking_from_full_note(row, recon_dt):
                 row, full_section, "Current", text, m.start(), m.end(), 0.999, "fallback_structured_current"
             ))
 
-    # 2. strongest structured former
-    m = _find_first(FB_BLOCK_FORMER, text)
+    m = _find_first(FB_STRUCT_FORMER, text)
     if m is not None:
         quit_m = _find_first(FB_QUIT_DATE, text)
         last_m = _find_first(FB_LAST_ATTEMPT, text)
@@ -987,6 +936,10 @@ def fallback_extract_smoking_from_full_note(row, recon_dt):
                     candidates.append(_make_fallback_smoking_candidate(
                         row, full_section, "Former", text, m.start(), m.end(), 0.998, "fallback_structured_former"
                     ))
+                else:
+                    candidates.append(_make_fallback_smoking_candidate(
+                        row, full_section, "Former", text, m.start(), m.end(), 0.992, "fallback_structured_former"
+                    ))
             else:
                 candidates.append(_make_fallback_smoking_candidate(
                     row, full_section, "Former", text, m.start(), m.end(), 0.992, "fallback_structured_former"
@@ -1003,16 +956,17 @@ def fallback_extract_smoking_from_full_note(row, recon_dt):
                     candidates.append(_make_fallback_smoking_candidate(
                         row, full_section, "Former", text, m.start(), m.end(), 0.998, "fallback_structured_former"
                     ))
+                else:
+                    candidates.append(_make_fallback_smoking_candidate(
+                        row, full_section, "Former", text, m.start(), m.end(), 0.992, "fallback_structured_former"
+                    ))
             else:
                 candidates.append(_make_fallback_smoking_candidate(
                     row, full_section, "Former", text, m.start(), m.end(), 0.992, "fallback_structured_former"
                 ))
         elif years_m is not None:
-            try:
-                yrs = float(years_m.group(1))
-            except Exception:
-                yrs = None
-            if yrs is not None and yrs < 0.25:
+            yrs = float(years_m.group(1))
+            if yrs < 0.25:
                 candidates.append(_make_fallback_smoking_candidate(
                     row, full_section, "Current", text, years_m.start(), years_m.end(), 0.997, "fallback_recent_quit_current"
                 ))
@@ -1025,29 +979,18 @@ def fallback_extract_smoking_from_full_note(row, recon_dt):
                 row, full_section, "Former", text, m.start(), m.end(), 0.992, "fallback_structured_former"
             ))
 
-    # 3. strongest structured never
-    m_never = _find_first(FB_BLOCK_NEVER, text)
-    m_smokeless = _find_first(FB_BLOCK_SMOKELESS_NEVER, text)
-    m_not_on_file = _find_first(FB_BLOCK_NOT_ON_FILE, text)
-
-    if m_never is not None:
+    m = _find_first(FB_STRUCT_NEVER, text)
+    if m is not None:
         candidates.append(_make_fallback_smoking_candidate(
-            row, full_section, "Never", text, m_never.start(), m_never.end(), 0.996, "fallback_structured_never"
+            row, full_section, "Never", text, m.start(), m.end(), 0.996, "fallback_structured_never"
         ))
 
-    if _find_first(FB_PASSIVE_NEVER, text) is not None:
-        mm = _find_first(FB_PASSIVE_NEVER, text)
+    m = _find_first(FB_PASSIVE_NEVER, text)
+    if m is not None:
         candidates.append(_make_fallback_smoking_candidate(
-            row, full_section, "Never", text, mm.start(), mm.end(), 0.995, "fallback_structured_never"
+            row, full_section, "Never", text, m.start(), m.end(), 0.995, "fallback_structured_never"
         ))
 
-    # Never only from smokeless-never if paired with Never Smoker or strong narrative never.
-    if m_smokeless is not None and m_never is not None:
-        candidates.append(_make_fallback_smoking_candidate(
-            row, full_section, "Never", text, m_smokeless.start(), m_smokeless.end(), 0.992, "fallback_structured_never"
-        ))
-
-    # 4. structured current comment / quantified current
     m = _find_first(FB_STRUCT_COMMENT_CURRENT, text)
     if m is not None:
         candidates.append(_make_fallback_smoking_candidate(
@@ -1061,7 +1004,6 @@ def fallback_extract_smoking_from_full_note(row, recon_dt):
             current_hits.append(mm)
 
     pack_m = _find_first(FB_PACKS_DAY, text)
-    packyr_m = _find_first(FB_PACK_YEARS, text)
     types_m = _find_first(FB_TYPES_CIG, text)
 
     if current_hits:
@@ -1069,13 +1011,11 @@ def fallback_extract_smoking_from_full_note(row, recon_dt):
         candidates.append(_make_fallback_smoking_candidate(
             row, full_section, "Current", text, mm.start(), mm.end(), 0.993, "fallback_current_narrative"
         ))
-    elif pack_m is not None and (types_m is not None or packyr_m is not None) and m_never is None:
-        # allow quantified current unless a stronger Never block exists
+    elif pack_m is not None and types_m is not None and _find_first(FB_STRUCT_FORMER, text) is None and _find_first(FB_STRUCT_NEVER, text) is None:
         candidates.append(_make_fallback_smoking_candidate(
             row, full_section, "Current", text, pack_m.start(), pack_m.end(), 0.988, "fallback_quantified_current"
         ))
 
-    # 5. former from explicit former patterns or quit timing
     for rx in FB_FORMER_PATTERNS:
         mm = _find_first(rx, text)
         if mm is not None:
@@ -1119,30 +1059,20 @@ def fallback_extract_smoking_from_full_note(row, recon_dt):
             ))
         break
 
-    # 6. Never from narrative negation families
-    if not counseling_only:
+    if FB_COUNSELING_ONLY.search(text) is None:
         for rx in FB_NEVER_PATTERNS:
             mm = _find_first(rx, text)
             if mm is not None:
-                # suppress if there is explicit Former block in same note
-                if m is None and m_never is None:
-                    if _find_first(FB_BLOCK_FORMER, text) is None and _find_first(FB_STRUCT_COMMENT_CURRENT, text) is None:
-                        candidates.append(_make_fallback_smoking_candidate(
-                            row, full_section, "Never", text, mm.start(), mm.end(), 0.985, "fallback_never"
-                        ))
-                else:
-                    # allow never narrative only if no explicit Former
-                    if _find_first(FB_BLOCK_FORMER, text) is None:
-                        candidates.append(_make_fallback_smoking_candidate(
-                            row, full_section, "Never", text, mm.start(), mm.end(), 0.985, "fallback_never"
-                        ))
+                candidates.append(_make_fallback_smoking_candidate(
+                    row, full_section, "Never", text, mm.start(), mm.end(), 0.985, "fallback_never"
+                ))
                 break
 
-    # 7. structured "not on file" should not produce a status by itself
-    # but if paired with strong Never narrative, keep that narrative only.
-    if m_not_on_file is not None and m_never is None and _find_first(FB_BLOCK_FORMER, text) is None and _find_first(FB_BLOCK_CURRENT, text) is None:
-        # no action; explicit "not on file" should not generate status
-        pass
+    if _find_first(FB_STRUCT_SMOKELESS_NEVER, text) is not None and _find_first(FB_STRUCT_NEVER, text) is not None:
+        mm = _find_first(FB_STRUCT_SMOKELESS_NEVER, text)
+        candidates.append(_make_fallback_smoking_candidate(
+            row, full_section, "Never", text, mm.start(), mm.end(), 0.992, "fallback_structured_never"
+        ))
 
     if not candidates:
         return []
@@ -1176,6 +1106,302 @@ def fallback_extract_smoking_from_full_note(row, recon_dt):
 
     best = sorted(candidates, key=fb_rank)[0]
     return [best]
+
+
+# -----------------------
+# Final patient-level structured override
+# -----------------------
+OVR_STRUCT_CURRENT = re.compile(
+    r"\bsmoking status\s*[:\-]?\s*(current every day smoker|current some day smoker|current smoker|current)\b",
+    re.IGNORECASE
+)
+OVR_STRUCT_FORMER = re.compile(
+    r"\bsmoking status\s*[:\-]?\s*(former smoker|former)\b",
+    re.IGNORECASE
+)
+OVR_STRUCT_NEVER = re.compile(
+    r"\bsmoking status\s*[:\-]?\s*(never smoker|never)\b",
+    re.IGNORECASE
+)
+OVR_SMOKELESS_NEVER = re.compile(
+    r"\bsmokeless tobacco\s*[:\-]?\s*never used\b",
+    re.IGNORECASE
+)
+OVR_QUIT_DATE = FB_QUIT_DATE
+OVR_LAST_ATTEMPT = FB_LAST_ATTEMPT
+OVR_YEARS_SINCE = FB_YEARS_SINCE
+OVR_COMMENT_CURRENT = re.compile(
+    r"\bcomment\s*[:\-]?\s*(?:states?\s+)?(?:she|he|pt|patient)\s+smokes?\b",
+    re.IGNORECASE
+)
+OVR_PACKS_DAY = FB_PACKS_DAY
+OVR_TYPES_CIG = FB_TYPES_CIG
+
+def build_override_candidate(row, value, status, confidence, start, end):
+    class Obj(object):
+        pass
+    o = Obj()
+    o.field = "SmokingStatus"
+    o.value = value
+    o.status = status
+    o.section = "PATIENT_LEVEL_STRUCTURED_OVERRIDE"
+    o.note_type = clean_cell(row.get("NOTE_TYPE", ""))
+    o.note_id = clean_cell(row.get("NOTE_ID", ""))
+    o.note_date = clean_cell(row.get("NOTE_DATE", ""))
+    text = clean_cell(row.get("NOTE_TEXT", ""))
+    left = max(0, start - 180)
+    right = min(len(text), end + 180)
+    o.evidence = text[left:right].replace("\n", " ").replace("\r", " ").strip()
+    o.confidence = confidence
+    return o
+
+def extract_structured_override_candidates_from_note(row):
+    text = clean_cell(row.get("NOTE_TEXT", ""))
+    if not text:
+        return []
+
+    note_dt = parse_date_safe(row.get("NOTE_DATE", ""))
+    cands = []
+
+    m_cur = OVR_STRUCT_CURRENT.search(text)
+    if m_cur is not None:
+        cands.append(build_override_candidate(
+            row, "Current", "override_structured_current", 1.000, m_cur.start(), m_cur.end()
+        ))
+
+    m_for = OVR_STRUCT_FORMER.search(text)
+    if m_for is not None:
+        quit_m = OVR_QUIT_DATE.search(text)
+        last_m = OVR_LAST_ATTEMPT.search(text)
+        years_m = OVR_YEARS_SINCE.search(text)
+
+        if quit_m is not None:
+            quit_dt = _parse_quit_date_fallback(quit_m.group(1))
+            if note_dt is not None and quit_dt is not None:
+                dd = days_between(note_dt, quit_dt)
+                if dd is not None and dd >= 0 and dd <= 90:
+                    cands.append(build_override_candidate(
+                        row, "Current", "override_recent_quit_current", 0.999, quit_m.start(), quit_m.end()
+                    ))
+                else:
+                    cands.append(build_override_candidate(
+                        row, "Former", "override_structured_former", 0.999, m_for.start(), m_for.end()
+                    ))
+            else:
+                cands.append(build_override_candidate(
+                    row, "Former", "override_structured_former", 0.997, m_for.start(), m_for.end()
+                ))
+        elif last_m is not None:
+            quit_dt = _parse_quit_date_fallback(last_m.group(1))
+            if note_dt is not None and quit_dt is not None:
+                dd = days_between(note_dt, quit_dt)
+                if dd is not None and dd >= 0 and dd <= 90:
+                    cands.append(build_override_candidate(
+                        row, "Current", "override_recent_quit_current", 0.999, last_m.start(), last_m.end()
+                    ))
+                else:
+                    cands.append(build_override_candidate(
+                        row, "Former", "override_structured_former", 0.999, m_for.start(), m_for.end()
+                    ))
+            else:
+                cands.append(build_override_candidate(
+                    row, "Former", "override_structured_former", 0.997, m_for.start(), m_for.end()
+                ))
+        elif years_m is not None:
+            yrs = safe_float(years_m.group(1), default=999.0)
+            if yrs < 0.25:
+                cands.append(build_override_candidate(
+                    row, "Current", "override_recent_quit_current", 0.998, years_m.start(), years_m.end()
+                ))
+            else:
+                cands.append(build_override_candidate(
+                    row, "Former", "override_structured_former", 0.998, m_for.start(), m_for.end()
+                ))
+        else:
+            cands.append(build_override_candidate(
+                row, "Former", "override_structured_former", 0.997, m_for.start(), m_for.end()
+            ))
+
+    m_nev = OVR_STRUCT_NEVER.search(text)
+    if m_nev is not None:
+        cands.append(build_override_candidate(
+            row, "Never", "override_structured_never", 0.997, m_nev.start(), m_nev.end()
+        ))
+
+    m_smokeless = OVR_SMOKELESS_NEVER.search(text)
+    if m_smokeless is not None and m_nev is not None:
+        cands.append(build_override_candidate(
+            row, "Never", "override_structured_never", 0.996, m_smokeless.start(), m_smokeless.end()
+        ))
+
+    m_comment = OVR_COMMENT_CURRENT.search(text)
+    if m_comment is not None:
+        cands.append(build_override_candidate(
+            row, "Current", "override_structured_current", 0.996, m_comment.start(), m_comment.end()
+        ))
+
+    if m_cur is None and m_for is None and m_nev is None:
+        if OVR_PACKS_DAY.search(text) is not None and OVR_TYPES_CIG.search(text) is not None:
+            m_pack = OVR_PACKS_DAY.search(text)
+            cands.append(build_override_candidate(
+                row, "Current", "override_quantified_current", 0.992, m_pack.start(), m_pack.end()
+            ))
+
+    return cands
+
+def override_status_priority(status):
+    s = clean_cell(status)
+    if s == "override_structured_current":
+        return 0
+    if s == "override_recent_quit_current":
+        return 1
+    if s == "override_quantified_current":
+        return 2
+    if s == "override_structured_former":
+        return 3
+    if s == "override_structured_never":
+        return 4
+    return 99
+
+def choose_best_override_candidate(existing, new):
+    if existing is None:
+        return new
+
+    ex_dt = parse_date_safe(getattr(existing, "note_date", ""))
+    nw_dt = parse_date_safe(getattr(new, "note_date", ""))
+
+    ex_tuple = (
+        override_status_priority(getattr(existing, "status", "")),
+        -safe_float(getattr(existing, "confidence", 0.0), 0.0),
+        ex_dt if ex_dt is not None else datetime(1900, 1, 1)
+    )
+    nw_tuple = (
+        override_status_priority(getattr(new, "status", "")),
+        -safe_float(getattr(new, "confidence", 0.0), 0.0),
+        nw_dt if nw_dt is not None else datetime(1900, 1, 1)
+    )
+
+    if nw_tuple > ex_tuple:
+        return existing
+    return new
+
+def should_apply_patient_override(existing, override):
+    if existing is None:
+        return True
+
+    ex_val = clean_cell(getattr(existing, "value", ""))
+    ov_val = clean_cell(getattr(override, "value", ""))
+
+    ex_status = clean_cell(getattr(existing, "status", ""))
+    ov_status = clean_cell(getattr(override, "status", ""))
+
+    ex_conf = safe_float(getattr(existing, "confidence", 0.0), 0.0)
+    ov_conf = safe_float(getattr(override, "confidence", 0.0), 0.0)
+
+    # Always allow override if existing is weak fallback or unresolved-ish
+    weak_prefixes = (
+        "fallback_",
+    )
+    if ex_status.startswith(weak_prefixes):
+        return True
+
+    # Allow strong structured override when it conflicts with weaker historical selection
+    if ov_status in {"override_structured_current", "override_recent_quit_current"}:
+        if ex_val != "Current" and ov_conf >= ex_conf:
+            return True
+
+    if ov_status == "override_structured_former":
+        if ex_val == "Never":
+            return True
+        if ex_val == "Current" and ex_status in {"fallback_current_narrative", "fallback_quantified_current", "computed"}:
+            return True
+        if ex_conf < 0.995:
+            return True
+
+    if ov_status == "override_structured_never":
+        if ex_val == "Former" and ex_status in {"computed", "fallback_former", "fallback_structured_former"}:
+            return True
+        if ex_conf < 0.995:
+            return True
+
+    return False
+
+def run_patient_level_structured_smoking_override(notes_df, anchor_map, final_best_smoking, evidence_rows):
+    mrns = sorted(set(anchor_map.keys()).intersection(set(notes_df[MERGE_KEY].astype(str).str.strip().tolist())))
+
+    override_count = 0
+
+    for mrn in mrns:
+        anchor = anchor_map.get(mrn)
+        if anchor is None:
+            continue
+
+        recon_dt = parse_date_safe(anchor.get("recon_date", ""))
+        if recon_dt is None:
+            continue
+
+        patient_notes = notes_df[notes_df[MERGE_KEY].astype(str).str.strip() == mrn].copy()
+        if len(patient_notes) == 0:
+            continue
+
+        best_override = None
+
+        for _, row in patient_notes.iterrows():
+            note_dt = parse_date_safe(row.get("NOTE_DATE", ""))
+            if note_dt is None:
+                continue
+            if not note_on_or_before_recon(note_dt, recon_dt):
+                continue
+
+            candidates = extract_structured_override_candidates_from_note(row)
+            if not candidates:
+                continue
+
+            for c in candidates:
+                best_override = choose_best_override_candidate(best_override, c)
+
+        if best_override is None:
+            continue
+
+        existing = final_best_smoking.get(mrn)
+        if not should_apply_patient_override(existing, best_override):
+            continue
+
+        final_best_smoking[mrn] = best_override
+        override_count += 1
+
+        note_day_diff = days_between(parse_date_safe(getattr(best_override, "note_date", "")), recon_dt)
+        evid = (
+            "{0} | SMOKING_RECON_DATE={1} | SMOKING_NOTE_DAY_DIFF={2} | "
+            "ANCHOR_TYPE={3} | ANCHOR_SOURCE={4} | ANCHOR_CPT={5} | ANCHOR_PROCEDURE={6}"
+        ).format(
+            getattr(best_override, "evidence", ""),
+            anchor.get("recon_date", ""),
+            note_day_diff,
+            anchor.get("anchor_type", ""),
+            anchor.get("source", ""),
+            anchor.get("cpt_code", ""),
+            anchor.get("procedure", "")
+        )
+
+        evidence_rows.append({
+            MERGE_KEY: mrn,
+            "NOTE_ID": getattr(best_override, "note_id", ""),
+            "NOTE_DATE": getattr(best_override, "note_date", ""),
+            "NOTE_TYPE": getattr(best_override, "note_type", ""),
+            "FIELD": "SmokingStatus",
+            "VALUE": getattr(best_override, "value", ""),
+            "STATUS": getattr(best_override, "status", ""),
+            "CONFIDENCE": getattr(best_override, "confidence", ""),
+            "SECTION": getattr(best_override, "section", ""),
+            "STAGE_USED": "patient_level_structured_override",
+            "WINDOW_USED": "preop_any",
+            "ANCHOR_TYPE": anchor.get("anchor_type", ""),
+            "ANCHOR_DATE": anchor.get("anchor_date", ""),
+            "EVIDENCE": evid
+        })
+
+    return final_best_smoking, evidence_rows, override_count
 
 
 def collect_bmi_candidates_for_window(notes_df, anchor_map, stage_name, before_days, after_days, eligible_mrns, evidence_rows):
@@ -1728,6 +1954,16 @@ def main():
     for mrn, cand in smoke_best_fb.items():
         if mrn not in final_best_smoking:
             final_best_smoking[mrn] = cand
+
+    # Final structured override
+    print("Stage 6: patient-level structured smoking override...")
+    final_best_smoking, evidence_rows, override_count = run_patient_level_structured_smoking_override(
+        notes_df=notes_df,
+        anchor_map=anchor_map,
+        final_best_smoking=final_best_smoking,
+        evidence_rows=evidence_rows
+    )
+    print("MRNs overridden by patient-level structured smoking logic: {0}".format(override_count))
 
     print("Final SmokingStatus predictions aggregated for MRNs: {0}".format(len(final_best_smoking)))
 
