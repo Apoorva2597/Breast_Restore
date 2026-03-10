@@ -30,10 +30,7 @@ CURRENT_PATTERNS = [
     re.compile(r"\bsmokes\b", re.IGNORECASE),
     re.compile(r"\bsmokes\s+\d+", re.IGNORECASE),
     re.compile(r"\bsmokes\s+(?:a\s+)?(?:couple|few)\s+cig", re.IGNORECASE),
-    re.compile(r"\bcigarettes?\s+per\s+(?:day|week)\b", re.IGNORECASE),
-    re.compile(r"\bpacks?\s*/?\s*day\b", re.IGNORECASE),
     re.compile(r"\btobacco use\s*[:\-]?\s*current\b", re.IGNORECASE),
-    re.compile(r"\bcomment\s*[:\-]?\s*smokes\b", re.IGNORECASE),
 ]
 
 FORMER_PATTERNS = [
