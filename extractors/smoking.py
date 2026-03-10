@@ -464,8 +464,24 @@ def extract_smoking(note: SectionedNote) -> List[Candidate]:
         if cand is not None:
             all_candidates.append(cand)
 
-    if not all_candidates:
+    # if nothing matched, create a weak candidate so evidence is preserved
+        if not all_candidates:
+            text_blob = " ".join([note.sections.get(s, "") for s in note.sections])
+        if text_blob.strip():
+            cand = Candidate(
+                field="SmokingStatus",
+                value="Unknown",
+                status="present",
+                evidence=text_blob[:200],
+                section="UNKNOWN",
+                note_type=note.note_type,
+                note_id=note.note_id,
+                note_date=note.note_date,
+                confidence=0.10,
+                )
+            return [cand]
         return []
+        
 
     def sort_key(c):
         return (
