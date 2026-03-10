@@ -9,6 +9,11 @@
 #   (1) staged extractor-based search
 #   (2) unresolved-patient full-note fallback
 #   (3) final patient-level structured smoking override
+# - This version adds checkbox-aware regex support for Epic-style exports:
+#       Smoking status □ Never Smoker
+#       Smoking status □ Former Smoker
+#       Smoking status □ Current Every Day Smoker
+#       Smokeless tobacco □ Never Used
 #
 # BMI logic:
 #   Stage 1: anchor day only
@@ -739,20 +744,29 @@ def note_on_or_before_recon(note_dt, recon_dt):
 # -----------------------
 # Smoking full-note unresolved fallback
 # -----------------------
+# Checkbox-aware token for Epic exports like:
+#   Smoking status □ Never Smoker
+#   Smoking status: ☐ Former Smoker
+BOX = r"(?:[\s\u00A0]*[□☐▪■•]?\s*)"
+
 FB_STRUCT_CURRENT = re.compile(
-    r"\bsmoking status\s*[:\-]?\s*(current every day smoker|current some day smoker|current smoker|current)\b",
+    r"\bsmoking status\s*[:\-]?" + BOX +
+    r"(current every day smoker|current some day smoker|current smoker|current)\b",
     re.IGNORECASE
 )
 FB_STRUCT_FORMER = re.compile(
-    r"\bsmoking status\s*[:\-]?\s*(former smoker|former)\b",
+    r"\bsmoking status\s*[:\-]?" + BOX +
+    r"(former smoker|former)\b",
     re.IGNORECASE
 )
 FB_STRUCT_NEVER = re.compile(
-    r"\bsmoking status\s*[:\-]?\s*(never smoker|never)\b",
+    r"\bsmoking status\s*[:\-]?" + BOX +
+    r"(never smoker|never)\b",
     re.IGNORECASE
 )
 FB_STRUCT_SMOKELESS_NEVER = re.compile(
-    r"\bsmokeless tobacco\s*[:\-]?\s*never used\b",
+    r"\bsmokeless tobacco\s*[:\-]?" + BOX +
+    r"never used\b",
     re.IGNORECASE
 )
 FB_STRUCT_COMMENT_CURRENT = re.compile(
@@ -1112,19 +1126,23 @@ def fallback_extract_smoking_from_full_note(row, recon_dt):
 # Final patient-level structured override
 # -----------------------
 OVR_STRUCT_CURRENT = re.compile(
-    r"\bsmoking status\s*[:\-]?\s*(current every day smoker|current some day smoker|current smoker|current)\b",
+    r"\bsmoking status\s*[:\-]?" + BOX +
+    r"(current every day smoker|current some day smoker|current smoker|current)\b",
     re.IGNORECASE
 )
 OVR_STRUCT_FORMER = re.compile(
-    r"\bsmoking status\s*[:\-]?\s*(former smoker|former)\b",
+    r"\bsmoking status\s*[:\-]?" + BOX +
+    r"(former smoker|former)\b",
     re.IGNORECASE
 )
 OVR_STRUCT_NEVER = re.compile(
-    r"\bsmoking status\s*[:\-]?\s*(never smoker|never)\b",
+    r"\bsmoking status\s*[:\-]?" + BOX +
+    r"(never smoker|never)\b",
     re.IGNORECASE
 )
 OVR_SMOKELESS_NEVER = re.compile(
-    r"\bsmokeless tobacco\s*[:\-]?\s*never used\b",
+    r"\bsmokeless tobacco\s*[:\-]?" + BOX +
+    r"never used\b",
     re.IGNORECASE
 )
 OVR_QUIT_DATE = FB_QUIT_DATE
@@ -1298,14 +1316,12 @@ def should_apply_patient_override(existing, override):
     ex_conf = safe_float(getattr(existing, "confidence", 0.0), 0.0)
     ov_conf = safe_float(getattr(override, "confidence", 0.0), 0.0)
 
-    # Always allow override if existing is weak fallback or unresolved-ish
     weak_prefixes = (
         "fallback_",
     )
     if ex_status.startswith(weak_prefixes):
         return True
 
-    # Allow strong structured override when it conflicts with weaker historical selection
     if ov_status in {"override_structured_current", "override_recent_quit_current"}:
         if ex_val != "Current" and ov_conf >= ex_conf:
             return True
@@ -1955,7 +1971,6 @@ def main():
         if mrn not in final_best_smoking:
             final_best_smoking[mrn] = cand
 
-    # Final structured override
     print("Stage 6: patient-level structured smoking override...")
     final_best_smoking, evidence_rows, override_count = run_patient_level_structured_smoking_override(
         notes_df=notes_df,
