@@ -1,301 +1,309 @@
 #!/usr/bin/env python3
-# qa_smoking_mismatches_categorized.py
+# qa_smoking_mismatches.py
 #
-# Stronger smoking QA script:
-# 1. Outputs ALL smoking mismatches vs gold
-# 2. Keeps rows even if there is no evidence row
-# 3. Adds automatic mismatch categorization to speed debugging
-# 4. Flags likely failure modes:
-#    - recent quit misread
-#    - former template/history misread as current
-#    - questionnaire/template issue
-#    - no evidence row
-#    - family history contamination
-#    - current narrative missed
-#    - never-vs-former confusion
+# Purpose:
+#   QA script for SmokingStatus mismatches only.
 #
-# UPDATED:
-# - MRN is now written to output.
+# What it does:
+#   1. Loads gold + predicted/master file
+#   2. Compares SmokingStatus
+#   3. Pulls smoking evidence rows for mismatched MRNs
+#   4. Summarizes which stage/status produced the wrong calls
+#
+# Outputs:
+#   _outputs/qa_smoking_mismatch_summary.csv
+#   _outputs/qa_smoking_mismatch_stage_summary.csv
+#   _outputs/qa_smoking_mismatch_status_summary.csv
+#   _outputs/qa_smoking_mismatch_details.csv
 #
 # Python 3.6.8 compatible
 
-import re
+import os
 import pandas as pd
 
-MASTER_FILE = "_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv"
-GOLD_FILE = "gold_cleaned_for_cedar.csv"
-EVID_FILE = "_outputs/bmi_smoking_only_evidence.csv"
 
-MRN = "MRN"
+# --------------------------------------------------
+# EDIT THESE PATHS
+# --------------------------------------------------
+BASE_DIR = "/home/apokol/Breast_Restore"
 
+# gold file with true SmokingStatus
+GOLD_FILE = os.path.join(BASE_DIR, "_outputs", "master_abstraction_rule_FINAL.csv")
 
-def clean(x):
-    if pd.isna(x):
-        return ""
-    return str(x).strip()
+# prediction/master file you just updated
+PRED_FILE = os.path.join(BASE_DIR, "_outputs", "master_abstraction_rule_FINAL_NO_GOLD.csv")
 
+# evidence file from updater
+EVID_FILE = os.path.join(BASE_DIR, "_outputs", "bmi_smoking_only_evidence.csv")
 
-def normalize_smoking(x):
-    s = clean(x).lower()
-
-    if s in [
-        "current", "current smoker", "smoker", "active smoker",
-        "currently smoking", "currently smokes"
-    ]:
-        return "Current"
-
-    if s in [
-        "former", "former smoker", "ex-smoker", "quit smoking",
-        "quit tobacco", "stopped smoking", "stopped tobacco"
-    ]:
-        return "Former"
-
-    if s in [
-        "never", "never smoker", "never smoked", "nonsmoker",
-        "non-smoker", "lifetime nonsmoker"
-    ]:
-        return "Never"
-
-    return clean(x)
+OUT_DIR = os.path.join(BASE_DIR, "_outputs")
+MERGE_KEY = "MRN"
+FIELD_NAME = "SmokingStatus"
 
 
-def safe_float(x, default=-1.0):
+# --------------------------------------------------
+# helpers
+# --------------------------------------------------
+def read_csv_robust(path):
+    common_kwargs = dict(dtype=str, engine="python")
     try:
-        return float(str(x).strip())
-    except Exception:
-        return default
+        return pd.read_csv(path, **common_kwargs, on_bad_lines="skip")
+    except TypeError:
+        try:
+            return pd.read_csv(
+                path,
+                **common_kwargs,
+                error_bad_lines=False,
+                warn_bad_lines=True
+            )
+        except UnicodeDecodeError:
+            return pd.read_csv(
+                path,
+                **common_kwargs,
+                encoding="latin-1",
+                error_bad_lines=False,
+                warn_bad_lines=True
+            )
+    except UnicodeDecodeError:
+        try:
+            return pd.read_csv(
+                path,
+                **common_kwargs,
+                encoding="latin-1",
+                on_bad_lines="skip"
+            )
+        except TypeError:
+            return pd.read_csv(
+                path,
+                **common_kwargs,
+                encoding="latin-1",
+                error_bad_lines=False,
+                warn_bad_lines=True
+            )
 
 
-def contains_any(text, patterns):
-    t = clean(text).lower()
-    for p in patterns:
-        if re.search(p, t, re.IGNORECASE):
-            return True
-    return False
+def clean_cols(df):
+    df.columns = [str(c).strip().replace("\ufeff", "") for c in df.columns]
+    return df
 
 
-def categorize_mismatch(gold, pred, evidence, value, note_type, section):
-    txt = " ".join([
-        clean(evidence),
-        clean(value),
-        clean(note_type),
-        clean(section)
-    ]).lower()
-
-    if clean(evidence) == "NO EVIDENCE ROW FOUND":
-        return "no_evidence_row"
-
-    if contains_any(txt, [
-        r"family history", r"\bmother\b", r"\bfather\b", r"\baunt\b",
-        r"\buncle\b", r"\bsister\b", r"\bbrother\b",
-        r"\bgrandmother\b", r"\bgrandfather\b"
-    ]):
-        return "family_history_contamination"
-
-    if contains_any(txt, [
-        r"resources?\s+to\s+help\s+quit\s+smoking",
-        r"interested\s+in\s+resources?\s+to\s+help\s+quit\s+smoking",
-        r"referral\s+to\s+mhealthy",
-        r"referred\s+to\s+mhealthy",
-        r"advised\s+by\s+provider\s+to\s+quit\s+smoking",
-        r"is patient currently smoking\?\s*no",
-        r"active tobacco use\?\s*no",
-        r"active tobacco use\s*[:\-]?\s*no",
-        r"current tobacco use\s*[:\-]?\s*no"
-    ]):
-        if gold == "Never" and pred == "Former":
-            return "questionnaire_template_false_former"
-        if gold == "Never" and pred == "Current":
-            return "questionnaire_template_false_current"
-        if gold == "Former" and pred == "Never":
-            return "questionnaire_template_false_never"
-        return "questionnaire_template_issue"
-
-    if gold == "Current" and pred == "Former":
-        if contains_any(txt, [
-            r"since\s+(our|the)\s+last\s+visit.*quit",
-            r"recently quit",
-            r"quit date",
-            r"years since quitting\s*[:\-]?\s*0\.",
-            r"\b0\.[0-9]+\s*years since quitting\b",
-            r"\bdown to\s+\d",
-            r"\bcigs?\s+daily\b",
-            r"\bcigarettes?\s+(a|per)\s+(day|week)\b",
-            r"\bsmokes approximately\b",
-            r"\bstill smoking\b",
-            r"\bcontinues to smoke\b",
-            r"\busing chantix\b"
-        ]):
-            return "recent_quit_or_current_narrative_missed"
-        return "current_misread_as_former"
-
-    if gold == "Former" and pred == "Current":
-        if contains_any(txt, [
-            r"former smoker",
-            r"smoking status\s*[:\-]?\s*former",
-            r"history smoking status\s*[:\-]?\s*former",
-            r"quit date",
-            r"years since quitting",
-            r"quit .* years ago",
-            r"stopped .* years ago"
-        ]):
-            return "former_template_misread_as_current"
-        return "former_misread_as_current"
-
-    if gold == "Never" and pred == "Former":
-        if contains_any(txt, [
-            r"no tobacco use",
-            r"never smoker",
-            r"never smoked",
-            r"never used tobacco",
-            r"denies tobacco",
-            r"denies smoking"
-        ]):
-            return "never_template_misread_as_former"
-        return "never_misread_as_former"
-
-    if gold == "Former" and pred == "Never":
-        if contains_any(txt, [
-            r"former smoker",
-            r"quit date",
-            r"years since quitting",
-            r"history smoking status\s*[:\-]?\s*former",
-            r"smoking status\s*[:\-]?\s*former"
-        ]):
-            return "former_history_overridden_by_never"
-        return "former_misread_as_never"
-
-    if gold == "Never" and pred == "Current":
-        return "never_misread_as_current"
-
-    if gold == "Current" and pred == "Never":
-        return "current_misread_as_never"
-
-    return "other"
+def clean_cell(x):
+    if x is None:
+        return ""
+    s = str(x).strip()
+    if s.lower() in {"", "nan", "none", "null", "na", "<na>"}:
+        return ""
+    return s
 
 
-print("Loading files...")
+def normalize_mrn(df):
+    key_variants = ["MRN", "mrn", "Patient_MRN", "PAT_MRN", "PATIENT_MRN"]
+    for k in key_variants:
+        if k in df.columns:
+            if k != MERGE_KEY:
+                df = df.rename(columns={k: MERGE_KEY})
+            break
+    if MERGE_KEY not in df.columns:
+        raise RuntimeError("MRN column not found. Seen columns: {0}".format(list(df.columns)[:50]))
+    df[MERGE_KEY] = df[MERGE_KEY].astype(str).str.strip()
+    return df
 
-master = pd.read_csv(MASTER_FILE, dtype=str)
-gold = pd.read_csv(GOLD_FILE, dtype=str)
-evid = pd.read_csv(EVID_FILE, dtype=str)
 
-master[MRN] = master[MRN].astype(str).str.strip()
-gold[MRN] = gold[MRN].astype(str).str.strip()
-evid[MRN] = evid[MRN].astype(str).str.strip()
+def norm_smoking(x):
+    s = clean_cell(x).lower()
+    if not s:
+        return ""
 
-merged = pd.merge(master, gold, on=MRN, suffixes=("_pred", "_gold"))
+    mapping = {
+        "current": "Current",
+        "former": "Former",
+        "never": "Never",
+        "current smoker": "Current",
+        "former smoker": "Former",
+        "never smoker": "Never",
+    }
+    return mapping.get(s, clean_cell(x))
 
-merged["Smoking_pred"] = merged["SmokingStatus_pred"].apply(normalize_smoking)
-merged["Smoking_gold"] = merged["SmokingStatus_gold"].apply(normalize_smoking)
 
-mismatches = merged[merged["Smoking_pred"] != merged["Smoking_gold"]].copy()
+# --------------------------------------------------
+# main
+# --------------------------------------------------
+def main():
+    os.makedirs(OUT_DIR, exist_ok=True)
 
-print("\nSmoking mismatches:", len(mismatches))
+    print("Loading files...")
+    gold = normalize_mrn(clean_cols(read_csv_robust(GOLD_FILE)))
+    pred = normalize_mrn(clean_cols(read_csv_robust(PRED_FILE)))
+    evid = normalize_mrn(clean_cols(read_csv_robust(EVID_FILE)))
 
-rows = []
+    if FIELD_NAME not in gold.columns:
+        raise RuntimeError("Gold file missing SmokingStatus column.")
+    if FIELD_NAME not in pred.columns:
+        raise RuntimeError("Pred file missing SmokingStatus column.")
 
-for _, r in mismatches.iterrows():
-    mrn = r[MRN]
+    gold_sub = gold[[MERGE_KEY, FIELD_NAME]].copy()
+    gold_sub = gold_sub.rename(columns={FIELD_NAME: "SmokingStatus_gold"})
+    gold_sub["SmokingStatus_gold"] = gold_sub["SmokingStatus_gold"].apply(norm_smoking)
 
-    ev = evid[
-        (evid[MRN] == mrn) &
-        (evid["FIELD"] == "SmokingStatus")
-    ].copy()
+    pred_sub = pred[[MERGE_KEY, FIELD_NAME]].copy()
+    pred_sub = pred_sub.rename(columns={FIELD_NAME: "SmokingStatus_pred"})
+    pred_sub["SmokingStatus_pred"] = pred_sub["SmokingStatus_pred"].apply(norm_smoking)
 
-    if len(ev) > 0:
-        if "CONFIDENCE" not in ev.columns:
-            ev["CONFIDENCE"] = ""
+    merged = gold_sub.merge(pred_sub, on=MERGE_KEY, how="outer")
 
-        if "NOTE_DATE" not in ev.columns:
-            ev["NOTE_DATE"] = ""
+    merged["gold_present"] = merged["SmokingStatus_gold"].apply(lambda x: 1 if clean_cell(x) else 0)
+    merged["pred_present"] = merged["SmokingStatus_pred"].apply(lambda x: 1 if clean_cell(x) else 0)
 
-        if "STAGE_USED" not in ev.columns:
-            ev["STAGE_USED"] = ""
+    compare_df = merged[(merged["gold_present"] == 1) | (merged["pred_present"] == 1)].copy()
+    compare_df["match"] = (
+        compare_df["SmokingStatus_gold"].fillna("").astype(str).str.strip()
+        == compare_df["SmokingStatus_pred"].fillna("").astype(str).str.strip()
+    ).astype(int)
 
-        stage_rank = {"day0": 1, "pm7": 2, "pm14": 3}
-        ev["_stage_rank"] = ev["STAGE_USED"].astype(str).str.strip().map(
-            lambda x: stage_rank.get(x, 9)
+    mismatches = compare_df[compare_df["match"] == 0].copy()
+
+    print("Total compared:", len(compare_df))
+    print("Smoking mismatches:", len(mismatches))
+
+    # keep only smoking evidence
+    evid["FIELD"] = evid["FIELD"].apply(clean_cell)
+    smoke_evid = evid[evid["FIELD"] == FIELD_NAME].copy()
+
+    # only evidence for mismatched MRNs
+    mismatch_mrns = set(mismatches[MERGE_KEY].astype(str).str.strip().tolist())
+    smoke_evid = smoke_evid[smoke_evid[MERGE_KEY].astype(str).str.strip().isin(mismatch_mrns)].copy()
+
+    # summarize stages
+    if len(smoke_evid) > 0:
+        stage_summary = (
+            smoke_evid.groupby(["STAGE_USED", "VALUE"])
+            .size()
+            .reset_index(name="n_rows")
+            .sort_values(["n_rows", "STAGE_USED", "VALUE"], ascending=[False, True, True])
         )
-        ev["_conf_num"] = ev["CONFIDENCE"].apply(safe_float)
-
-        ev = ev.sort_values(
-            by=["_stage_rank", "_conf_num"],
-            ascending=[True, False]
+        status_summary = (
+            smoke_evid.groupby(["STATUS", "VALUE"])
+            .size()
+            .reset_index(name="n_rows")
+            .sort_values(["n_rows", "STATUS", "VALUE"], ascending=[False, True, True])
         )
-
-        e = ev.iloc[0]
-
-        gold_val = clean(r["Smoking_gold"])
-        pred_val = clean(r["Smoking_pred"])
-        note_date = clean(e.get("NOTE_DATE"))
-        note_type = clean(e.get("NOTE_TYPE"))
-        section = clean(e.get("SECTION"))
-        value = clean(e.get("VALUE"))
-        evidence = clean(e.get("EVIDENCE"))
-
     else:
-        gold_val = clean(r["Smoking_gold"])
-        pred_val = clean(r["Smoking_pred"])
-        note_date = ""
-        note_type = ""
-        section = ""
-        value = ""
-        evidence = "NO EVIDENCE ROW FOUND"
+        stage_summary = pd.DataFrame(columns=["STAGE_USED", "VALUE", "n_rows"])
+        status_summary = pd.DataFrame(columns=["STATUS", "VALUE", "n_rows"])
 
-    category = categorize_mismatch(
-        gold=gold_val,
-        pred=pred_val,
-        evidence=evidence,
-        value=value,
-        note_type=note_type,
-        section=section
+    # build detailed QA table
+    detail = mismatches.merge(
+        smoke_evid,
+        on=MERGE_KEY,
+        how="left"
     )
 
-    rows.append({
-        "MRN": mrn,
-        "Mismatch_Category": category,
-        "Gold": gold_val,
-        "Pred": pred_val,
-        "Note_Date": note_date,
-        "Note_Type": note_type,
-        "Section": section,
-        "Value": value,
-        "Evidence": evidence
-    })
+    detail_cols = [
+        MERGE_KEY,
+        "SmokingStatus_gold",
+        "SmokingStatus_pred",
+        "NOTE_DATE",
+        "NOTE_TYPE",
+        "VALUE",
+        "STATUS",
+        "STAGE_USED",
+        "WINDOW_USED",
+        "SECTION",
+        "CONFIDENCE",
+        "ANCHOR_TYPE",
+        "ANCHOR_DATE",
+        "EVIDENCE",
+    ]
+    detail = detail[[c for c in detail_cols if c in detail.columns]].copy()
+    detail = detail.sort_values(
+        by=[MERGE_KEY, "NOTE_DATE", "STAGE_USED", "STATUS"],
+        ascending=[True, True, True, True]
+    )
 
-qa = pd.DataFrame(rows)
+    # one-row summary per mismatch MRN
+    mismatch_summary = mismatches[[MERGE_KEY, "SmokingStatus_gold", "SmokingStatus_pred"]].copy()
+    mismatch_summary["has_smoking_evidence_rows"] = mismatch_summary[MERGE_KEY].isin(
+        set(smoke_evid[MERGE_KEY].astype(str).str.strip().tolist())
+    ).astype(int)
 
-sort_order = {
-    "recent_quit_or_current_narrative_missed": 1,
-    "former_template_misread_as_current": 2,
-    "never_template_misread_as_former": 3,
-    "former_history_overridden_by_never": 4,
-    "questionnaire_template_false_former": 5,
-    "questionnaire_template_false_current": 6,
-    "questionnaire_template_false_never": 7,
-    "questionnaire_template_issue": 8,
-    "family_history_contamination": 9,
-    "no_evidence_row": 10,
-    "current_misread_as_former": 11,
-    "former_misread_as_current": 12,
-    "never_misread_as_former": 13,
-    "former_misread_as_never": 14,
-    "never_misread_as_current": 15,
-    "current_misread_as_never": 16,
-    "other": 99
-}
+    # best guess: final deciding evidence row = patient override if present, else fallback, else latest evidence row
+    final_guess_rows = []
+    if len(smoke_evid) > 0:
+        priority_map = {
+            "patient_level_structured_override": 0,
+            "fallback_full_note": 1,
+            "historical_preop": 2,
+            "pm14": 3,
+            "pm7": 4,
+            "day0": 5,
+        }
 
-if len(qa) > 0:
-    qa["_sort"] = qa["Mismatch_Category"].map(lambda x: sort_order.get(x, 99))
-    qa = qa.sort_values(by=["_sort", "Mismatch_Category", "Gold", "Pred", "Note_Date"]).drop(columns=["_sort"])
+        smoke_evid2 = smoke_evid.copy()
+        smoke_evid2["_stage_pri"] = smoke_evid2["STAGE_USED"].apply(lambda x: priority_map.get(clean_cell(x), 99))
+        smoke_evid2["_conf"] = pd.to_numeric(smoke_evid2["CONFIDENCE"], errors="coerce").fillna(0.0)
+        smoke_evid2 = smoke_evid2.sort_values(
+            by=[MERGE_KEY, "_stage_pri", "_conf", "NOTE_DATE"],
+            ascending=[True, True, False, False]
+        )
+        final_guess_rows = smoke_evid2.groupby(MERGE_KEY, as_index=False).first()
 
-out = "_outputs/qa_smoking_mismatches_categorized.csv"
-qa.to_csv(out, index=False)
+        final_guess_rows = final_guess_rows[[
+            MERGE_KEY, "VALUE", "STATUS", "STAGE_USED", "NOTE_DATE", "NOTE_TYPE", "CONFIDENCE", "EVIDENCE"
+        ]].copy()
+        final_guess_rows = final_guess_rows.rename(columns={
+            "VALUE": "qa_best_evidence_value",
+            "STATUS": "qa_best_evidence_status",
+            "STAGE_USED": "qa_best_evidence_stage",
+            "NOTE_DATE": "qa_best_evidence_note_date",
+            "NOTE_TYPE": "qa_best_evidence_note_type",
+            "CONFIDENCE": "qa_best_evidence_confidence",
+            "EVIDENCE": "qa_best_evidence_text",
+        })
+    else:
+        final_guess_rows = pd.DataFrame(columns=[
+            MERGE_KEY,
+            "qa_best_evidence_value",
+            "qa_best_evidence_status",
+            "qa_best_evidence_stage",
+            "qa_best_evidence_note_date",
+            "qa_best_evidence_note_type",
+            "qa_best_evidence_confidence",
+            "qa_best_evidence_text",
+        ])
 
-print("Saved:", out)
-print("Rows written:", len(qa))
+    mismatch_summary = mismatch_summary.merge(final_guess_rows, on=MERGE_KEY, how="left")
 
-if len(qa) > 0:
-    print("\nMismatch category counts:")
-    print(qa["Mismatch_Category"].value_counts(dropna=False).to_string())
+    # save
+    mismatch_summary_path = os.path.join(OUT_DIR, "qa_smoking_mismatch_summary.csv")
+    stage_summary_path = os.path.join(OUT_DIR, "qa_smoking_mismatch_stage_summary.csv")
+    status_summary_path = os.path.join(OUT_DIR, "qa_smoking_mismatch_status_summary.csv")
+    detail_path = os.path.join(OUT_DIR, "qa_smoking_mismatch_details.csv")
+
+    mismatch_summary.to_csv(mismatch_summary_path, index=False)
+    stage_summary.to_csv(stage_summary_path, index=False)
+    status_summary.to_csv(status_summary_path, index=False)
+    detail.to_csv(detail_path, index=False)
+
+    print("\nSaved:")
+    print(" ", mismatch_summary_path)
+    print(" ", stage_summary_path)
+    print(" ", status_summary_path)
+    print(" ", detail_path)
+
+    print("\nTop mismatch stage summary:")
+    if len(stage_summary) > 0:
+        print(stage_summary.head(20).to_string(index=False))
+    else:
+        print("No smoking evidence rows found for mismatches.")
+
+    print("\nTop mismatch status summary:")
+    if len(status_summary) > 0:
+        print(status_summary.head(20).to_string(index=False))
+    else:
+        print("No smoking evidence rows found for mismatches.")
+
+    print("\nDone.")
+
+
+if __name__ == "__main__":
+    main()
