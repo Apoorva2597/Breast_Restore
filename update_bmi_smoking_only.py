@@ -3,6 +3,10 @@
 #
 # BMI + Smoking updater for the existing master file.
 #
+# IMPORTANT:
+# - BMI logic is intentionally left unchanged.
+# - Only Smoking selection / resolution logic has been updated.
+#
 # BMI logic:
 #   Stage 1: anchor day only
 #   Stage 2: +/- 7 days (only if nothing found in Stage 1)
@@ -13,11 +17,10 @@
 #       Stage 1: anchor day only
 #       Stage 2: +/- 7 days
 #       Stage 3: +/- 14 days
-#   Former / Never:
+#   Historical fallback:
 #       allow any note ON OR BEFORE reconstruction date
-#       because:
-#         - Former can be resolved from quit timing relative to recon
-#         - Never is not meaningfully time-sensitive
+#       and now keep Current / Former / Never if extractor resolves it
+#       from quit timing or explicit evidence
 #
 # Anchor logic:
 #   - Primary anchor from structured RECONSTRUCTION_DATE + ADMIT_DATE
@@ -617,7 +620,18 @@ def candidate_stage_rank(cand, recon_dt, source_file):
 
     return (9, abs(dd), 1 if dd > 0 else 0, 9, 0)
 
+def smoking_value_priority(val):
+    v = clean_cell(val)
+    if v == "Current":
+        return 0
+    if v == "Former":
+        return 1
+    if v == "Never":
+        return 2
+    return 9
+
 def choose_best_candidate(existing, new, recon_dt, source_file):
+    # Generic selection used by BMI and any non-smoking fields.
     if existing is None:
         return new
 
@@ -637,6 +651,67 @@ def choose_best_candidate(existing, new, recon_dt, source_file):
         nw_conf = float(getattr(new, "confidence", 0.0) or 0.0)
         if nw_conf > ex_conf:
             return new
+
+    return existing
+
+def choose_best_smoking_candidate(existing, new, recon_dt, source_file):
+    # Smoking-only comparator.
+    # BMI is not affected because BMI still uses choose_best_candidate().
+    if existing is None:
+        return new
+
+    ex_rank = candidate_stage_rank(existing, recon_dt, source_file)
+    nw_rank = candidate_stage_rank(new, recon_dt, source_file)
+
+    if ex_rank is None:
+        return new
+    if nw_rank is None:
+        return existing
+
+    ex_val = clean_cell(getattr(existing, "value", ""))
+    nw_val = clean_cell(getattr(new, "value", ""))
+
+    ex_pri = smoking_value_priority(ex_val)
+    nw_pri = smoking_value_priority(nw_val)
+
+    # Prefer better temporal/note rank first.
+    if nw_rank < ex_rank:
+        return new
+    if ex_rank < nw_rank:
+        return existing
+
+    # If same note/window rank, prefer Current > Former > Never.
+    if nw_pri < ex_pri:
+        return new
+    if ex_pri < nw_pri:
+        return existing
+
+    # Then confidence.
+    ex_conf = float(getattr(existing, "confidence", 0.0) or 0.0)
+    nw_conf = float(getattr(new, "confidence", 0.0) or 0.0)
+    if nw_conf > ex_conf:
+        return new
+    if ex_conf > nw_conf:
+        return existing
+
+    # Then prefer note closest to recon, pre-op favored over post-op.
+    ex_note_dt = parse_date_safe(getattr(existing, "note_date", ""))
+    nw_note_dt = parse_date_safe(getattr(new, "note_date", ""))
+
+    ex_dd = days_between(ex_note_dt, recon_dt) if ex_note_dt is not None and recon_dt is not None else None
+    nw_dd = days_between(nw_note_dt, recon_dt) if nw_note_dt is not None and recon_dt is not None else None
+
+    if ex_dd is not None and nw_dd is not None:
+        ex_post = 1 if ex_dd > 0 else 0
+        nw_post = 1 if nw_dd > 0 else 0
+        if nw_post < ex_post:
+            return new
+        if ex_post < nw_post:
+            return existing
+        if abs(nw_dd) < abs(ex_dd):
+            return new
+        if abs(ex_dd) < abs(nw_dd):
+            return existing
 
     return existing
 
@@ -840,7 +915,7 @@ def collect_smoking_current_candidates_for_window(notes_df, anchor_map, stage_na
             })
 
             existing = best_by_mrn.get(mrn)
-            best_by_mrn[mrn] = choose_best_candidate(existing, c, recon_dt, row.get("SOURCE_FILE", ""))
+            best_by_mrn[mrn] = choose_best_smoking_candidate(existing, c, recon_dt, row.get("SOURCE_FILE", ""))
 
     return best_by_mrn, notes_with_any_candidate, evidence_rows
 
@@ -899,10 +974,11 @@ def collect_smoking_historical_candidates(notes_df, anchor_map, eligible_mrns, e
         if not candidates:
             continue
 
+        # Updated: keep Current too, not just Former/Never.
         hist_candidates = []
         for c in candidates:
             val = clean_cell(getattr(c, "value", ""))
-            if val in {"Former", "Never"}:
+            if val in {"Current", "Former", "Never"}:
                 hist_candidates.append(c)
 
         if not hist_candidates:
@@ -943,7 +1019,7 @@ def collect_smoking_historical_candidates(notes_df, anchor_map, eligible_mrns, e
             })
 
             existing = best_by_mrn.get(mrn)
-            best_by_mrn[mrn] = choose_best_candidate(existing, c, recon_dt, row.get("SOURCE_FILE", ""))
+            best_by_mrn[mrn] = choose_best_smoking_candidate(existing, c, recon_dt, row.get("SOURCE_FILE", ""))
 
     return best_by_mrn, notes_with_any_candidate, evidence_rows
 
@@ -1089,7 +1165,7 @@ def main():
             final_best_smoking[mrn] = cand
 
     smoke_hist_mrns = set([m for m in anchor_map.keys() if m not in final_best_smoking])
-    print("Stage 4: searching Former/Never SmokingStatus in any note on or before reconstruction date...")
+    print("Stage 4: searching SmokingStatus in any note on or before reconstruction date...")
     print("Eligible MRNs: {0}".format(len(smoke_hist_mrns)))
     smoke_best_hist, smoke_found_hist, evidence_rows = collect_smoking_historical_candidates(
         notes_df=notes_df,
@@ -1097,7 +1173,7 @@ def main():
         eligible_mrns=smoke_hist_mrns,
         evidence_rows=evidence_rows
     )
-    print("MRNs with any Former/Never SmokingStatus candidate in historical preop notes: {0}".format(len(smoke_found_hist)))
+    print("MRNs with any SmokingStatus candidate in historical preop notes: {0}".format(len(smoke_found_hist)))
     for mrn, cand in smoke_best_hist.items():
         if mrn not in final_best_smoking:
             final_best_smoking[mrn] = cand
