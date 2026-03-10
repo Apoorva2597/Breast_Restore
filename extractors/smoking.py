@@ -1,7 +1,7 @@
 # extractors/smoking.py
 import re
 from datetime import datetime
-from typing import List
+from typing import List, Optional
 
 from models import Candidate, SectionedNote
 from .utils import window_around
@@ -87,6 +87,7 @@ SCREENING_NEVER_PATTERNS = [
     re.compile(r"\bno tobacco use\b", re.IGNORECASE),
 ]
 
+# Explicit quit-with-duration
 QUIT_TIME_PATTERN = re.compile(
     r"(quit|stopped)\s+(smoking|tobacco)[^\.]{0,60}?(\d+(?:\.\d+)?)\s*(day|days|week|weeks|month|months|year|years)",
     re.IGNORECASE
@@ -132,6 +133,7 @@ RECENT_QUIT_CONTEXT_PATTERN = re.compile(
     re.IGNORECASE
 )
 
+# Template/questionnaire quit phrases that should NOT count as Former
 QUESTIONNAIRE_QUIT_PATTERN = re.compile(
     r"\b(resources?\s+to\s+help\s+quit\s+smoking|interested\s+in\s+resources?\s+to\s+help\s+quit\s+smoking|referral\s+to\s+mhealthy|referred\s+to\s+mhealthy|advised\s+by\s+provider\s+to\s+quit\s+smoking|plans?\s+to\s+quit)\b",
     re.IGNORECASE
@@ -186,7 +188,8 @@ def _parse_date_safe(x):
             pass
 
     try:
-        return datetime.strptime(s[:10], "%Y-%m-%d")
+        ts = datetime.strptime(s[:10], "%Y-%m-%d")
+        return ts
     except Exception:
         return None
 
@@ -196,12 +199,14 @@ def _parse_quit_date(raw):
     if not s:
         return None
 
+    # MM/DD/YYYY or MM/DD/YY
     for fmt in ("%m/%d/%Y", "%m/%d/%y"):
         try:
             return datetime.strptime(s, fmt)
         except Exception:
             pass
 
+    # MM/YYYY -> first day of month
     m = re.match(r"^([0-9]{1,2})/([0-9]{4})$", s)
     if m:
         try:
@@ -209,6 +214,7 @@ def _parse_quit_date(raw):
         except Exception:
             pass
 
+    # YYYY -> first day of year
     m = re.match(r"^((?:19|20)[0-9]{2})$", s)
     if m:
         try:
