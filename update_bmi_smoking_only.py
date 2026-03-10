@@ -3,15 +3,21 @@
 #
 # BMI + Smoking updater for the existing master file.
 #
-# Final staged logic for BOTH BMI and Smoking:
+# BMI logic:
 #   Stage 1: anchor day only
 #   Stage 2: +/- 7 days (only if nothing found in Stage 1)
 #   Stage 3: +/- 14 days (only if nothing found in Stage 2)
 #
-# Within each stage, candidate priority is:
-#   1) same-day peri-op explicit mention
-#   2) nearest peri-op explicit mention
-#   3) nearest peri-op computed BMI from height/weight (BMI only)
+# Smoking logic:
+#   Current:
+#       Stage 1: anchor day only
+#       Stage 2: +/- 7 days
+#       Stage 3: +/- 14 days
+#   Former / Never:
+#       allow any note ON OR BEFORE reconstruction date
+#       because:
+#         - Former can be resolved from quit timing relative to recon
+#         - Never is not meaningfully time-sensitive
 #
 # Anchor logic:
 #   - Primary anchor from structured RECONSTRUCTION_DATE + ADMIT_DATE
@@ -56,12 +62,6 @@ NOTE_GLOBS = [
     "{0}/**/HPI11526*clinic notes.csv".format(BASE_DIR),
     "{0}/**/HPI11526*inpatient notes.csv".format(BASE_DIR),
     "{0}/**/HPI11526*operation notes.csv".format(BASE_DIR),
-]
-
-STAGE_WINDOWS = [
-    ("day0", 0, 0),
-    ("pm7", 7, 7),
-    ("pm14", 14, 14),
 ]
 
 from models import SectionedNote  # noqa: E402
@@ -317,10 +317,10 @@ def _is_recon_like_row(row, has_preferred_cpt):
 
     return False
 
-def choose_best_bmi_anchor_rows(struct_df):
-    bmi_best = {}
+def choose_best_anchor_rows(struct_df):
+    best = {}
     if len(struct_df) == 0:
-        return bmi_best
+        return best
 
     source_priority = {
         "clinic": 1,
@@ -330,7 +330,7 @@ def choose_best_bmi_anchor_rows(struct_df):
 
     eligible_sources = struct_df[struct_df["STRUCT_SOURCE"].isin(["clinic", "operation", "inpatient"])].copy()
     if len(eligible_sources) == 0:
-        return bmi_best
+        return best
 
     has_preferred_cpt = {}
     preferred_cpts = set(["19357", "19340", "19342", "19361", "19364", "19367", "S2068"])
@@ -366,9 +366,9 @@ def choose_best_bmi_anchor_rows(struct_df):
             admit_date
         )
 
-        current_best = bmi_best.get(mrn)
+        current_best = best.get(mrn)
         if current_best is None or score < current_best["score"]:
-            bmi_best[mrn] = {
+            best[mrn] = {
                 "anchor_type": "primary_recon_date",
                 "anchor_date": recon_date.strftime("%Y-%m-%d"),
                 "admit_date": admit_date.strftime("%Y-%m-%d"),
@@ -380,9 +380,9 @@ def choose_best_bmi_anchor_rows(struct_df):
                 "reason_for_visit": clean_cell(row.get("REASON_FOR_VISIT_STRUCT", ""))
             }
 
-    return bmi_best
+    return best
 
-def choose_backup_bmi_anchor_rows(struct_df, existing_anchor_map):
+def choose_backup_anchor_rows(struct_df, existing_anchor_map):
     backup = {}
     if len(struct_df) == 0:
         return backup
@@ -565,7 +565,7 @@ def load_and_reconstruct_notes():
 
 
 # -----------------------
-# BMI / Smoking selection logic
+# Selection logic
 # -----------------------
 def note_type_bucket(note_type, source_file):
     s = "{0} {1}".format(clean_cell(note_type).lower(), clean_cell(source_file).lower())
@@ -646,7 +646,13 @@ def note_in_window(note_dt, recon_dt, before_days, after_days):
         return False
     return (dd >= (-1 * before_days) and dd <= after_days)
 
-def collect_candidates_for_window(notes_df, anchor_map, extractor_fn, field_name, stage_name, before_days, after_days, eligible_mrns, evidence_rows):
+def note_on_or_before_recon(note_dt, recon_dt):
+    dd = days_between(note_dt, recon_dt)
+    if dd is None:
+        return False
+    return dd <= 0
+
+def collect_bmi_candidates_for_window(notes_df, anchor_map, stage_name, before_days, after_days, eligible_mrns, evidence_rows):
     best_by_mrn = {}
     notes_with_any_candidate = set()
 
@@ -678,7 +684,7 @@ def collect_candidates_for_window(notes_df, anchor_map, extractor_fn, field_name
         )
 
         try:
-            candidates = extractor_fn(snote)
+            candidates = extract_bmi(snote)
         except Exception as e:
             evidence_rows.append({
                 MERGE_KEY: mrn,
@@ -694,7 +700,7 @@ def collect_candidates_for_window(notes_df, anchor_map, extractor_fn, field_name
                 "WINDOW_USED": "{0}_{1}".format(before_days, after_days),
                 "ANCHOR_TYPE": anchor.get("anchor_type", ""),
                 "ANCHOR_DATE": anchor.get("anchor_date", ""),
-                "EVIDENCE": "{0} failed: {1}".format(extractor_fn.__name__, repr(e))
+                "EVIDENCE": "extract_bmi failed: {0}".format(repr(e))
             })
             continue
 
@@ -705,46 +711,232 @@ def collect_candidates_for_window(notes_df, anchor_map, extractor_fn, field_name
 
         for c in candidates:
             note_day_diff = days_between(parse_date_safe(getattr(c, "note_date", "")), recon_dt)
-
-            if field_name == "BMI":
-                evid = (
-                    "{0} | BMI_RECON_DATE={1} | BMI_NOTE_DAY_DIFF={2} | "
-                    "ANCHOR_TYPE={3} | ANCHOR_SOURCE={4} | ANCHOR_CPT={5} | ANCHOR_PROCEDURE={6}"
-                ).format(
-                    getattr(c, "evidence", ""),
-                    anchor.get("recon_date", ""),
-                    note_day_diff,
-                    anchor.get("anchor_type", ""),
-                    anchor.get("source", ""),
-                    anchor.get("cpt_code", ""),
-                    anchor.get("procedure", "")
-                )
-            else:
-                evid = (
-                    "{0} | SMOKING_RECON_DATE={1} | SMOKING_NOTE_DAY_DIFF={2} | "
-                    "ANCHOR_TYPE={3} | ANCHOR_SOURCE={4} | ANCHOR_CPT={5} | ANCHOR_PROCEDURE={6}"
-                ).format(
-                    getattr(c, "evidence", ""),
-                    anchor.get("recon_date", ""),
-                    note_day_diff,
-                    anchor.get("anchor_type", ""),
-                    anchor.get("source", ""),
-                    anchor.get("cpt_code", ""),
-                    anchor.get("procedure", "")
-                )
+            evid = (
+                "{0} | BMI_RECON_DATE={1} | BMI_NOTE_DAY_DIFF={2} | "
+                "ANCHOR_TYPE={3} | ANCHOR_SOURCE={4} | ANCHOR_CPT={5} | ANCHOR_PROCEDURE={6}"
+            ).format(
+                getattr(c, "evidence", ""),
+                anchor.get("recon_date", ""),
+                note_day_diff,
+                anchor.get("anchor_type", ""),
+                anchor.get("source", ""),
+                anchor.get("cpt_code", ""),
+                anchor.get("procedure", "")
+            )
 
             evidence_rows.append({
                 MERGE_KEY: mrn,
                 "NOTE_ID": getattr(c, "note_id", row["NOTE_ID"]),
                 "NOTE_DATE": getattr(c, "note_date", row["NOTE_DATE"]),
                 "NOTE_TYPE": getattr(c, "note_type", row["NOTE_TYPE"]),
-                "FIELD": field_name,
+                "FIELD": "BMI",
                 "VALUE": getattr(c, "value", ""),
                 "STATUS": getattr(c, "status", ""),
                 "CONFIDENCE": getattr(c, "confidence", ""),
                 "SECTION": getattr(c, "section", ""),
                 "STAGE_USED": stage_name,
                 "WINDOW_USED": "{0}_{1}".format(before_days, after_days),
+                "ANCHOR_TYPE": anchor.get("anchor_type", ""),
+                "ANCHOR_DATE": anchor.get("anchor_date", ""),
+                "EVIDENCE": evid
+            })
+
+            existing = best_by_mrn.get(mrn)
+            best_by_mrn[mrn] = choose_best_candidate(existing, c, recon_dt, row.get("SOURCE_FILE", ""))
+
+    return best_by_mrn, notes_with_any_candidate, evidence_rows
+
+def collect_smoking_current_candidates_for_window(notes_df, anchor_map, stage_name, before_days, after_days, eligible_mrns, evidence_rows):
+    best_by_mrn = {}
+    notes_with_any_candidate = set()
+
+    for _, row in notes_df.iterrows():
+        mrn = clean_cell(row.get(MERGE_KEY, ""))
+        if not mrn:
+            continue
+        if mrn not in eligible_mrns:
+            continue
+
+        anchor = anchor_map.get(mrn)
+        if anchor is None:
+            continue
+
+        recon_dt = parse_date_safe(anchor.get("recon_date", ""))
+        note_dt = parse_date_safe(row.get("NOTE_DATE", ""))
+
+        if recon_dt is None or note_dt is None:
+            continue
+
+        if not note_in_window(note_dt, recon_dt, before_days, after_days):
+            continue
+
+        snote = build_sectioned_note(
+            note_text=row["NOTE_TEXT"],
+            note_type=row["NOTE_TYPE"],
+            note_id=row["NOTE_ID"],
+            note_date=row["NOTE_DATE"]
+        )
+
+        try:
+            candidates = extract_smoking(snote)
+        except Exception as e:
+            evidence_rows.append({
+                MERGE_KEY: mrn,
+                "NOTE_ID": row["NOTE_ID"],
+                "NOTE_DATE": row["NOTE_DATE"],
+                "NOTE_TYPE": row["NOTE_TYPE"],
+                "FIELD": "EXTRACTOR_ERROR",
+                "VALUE": "",
+                "STATUS": "",
+                "CONFIDENCE": "",
+                "SECTION": "",
+                "STAGE_USED": stage_name,
+                "WINDOW_USED": "{0}_{1}".format(before_days, after_days),
+                "ANCHOR_TYPE": anchor.get("anchor_type", ""),
+                "ANCHOR_DATE": anchor.get("anchor_date", ""),
+                "EVIDENCE": "extract_smoking failed: {0}".format(repr(e))
+            })
+            continue
+
+        if not candidates:
+            continue
+
+        current_candidates = [c for c in candidates if clean_cell(getattr(c, "value", "")) == "Current"]
+        if not current_candidates:
+            continue
+
+        notes_with_any_candidate.add(mrn)
+
+        for c in current_candidates:
+            note_day_diff = days_between(parse_date_safe(getattr(c, "note_date", "")), recon_dt)
+            evid = (
+                "{0} | SMOKING_RECON_DATE={1} | SMOKING_NOTE_DAY_DIFF={2} | "
+                "ANCHOR_TYPE={3} | ANCHOR_SOURCE={4} | ANCHOR_CPT={5} | ANCHOR_PROCEDURE={6}"
+            ).format(
+                getattr(c, "evidence", ""),
+                anchor.get("recon_date", ""),
+                note_day_diff,
+                anchor.get("anchor_type", ""),
+                anchor.get("source", ""),
+                anchor.get("cpt_code", ""),
+                anchor.get("procedure", "")
+            )
+
+            evidence_rows.append({
+                MERGE_KEY: mrn,
+                "NOTE_ID": getattr(c, "note_id", row["NOTE_ID"]),
+                "NOTE_DATE": getattr(c, "note_date", row["NOTE_DATE"]),
+                "NOTE_TYPE": getattr(c, "note_type", row["NOTE_TYPE"]),
+                "FIELD": "SmokingStatus",
+                "VALUE": getattr(c, "value", ""),
+                "STATUS": getattr(c, "status", ""),
+                "CONFIDENCE": getattr(c, "confidence", ""),
+                "SECTION": getattr(c, "section", ""),
+                "STAGE_USED": stage_name,
+                "WINDOW_USED": "{0}_{1}".format(before_days, after_days),
+                "ANCHOR_TYPE": anchor.get("anchor_type", ""),
+                "ANCHOR_DATE": anchor.get("anchor_date", ""),
+                "EVIDENCE": evid
+            })
+
+            existing = best_by_mrn.get(mrn)
+            best_by_mrn[mrn] = choose_best_candidate(existing, c, recon_dt, row.get("SOURCE_FILE", ""))
+
+    return best_by_mrn, notes_with_any_candidate, evidence_rows
+
+def collect_smoking_historical_candidates(notes_df, anchor_map, eligible_mrns, evidence_rows):
+    best_by_mrn = {}
+    notes_with_any_candidate = set()
+
+    for _, row in notes_df.iterrows():
+        mrn = clean_cell(row.get(MERGE_KEY, ""))
+        if not mrn:
+            continue
+        if mrn not in eligible_mrns:
+            continue
+
+        anchor = anchor_map.get(mrn)
+        if anchor is None:
+            continue
+
+        recon_dt = parse_date_safe(anchor.get("recon_date", ""))
+        note_dt = parse_date_safe(row.get("NOTE_DATE", ""))
+
+        if recon_dt is None or note_dt is None:
+            continue
+
+        if not note_on_or_before_recon(note_dt, recon_dt):
+            continue
+
+        snote = build_sectioned_note(
+            note_text=row["NOTE_TEXT"],
+            note_type=row["NOTE_TYPE"],
+            note_id=row["NOTE_ID"],
+            note_date=row["NOTE_DATE"]
+        )
+
+        try:
+            candidates = extract_smoking(snote)
+        except Exception as e:
+            evidence_rows.append({
+                MERGE_KEY: mrn,
+                "NOTE_ID": row["NOTE_ID"],
+                "NOTE_DATE": row["NOTE_DATE"],
+                "NOTE_TYPE": row["NOTE_TYPE"],
+                "FIELD": "EXTRACTOR_ERROR",
+                "VALUE": "",
+                "STATUS": "",
+                "CONFIDENCE": "",
+                "SECTION": "",
+                "STAGE_USED": "historical_preop",
+                "WINDOW_USED": "preop_any",
+                "ANCHOR_TYPE": anchor.get("anchor_type", ""),
+                "ANCHOR_DATE": anchor.get("anchor_date", ""),
+                "EVIDENCE": "extract_smoking failed: {0}".format(repr(e))
+            })
+            continue
+
+        if not candidates:
+            continue
+
+        hist_candidates = []
+        for c in candidates:
+            val = clean_cell(getattr(c, "value", ""))
+            if val in {"Former", "Never"}:
+                hist_candidates.append(c)
+
+        if not hist_candidates:
+            continue
+
+        notes_with_any_candidate.add(mrn)
+
+        for c in hist_candidates:
+            note_day_diff = days_between(parse_date_safe(getattr(c, "note_date", "")), recon_dt)
+            evid = (
+                "{0} | SMOKING_RECON_DATE={1} | SMOKING_NOTE_DAY_DIFF={2} | "
+                "ANCHOR_TYPE={3} | ANCHOR_SOURCE={4} | ANCHOR_CPT={5} | ANCHOR_PROCEDURE={6}"
+            ).format(
+                getattr(c, "evidence", ""),
+                anchor.get("recon_date", ""),
+                note_day_diff,
+                anchor.get("anchor_type", ""),
+                anchor.get("source", ""),
+                anchor.get("cpt_code", ""),
+                anchor.get("procedure", "")
+            )
+
+            evidence_rows.append({
+                MERGE_KEY: mrn,
+                "NOTE_ID": getattr(c, "note_id", row["NOTE_ID"]),
+                "NOTE_DATE": getattr(c, "note_date", row["NOTE_DATE"]),
+                "NOTE_TYPE": getattr(c, "note_type", row["NOTE_TYPE"]),
+                "FIELD": "SmokingStatus",
+                "VALUE": getattr(c, "value", ""),
+                "STATUS": getattr(c, "status", ""),
+                "CONFIDENCE": getattr(c, "confidence", ""),
+                "SECTION": getattr(c, "section", ""),
+                "STAGE_USED": "historical_preop",
+                "WINDOW_USED": "preop_any",
                 "ANCHOR_TYPE": anchor.get("anchor_type", ""),
                 "ANCHOR_DATE": anchor.get("anchor_date", ""),
                 "EVIDENCE": evid
@@ -768,8 +960,8 @@ def main():
     print("Loading structured encounters...")
     struct_df = load_structured_encounters()
 
-    primary_anchor_map = choose_best_bmi_anchor_rows(struct_df)
-    backup_anchor_map = choose_backup_bmi_anchor_rows(struct_df, primary_anchor_map)
+    primary_anchor_map = choose_best_anchor_rows(struct_df)
+    backup_anchor_map = choose_backup_anchor_rows(struct_df, primary_anchor_map)
 
     anchor_map = {}
     for mrn, info in primary_anchor_map.items():
@@ -795,11 +987,9 @@ def main():
     # -----------------------
     stage1_mrns = set(anchor_map.keys())
     print("Stage 1: searching BMI on anchor day only...")
-    best_stage1, found_stage1, evidence_rows = collect_candidates_for_window(
+    best_stage1, found_stage1, evidence_rows = collect_bmi_candidates_for_window(
         notes_df=notes_df,
         anchor_map=anchor_map,
-        extractor_fn=extract_bmi,
-        field_name="BMI",
         stage_name="day0",
         before_days=0,
         after_days=0,
@@ -813,11 +1003,9 @@ def main():
     stage2_mrns = set([m for m in anchor_map.keys() if m not in final_best_bmi])
     print("Stage 2: searching BMI in +/-7 days ONLY for MRNs with no day-0 candidate...")
     print("Eligible MRNs: {0}".format(len(stage2_mrns)))
-    best_stage2, found_stage2, evidence_rows = collect_candidates_for_window(
+    best_stage2, found_stage2, evidence_rows = collect_bmi_candidates_for_window(
         notes_df=notes_df,
         anchor_map=anchor_map,
-        extractor_fn=extract_bmi,
-        field_name="BMI",
         stage_name="pm7",
         before_days=7,
         after_days=7,
@@ -832,11 +1020,9 @@ def main():
     stage3_mrns = set([m for m in anchor_map.keys() if m not in final_best_bmi])
     print("Stage 3: searching BMI in +/-14 days ONLY for MRNs with no candidate in earlier stages...")
     print("Eligible MRNs: {0}".format(len(stage3_mrns)))
-    best_stage3, found_stage3, evidence_rows = collect_candidates_for_window(
+    best_stage3, found_stage3, evidence_rows = collect_bmi_candidates_for_window(
         notes_df=notes_df,
         anchor_map=anchor_map,
-        extractor_fn=extract_bmi,
-        field_name="BMI",
         stage_name="pm14",
         before_days=14,
         after_days=14,
@@ -854,57 +1040,65 @@ def main():
     # Smoking staged extraction
     # -----------------------
     smoke_stage1_mrns = set(anchor_map.keys())
-    print("Stage 1: searching SmokingStatus on anchor day only...")
-    smoke_best_stage1, smoke_found_stage1, evidence_rows = collect_candidates_for_window(
+    print("Stage 1: searching Current SmokingStatus on anchor day only...")
+    smoke_best_stage1, smoke_found_stage1, evidence_rows = collect_smoking_current_candidates_for_window(
         notes_df=notes_df,
         anchor_map=anchor_map,
-        extractor_fn=extract_smoking,
-        field_name="SmokingStatus",
         stage_name="day0",
         before_days=0,
         after_days=0,
         eligible_mrns=smoke_stage1_mrns,
         evidence_rows=evidence_rows
     )
-    print("MRNs with any SmokingStatus candidate on anchor day: {0}".format(len(smoke_found_stage1)))
+    print("MRNs with any Current SmokingStatus candidate on anchor day: {0}".format(len(smoke_found_stage1)))
     for mrn, cand in smoke_best_stage1.items():
         final_best_smoking[mrn] = cand
 
     smoke_stage2_mrns = set([m for m in anchor_map.keys() if m not in final_best_smoking])
-    print("Stage 2: searching SmokingStatus in +/-7 days ONLY for MRNs with no day-0 candidate...")
+    print("Stage 2: searching Current SmokingStatus in +/-7 days ONLY for MRNs with no day-0 current candidate...")
     print("Eligible MRNs: {0}".format(len(smoke_stage2_mrns)))
-    smoke_best_stage2, smoke_found_stage2, evidence_rows = collect_candidates_for_window(
+    smoke_best_stage2, smoke_found_stage2, evidence_rows = collect_smoking_current_candidates_for_window(
         notes_df=notes_df,
         anchor_map=anchor_map,
-        extractor_fn=extract_smoking,
-        field_name="SmokingStatus",
         stage_name="pm7",
         before_days=7,
         after_days=7,
         eligible_mrns=smoke_stage2_mrns,
         evidence_rows=evidence_rows
     )
-    print("MRNs with any SmokingStatus candidate in +/-7 days: {0}".format(len(smoke_found_stage2)))
+    print("MRNs with any Current SmokingStatus candidate in +/-7 days: {0}".format(len(smoke_found_stage2)))
     for mrn, cand in smoke_best_stage2.items():
         if mrn not in final_best_smoking:
             final_best_smoking[mrn] = cand
 
     smoke_stage3_mrns = set([m for m in anchor_map.keys() if m not in final_best_smoking])
-    print("Stage 3: searching SmokingStatus in +/-14 days ONLY for MRNs with no candidate in earlier stages...")
+    print("Stage 3: searching Current SmokingStatus in +/-14 days ONLY for MRNs with no earlier current candidate...")
     print("Eligible MRNs: {0}".format(len(smoke_stage3_mrns)))
-    smoke_best_stage3, smoke_found_stage3, evidence_rows = collect_candidates_for_window(
+    smoke_best_stage3, smoke_found_stage3, evidence_rows = collect_smoking_current_candidates_for_window(
         notes_df=notes_df,
         anchor_map=anchor_map,
-        extractor_fn=extract_smoking,
-        field_name="SmokingStatus",
         stage_name="pm14",
         before_days=14,
         after_days=14,
         eligible_mrns=smoke_stage3_mrns,
         evidence_rows=evidence_rows
     )
-    print("MRNs with any SmokingStatus candidate in +/-14 days: {0}".format(len(smoke_found_stage3)))
+    print("MRNs with any Current SmokingStatus candidate in +/-14 days: {0}".format(len(smoke_found_stage3)))
     for mrn, cand in smoke_best_stage3.items():
+        if mrn not in final_best_smoking:
+            final_best_smoking[mrn] = cand
+
+    smoke_hist_mrns = set([m for m in anchor_map.keys() if m not in final_best_smoking])
+    print("Stage 4: searching Former/Never SmokingStatus in any note on or before reconstruction date...")
+    print("Eligible MRNs: {0}".format(len(smoke_hist_mrns)))
+    smoke_best_hist, smoke_found_hist, evidence_rows = collect_smoking_historical_candidates(
+        notes_df=notes_df,
+        anchor_map=anchor_map,
+        eligible_mrns=smoke_hist_mrns,
+        evidence_rows=evidence_rows
+    )
+    print("MRNs with any Former/Never SmokingStatus candidate in historical preop notes: {0}".format(len(smoke_found_hist)))
+    for mrn, cand in smoke_best_hist.items():
         if mrn not in final_best_smoking:
             final_best_smoking[mrn] = cand
 
