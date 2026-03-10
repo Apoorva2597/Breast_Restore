@@ -744,9 +744,6 @@ def note_on_or_before_recon(note_dt, recon_dt):
 # -----------------------
 # Smoking full-note unresolved fallback
 # -----------------------
-# Checkbox-aware token for Epic exports like:
-#   Smoking status □ Never Smoker
-#   Smoking status: ☐ Former Smoker
 BOX = r"(?:[\s\u00A0]*[□☐▪■•]?\s*)"
 
 FB_STRUCT_CURRENT = re.compile(
@@ -1670,7 +1667,16 @@ def collect_smoking_historical_candidates(notes_df, anchor_map, eligible_mrns, e
         hist_candidates = []
         for c in candidates:
             val = clean_cell(getattr(c, "value", ""))
-            if val in {"Current", "Former", "Never"}:
+            status = clean_cell(getattr(c, "status", "")).lower()
+            conf = safe_float(getattr(c, "confidence", 0.0), 0.0)
+
+            # Strong historical fix:
+            # keep all Current, but only allow Former/Never if evidence is strong.
+            if val == "Current":
+                hist_candidates.append(c)
+            elif conf >= 0.95:
+                hist_candidates.append(c)
+            elif status.startswith("override_") or status.startswith("fallback_structured_"):
                 hist_candidates.append(c)
 
         if not hist_candidates:
