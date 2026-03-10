@@ -87,7 +87,6 @@ SCREENING_NEVER_PATTERNS = [
     re.compile(r"\bno tobacco use\b", re.IGNORECASE),
 ]
 
-# Explicit quit-with-duration
 QUIT_TIME_PATTERN = re.compile(
     r"(quit|stopped)\s+(smoking|tobacco)[^\.]{0,60}?(\d+(?:\.\d+)?)\s*(day|days|week|weeks|month|months|year|years)",
     re.IGNORECASE
@@ -133,7 +132,6 @@ RECENT_QUIT_CONTEXT_PATTERN = re.compile(
     re.IGNORECASE
 )
 
-# Template/questionnaire quit phrases that should NOT count as Former
 QUESTIONNAIRE_QUIT_PATTERN = re.compile(
     r"\b(resources?\s+to\s+help\s+quit\s+smoking|interested\s+in\s+resources?\s+to\s+help\s+quit\s+smoking|referral\s+to\s+mhealthy|referred\s+to\s+mhealthy|advised\s+by\s+provider\s+to\s+quit\s+smoking|plans?\s+to\s+quit)\b",
     re.IGNORECASE
