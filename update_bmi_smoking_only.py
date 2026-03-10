@@ -659,6 +659,94 @@ def choose_best_candidate(existing, new, recon_dt, source_file):
 
     return existing
 
+def smoking_evidence_priority(cand):
+    """
+    Lower is better.
+    Strong structured smoking blocks should beat weak generic mentions.
+    """
+    status = clean_cell(getattr(cand, "status", "")).lower()
+    val = clean_cell(getattr(cand, "value", ""))
+    evidence = clean_cell(getattr(cand, "evidence", "")).lower()
+
+    has_smoking_status = ("smoking status" in evidence)
+    has_tobacco_use = ("tobacco use" in evidence)
+    has_smokeless = ("smokeless tobacco" in evidence)
+    has_quit_date = ("quit date" in evidence or "last attempt to quit" in evidence)
+    has_years_since = ("years since quitting" in evidence)
+    has_packs_day = ("packs/day" in evidence or "pack/day" in evidence)
+    has_pack_years = ("pack years" in evidence or "pack-years" in evidence or "packyear" in evidence)
+    has_types_cig = ("types: cigarettes" in evidence or "types : cigarettes" in evidence)
+    has_current_phrase = (
+        "current every day smoker" in evidence or
+        "current some day smoker" in evidence or
+        "current smoker" in evidence or
+        "smokes every once in a while currently" in evidence or
+        "smokes every once in a while" in evidence
+    )
+    has_former_phrase = (
+        "former smoker" in evidence or
+        "quit as a teenager" in evidence or
+        "remote history of tobacco use" in evidence
+    )
+    has_never_phrase = (
+        "never smoker" in evidence or
+        "never smoked" in evidence or
+        "nonsmoker" in evidence or
+        "non-smoker" in evidence or
+        "does not smoke" in evidence or
+        "doesn't smoke" in evidence or
+        "denies tobacco use" in evidence or
+        "denies tobacco" in evidence or
+        "denies use of tobacco products" in evidence or
+        "no history of tobacco" in evidence or
+        "no smoking" in evidence
+    )
+    counseling_only = (
+        "avoid tobacco use" in evidence or
+        "avoid smoking" in evidence or
+        "encouraged to avoid tobacco use" in evidence or
+        "counseled to avoid tobacco use" in evidence
+    )
+
+    # strongest: structured fallback or structured extractor output with direct smoking-status content
+    if status in {"fallback_structured_current", "fallback_recent_quit_current"}:
+        return 0
+    if status == "fallback_structured_former":
+        return 1
+    if status == "fallback_structured_never":
+        return 2
+
+    if has_smoking_status and val == "Current" and (has_current_phrase or has_packs_day or has_types_cig):
+        return 3
+    if has_smoking_status and val == "Former" and (has_former_phrase or has_quit_date or has_years_since or has_pack_years):
+        return 4
+    if has_smoking_status and val == "Never" and (has_never_phrase or has_smokeless):
+        return 5
+
+    if status == "fallback_current_narrative":
+        return 6
+    if status == "fallback_quantified_current":
+        return 7
+    if status == "fallback_former":
+        return 8
+    if status == "fallback_never":
+        return 9
+
+    if val == "Current" and (has_current_phrase or (has_packs_day and has_types_cig)):
+        return 10
+    if val == "Former" and (has_former_phrase or has_quit_date or has_years_since):
+        return 11
+    if val == "Never" and has_never_phrase:
+        return 12
+
+    if counseling_only:
+        return 40
+
+    if has_tobacco_use and not (has_smoking_status or has_quit_date or has_years_since or has_current_phrase or has_former_phrase or has_never_phrase):
+        return 50
+
+    return 25
+
 def choose_best_smoking_candidate(existing, new, recon_dt, source_file):
     if existing is None:
         return new
@@ -671,22 +759,33 @@ def choose_best_smoking_candidate(existing, new, recon_dt, source_file):
     if nw_rank is None:
         return existing
 
+    # 1. stage/window rank first
+    if nw_rank < ex_rank:
+        return new
+    if ex_rank < nw_rank:
+        return existing
+
+    # 2. stronger smoking evidence next
+    ex_evid_pri = smoking_evidence_priority(existing)
+    nw_evid_pri = smoking_evidence_priority(new)
+    if nw_evid_pri < ex_evid_pri:
+        return new
+    if ex_evid_pri < nw_evid_pri:
+        return existing
+
+    # 3. label priority
     ex_val = clean_cell(getattr(existing, "value", ""))
     nw_val = clean_cell(getattr(new, "value", ""))
 
     ex_pri = smoking_value_priority(ex_val)
     nw_pri = smoking_value_priority(nw_val)
 
-    if nw_rank < ex_rank:
-        return new
-    if ex_rank < nw_rank:
-        return existing
-
     if nw_pri < ex_pri:
         return new
     if ex_pri < nw_pri:
         return existing
 
+    # 4. confidence
     ex_conf = float(getattr(existing, "confidence", 0.0) or 0.0)
     nw_conf = float(getattr(new, "confidence", 0.0) or 0.0)
     if nw_conf > ex_conf:
@@ -694,6 +793,7 @@ def choose_best_smoking_candidate(existing, new, recon_dt, source_file):
     if ex_conf > nw_conf:
         return existing
 
+    # 5. closest/preop note
     ex_note_dt = parse_date_safe(getattr(existing, "note_date", ""))
     nw_note_dt = parse_date_safe(getattr(new, "note_date", ""))
 
@@ -901,11 +1001,6 @@ def fallback_extract_smoking_from_full_note(row, recon_dt):
     candidates = []
     full_section = "FULL_NOTE_FALLBACK"
 
-    # Guard: ignore counseling-only tobacco language when isolated
-    # but do not suppress real structured smoking status hits.
-    # So no early return here.
-
-    # 1. Strong structured current
     m = _find_first(FB_STRUCT_CURRENT, text)
     if m is not None:
         ctx = _fb_window(text, m.start(), m.end(), 150)
@@ -914,7 +1009,6 @@ def fallback_extract_smoking_from_full_note(row, recon_dt):
                 row, full_section, "Current", text, m.start(), m.end(), 0.999, "fallback_structured_current"
             ))
 
-    # 2. Strong structured former with quit timing
     m = _find_first(FB_STRUCT_FORMER, text)
     if m is not None:
         quit_m = _find_first(FB_QUIT_DATE, text)
@@ -976,7 +1070,6 @@ def fallback_extract_smoking_from_full_note(row, recon_dt):
                 row, full_section, "Former", text, m.start(), m.end(), 0.992, "fallback_structured_former"
             ))
 
-    # 3. Strong structured never
     m = _find_first(FB_STRUCT_NEVER, text)
     if m is not None:
         candidates.append(_make_fallback_smoking_candidate(
@@ -989,7 +1082,6 @@ def fallback_extract_smoking_from_full_note(row, recon_dt):
             row, full_section, "Never", text, m.start(), m.end(), 0.995, "fallback_structured_never"
         ))
 
-    # 4. Strong current comment / packs/day / cigarettes
     m = _find_first(FB_STRUCT_COMMENT_CURRENT, text)
     if m is not None:
         candidates.append(_make_fallback_smoking_candidate(
@@ -1016,7 +1108,6 @@ def fallback_extract_smoking_from_full_note(row, recon_dt):
             row, full_section, "Current", text, pack_m.start(), pack_m.end(), 0.988, "fallback_quantified_current"
         ))
 
-    # 5. Former from explicit former patterns or quit timing
     for rx in FB_FORMER_PATTERNS:
         mm = _find_first(rx, text)
         if mm is not None:
@@ -1060,7 +1151,6 @@ def fallback_extract_smoking_from_full_note(row, recon_dt):
             ))
         break
 
-    # 6. Never from repeated negation families
     if FB_COUNSELING_ONLY.search(text) is None:
         for rx in FB_NEVER_PATTERNS:
             mm = _find_first(rx, text)
@@ -1079,7 +1169,6 @@ def fallback_extract_smoking_from_full_note(row, recon_dt):
     if not candidates:
         return []
 
-    # Prioritize inside fallback
     def fb_rank(c):
         st = clean_cell(getattr(c, "status", ""))
         val = clean_cell(getattr(c, "value", ""))
