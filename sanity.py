@@ -14,7 +14,8 @@
 #    - current narrative missed
 #    - never-vs-former confusion
 #
-# MRN is used internally but NOT written to output.
+# UPDATED:
+# - MRN is now written to output.
 #
 # Python 3.6.8 compatible
 
@@ -252,6 +253,7 @@ for _, r in mismatches.iterrows():
     )
 
     rows.append({
+        "MRN": mrn,
         "Mismatch_Category": category,
         "Gold": gold_val,
         "Pred": pred_val,
@@ -264,7 +266,6 @@ for _, r in mismatches.iterrows():
 
 qa = pd.DataFrame(rows)
 
-# sort for easier review
 sort_order = {
     "recent_quit_or_current_narrative_missed": 1,
     "former_template_misread_as_current": 2,
