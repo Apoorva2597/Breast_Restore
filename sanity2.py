@@ -3,7 +3,7 @@
 #
 # For smoking mismatches categorized as "no_evidence_row",
 # search ALL reconstructed full notes (entire note text, not sections)
-# using a broad smoking/tobacco keyword pattern.
+# using a tighter phrase-based smoking/tobacco pattern list.
 #
 # Outputs:
 #   _outputs/qa_no_evidence_full_note_grep_hits.csv
@@ -32,9 +32,58 @@ NOTE_GLOBS = [
     "{0}/**/HPI11526*operation notes.csv".format(BASE_DIR),
 ]
 
-# Broad grep-style smoking pattern
+# Tighter phrase-based smoking pattern list.
+# Intentionally avoids loose stems like "quit", "smok", "tob", "pack"
+# by themselves because they produced too many false positives.
 SMOKING_RX = re.compile(
-    r"(smok|tob|nicot|cig|ppd|pack|quit|deni)",
+    r"("
+    r"\bcurrent smoker\b|"
+    r"\bformer smoker\b|"
+    r"\bnever smoker\b|"
+    r"\bcurrent every day smoker\b|"
+    r"\bcurrent some day smoker\b|"
+    r"\bevery day smoker\b|"
+    r"\bsome day smoker\b|"
+    r"\bnonsmoker\b|"
+    r"\bnon[- ]smoker\b|"
+    r"\bsmoking status\b|"
+    r"\btobacco use\b|"
+    r"\bsmokeless tobacco\b|"
+    r"\bquit smoking\b|"
+    r"\bstopped smoking\b|"
+    r"\bquit date\b|"
+    r"\byears since quitting\b|"
+    r"\blast attempt to quit\b|"
+    r"\bpack years?\b|"
+    r"\bpacks?/day\b|"
+    r"\bcigarettes?\b|"
+    r"\bdenies smoking\b|"
+    r"\bdenies tobacco\b|"
+    r"\bdenies tobacco use\b|"
+    r"\bdenies use of tobacco products\b|"
+    r"\bdenies use of tobacco\b|"
+    r"\bdenies tobacco or alcohol use\b|"
+    r"\bdenies use of tobacco,\s*alcohol\s*or\s*recreational drug use\b|"
+    r"\bdenies use of tobacco,\s*alcohol\s*or\s*illicit drug use\b|"
+    r"\bdoes not smoke\b|"
+    r"\bdoes not smoke or use nicotine\b|"
+    r"\bdoes not drink alcohol or smoke\b|"
+    r"\bdoes not drink alcohol or use tobacco\b|"
+    r"\bno smoking\b|"
+    r"\bno tobacco use\b|"
+    r"\bnever used tobacco\b|"
+    r"\bno history of tobacco\b|"
+    r"\bno history of tobacco use\b|"
+    r"\bdoes not smoke or use nicotine\b|"
+    r"\bsmokes?\s+(?:a\s+)?(?:couple|few)\s+cigarettes?\s+(?:a|per)\s+(?:day|week)\b|"
+    r"\bsmokes?\s+\d+(?:\.\d+)?\s+cigarettes?\s+(?:a|per)\s+(?:day|week)\b|"
+    r"\bsmokes?\s+\d+(?:\.\d+)?\s*packs?\s*/?\s*(?:day|week)\b|"
+    r"\bsmokes?\s+every\s+once\s+in\s+a\s+while\b|"
+    r"\bstill smoking\b|"
+    r"\bcontinues to smoke\b|"
+    r"\bcurrently smoking\b|"
+    r"\bcurrently smokes\b"
+    r")",
     re.IGNORECASE
 )
 
