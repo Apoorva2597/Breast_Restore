@@ -82,6 +82,7 @@ NEVER_PATTERNS = [
 SCREENING_NEVER_PATTERNS = [
     re.compile(r"\bactive tobacco use\?\s*no\b", re.IGNORECASE),
     re.compile(r"\bcurrently smoking\?\s*no\b", re.IGNORECASE),
+    re.compile(r"\bis patient currently smoking\?\s*no\b", re.IGNORECASE),
     re.compile(r"\bactive tobacco use\s*[:\-]?\s*no\b", re.IGNORECASE),
     re.compile(r"\bcurrent tobacco use\s*[:\-]?\s*no\b", re.IGNORECASE),
     re.compile(r"\bno tobacco use\b", re.IGNORECASE),
@@ -134,6 +135,11 @@ RECENT_QUIT_CONTEXT_PATTERN = re.compile(
 
 QUESTIONNAIRE_QUIT_PATTERN = re.compile(
     r"\b(resources?\s+to\s+help\s+quit\s+smoking|interested\s+in\s+resources?\s+to\s+help\s+quit\s+smoking|referral\s+to\s+mhealthy|referred\s+to\s+mhealthy|advised\s+by\s+provider\s+to\s+quit\s+smoking|plans?\s+to\s+quit)\b",
+    re.IGNORECASE
+)
+
+QUESTIONNAIRE_FALSE_CURRENT_PATTERN = re.compile(
+    r"\b(is patient currently smoking\?\s*no|currently smoking\?\s*no|active tobacco use\?\s*no|current tobacco use\?\s*no|if active smoker\b|was patient advised by provider to quit smoking\?|was patient referred to mhealthy\?)\b",
     re.IGNORECASE
 )
 
@@ -265,6 +271,13 @@ def _is_questionnaire_quit_context(text, start, end):
     return QUESTIONNAIRE_QUIT_PATTERN.search(ctx) is not None
 
 
+def _is_questionnaire_false_current_context(text, start, end):
+    left = max(0, start - 200)
+    right = min(len(text), end + 200)
+    ctx = text[left:right]
+    return QUESTIONNAIRE_FALSE_CURRENT_PATTERN.search(ctx) is not None
+
+
 def _find_best(patterns, text, note, section, value, confidence, suppress_family=True):
     best = None
     best_key = None
@@ -272,6 +285,9 @@ def _find_best(patterns, text, note, section, value, confidence, suppress_family
     for rx in patterns:
         for m in rx.finditer(text):
             if suppress_family and _is_family_history_context(text, m.start(), m.end()):
+                continue
+
+            if value == "Current" and _is_questionnaire_false_current_context(text, m.start(), m.end()):
                 continue
 
             cand = _candidate(note, section, value, text, m.start(), m.end(), confidence)
