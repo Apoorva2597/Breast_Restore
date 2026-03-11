@@ -22,6 +22,15 @@ existing finalized validation behavior:
 - Obesity_from_BMI
 - Obesity_from_BMI_tol_0_5
 
+UPDATED PBS VALIDATION:
+Added:
+- PastBreastSurgery
+- PBS_Lumpectomy
+- PBS_Breast Reduction
+- PBS_Mastopexy
+- PBS_Augmentation
+- PBS_Other
+
 Compatible with Python 3.6.8.
 """
 
@@ -51,7 +60,12 @@ BINARY_VARS = [
     "CardiacDisease",
     "VenousThromboembolism",
     "Steroid",
+    "PastBreastSurgery",
     "PBS_Lumpectomy",
+    "PBS_Breast Reduction",
+    "PBS_Mastopexy",
+    "PBS_Augmentation",
+    "PBS_Other",
     "Radiation",
     "Chemo"
 ]
@@ -75,7 +89,6 @@ def safe_read_csv(path):
 # ---------------------------------------------------
 
 def clean_string_series(series):
-
     series = series.copy()
     series = series.astype(str)
     series = series.str.strip()
@@ -95,9 +108,7 @@ def clean_string_series(series):
 
 
 def normalize_categorical(series):
-
     series = clean_string_series(series)
-
     series = series.astype("object")
 
     mask = series.notna()
@@ -113,11 +124,9 @@ def normalize_categorical(series):
 
 
 def normalize_binary(series):
-
     series = clean_string_series(series)
 
     def conv(x):
-
         if pd.isna(x):
             return pd.NA
 
@@ -135,9 +144,7 @@ def normalize_binary(series):
 
 
 def normalize_numeric(series):
-
     series = clean_string_series(series)
-
     return pd.to_numeric(series, errors="coerce")
 
 
@@ -146,7 +153,6 @@ def normalize_numeric(series):
 # ---------------------------------------------------
 
 def normalize_race_token(token):
-
     s = str(token).strip().lower()
 
     if s in ["", "nan", "none", "null", "na"]:
@@ -191,7 +197,6 @@ def normalize_race_token(token):
 
 
 def collapse_race_value(x):
-
     if pd.isna(x):
         return pd.NA
 
@@ -201,7 +206,6 @@ def collapse_race_value(x):
         return pd.NA
 
     pieces = []
-
     tmp = raw.replace(";", ",")
 
     for part in tmp.split(","):
@@ -216,7 +220,6 @@ def collapse_race_value(x):
     saw_unknown = False
 
     for p in pieces:
-
         norm = normalize_race_token(p)
 
         if not norm:
@@ -241,9 +244,7 @@ def collapse_race_value(x):
 
 
 def normalize_race_series(series):
-
     series = clean_string_series(series)
-
     return series.apply(collapse_race_value)
 
 
@@ -252,7 +253,6 @@ def normalize_race_series(series):
 # ---------------------------------------------------
 
 def compute_categorical_metrics(pred, gold):
-
     pred = normalize_categorical(pred)
     gold = normalize_categorical(gold)
 
@@ -267,14 +267,12 @@ def compute_categorical_metrics(pred, gold):
         return 0.0, 0, 0
 
     matches = (pred == gold).sum()
-
     accuracy = float(matches) / float(total)
 
     return accuracy, int(matches), int(total)
 
 
 def compute_race_metrics(pred, gold):
-
     pred = normalize_race_series(pred)
     gold = normalize_race_series(gold)
 
@@ -289,14 +287,12 @@ def compute_race_metrics(pred, gold):
         return 0.0, 0, 0
 
     matches = (pred == gold).sum()
-
     accuracy = float(matches) / float(total)
 
     return accuracy, int(matches), int(total)
 
 
 def compute_binary_metrics(pred, gold):
-
     pred = normalize_binary(pred)
     gold = normalize_binary(gold)
 
@@ -311,14 +307,12 @@ def compute_binary_metrics(pred, gold):
         return 0.0, 0, 0
 
     matches = (pred == gold).sum()
-
     accuracy = float(matches) / float(total)
 
     return accuracy, int(matches), int(total)
 
 
 def compute_numeric_metrics(pred, gold, tolerance=None):
-
     pred = normalize_numeric(pred)
     gold = normalize_numeric(gold)
 
@@ -343,7 +337,6 @@ def compute_numeric_metrics(pred, gold, tolerance=None):
 
 
 def compute_age_floor_round_metrics(pred, gold):
-
     pred = normalize_numeric(pred)
     gold = normalize_numeric(gold)
 
@@ -373,7 +366,6 @@ def compute_age_floor_round_metrics(pred, gold):
 # ---------------------------------------------------
 
 def compute_bmi_round_integer_metrics(pred, gold):
-
     pred = normalize_numeric(pred)
     gold = normalize_numeric(gold)
 
@@ -388,14 +380,12 @@ def compute_bmi_round_integer_metrics(pred, gold):
         return 0.0, 0, 0
 
     matches = (pred.round(0) == gold.round(0)).sum()
-
     accuracy = float(matches) / float(total)
 
     return accuracy, int(matches), int(total)
 
 
 def compute_obesity_from_bmi_metrics(pred, gold, tolerance=None):
-
     pred = normalize_numeric(pred)
     gold = normalize_numeric(gold)
 
@@ -428,7 +418,6 @@ def compute_obesity_from_bmi_metrics(pred, gold, tolerance=None):
 # ---------------------------------------------------
 
 def main():
-
     print("Loading files...")
 
     master = safe_read_csv(MASTER_FILE)
@@ -473,7 +462,6 @@ def main():
     results = []
 
     for v in ALL_VARIABLES:
-
         pred_col = v + "_pred"
         gold_col = v + "_gold"
 
@@ -509,18 +497,15 @@ def main():
             "total_compared": total
         })
 
-
     # -----------------------------------------------
     # Supplemental BMI / obesity validation
     # -----------------------------------------------
 
     if "BMI_pred" in merged.columns and "BMI_gold" in merged.columns:
-
         pred_bmi = merged["BMI_pred"]
         gold_bmi = merged["BMI_gold"]
 
         acc, matches, total = compute_numeric_metrics(pred_bmi, gold_bmi, tolerance=0.5)
-
         results.append({
             "variable": "BMI_close_0_5",
             "accuracy": acc,
@@ -529,7 +514,6 @@ def main():
         })
 
         acc, matches, total = compute_numeric_metrics(pred_bmi, gold_bmi, tolerance=1.0)
-
         results.append({
             "variable": "BMI_close_1_0",
             "accuracy": acc,
@@ -538,7 +522,6 @@ def main():
         })
 
         acc, matches, total = compute_bmi_round_integer_metrics(pred_bmi, gold_bmi)
-
         results.append({
             "variable": "BMI_round_integer",
             "accuracy": acc,
@@ -547,7 +530,6 @@ def main():
         })
 
         acc, matches, total = compute_obesity_from_bmi_metrics(pred_bmi, gold_bmi, tolerance=None)
-
         results.append({
             "variable": "Obesity_from_BMI",
             "accuracy": acc,
@@ -556,14 +538,12 @@ def main():
         })
 
         acc, matches, total = compute_obesity_from_bmi_metrics(pred_bmi, gold_bmi, tolerance=0.5)
-
         results.append({
             "variable": "Obesity_from_BMI_tol_0_5",
             "accuracy": acc,
             "matches": matches,
             "total_compared": total
         })
-
 
     df = pd.DataFrame(results)
 
@@ -574,7 +554,6 @@ def main():
         os.makedirs("_outputs")
 
     out_path = "_outputs/validation_summary.csv"
-
     df.to_csv(out_path, index=False)
 
     print("\nValidation complete.")
