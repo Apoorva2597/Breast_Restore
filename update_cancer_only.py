@@ -89,7 +89,6 @@ ALND_RX = re.compile(
     r"completion\s+axillary\s+lymph\s+node\s+dissection|"
     r"completion\s+node\s+dissection|"
     r"complete\s+axillary\s+dissection|"
-    r"lymph\s+node\s+dissection|"
     r"\bALND\b"
     r")\b",
     re.IGNORECASE
@@ -144,6 +143,17 @@ LN_PLAN_RX = re.compile(
     r"if\s+positive|if\s+needed|potential|"
     r"could\s+require|would\s+require|"
     r"pending|depending\s+on|awaiting"
+    r")\b",
+    re.IGNORECASE
+)
+
+LN_FAIL_MAP_RX = re.compile(
+    r"\b("
+    r"failed\s+to\s+map|"
+    r"mapping\s+failed|"
+    r"unable\s+to\s+map|"
+    r"no\s+sentinel\s+node\s+identified|"
+    r"no\s+sentinel\s+nodes?\s+identified"
     r")\b",
     re.IGNORECASE
 )
@@ -930,15 +940,18 @@ def _lymph_score(value, note_type, note_date, evidence, recon_dt):
     ev = clean_cell(evidence).lower()
     nd = parse_date_safe(note_date)
 
+    if LN_FAIL_MAP_RX.search(ev) and ALND_RX.search(ev):
+        score += 50.0
+
     if v == "ALND":
         score += 30.0
     elif v == "SLNB":
         score += 20.0
 
     if _is_clinic_like_note_type(nt):
-        score += 14.0
+        score += 16.0
     elif _is_op_like_note_type(nt):
-        score += 7.0
+        score += 8.0
 
     if LN_DONE_RX.search(ev):
         score += 10.0
@@ -947,17 +960,17 @@ def _lymph_score(value, note_type, note_date, evidence, recon_dt):
         score += 8.0
 
     if LN_PLAN_RX.search(ev):
-        score -= 25.0
+        score -= 30.0
 
     if recon_dt is not None and nd is not None:
         dd = days_between(nd, recon_dt)
         if dd is not None:
             if dd >= 0 and _is_clinic_like_note_type(nt):
-                score += 28.0
+                score += 30.0
                 if dd <= 180:
                     score += 6.0
             elif dd < 0 and _is_clinic_like_note_type(nt):
-                score -= 15.0
+                score -= 18.0
             elif dd >= 0 and _is_op_like_note_type(nt):
                 score += 4.0
 
@@ -1101,7 +1114,7 @@ def main():
             else:
                 best_by_mrn[mrn][logical] = choose_best(existing, c)
 
-    print("Resolving lymph node using post-recon clinic notes first...")
+    print("Resolving lymph node using ordered post-recon logic...")
     for mrn, cands in lymphnode_by_mrn.items():
         recon_info = recon_anchor_map.get(mrn)
         recon_dt = parse_date_safe((recon_info or {}).get("recon_date", ""))
@@ -1256,7 +1269,3 @@ def main():
     print("- Appended evidence: {0}".format(EVID_PATH))
     print("\nRun:")
     print(" python build_master_rule_CANCER_RECON_PATCH.py")
-
-
-if __name__ == "__main__":
-    main()
