@@ -17,12 +17,6 @@
 # - Recon_Classification
 # - Recon_Timing
 #
-# IMPORTANT:
-# - Reads the EXISTING original master file
-# - Updates ONLY the target variables above
-# - Preserves all other columns exactly as they already are
-# - Writes back to the SAME original master/evidence paths
-#
 # Python 3.6.8 compatible
 
 import os
@@ -86,22 +80,71 @@ MASTECTOMY_RX = re.compile(
 )
 
 ALND_RX = re.compile(
-    r"\b(axillary\s+lymph\s+node\s+dissection|axillary\s+dissection|\bALND\b)\b",
+    r"\b("
+    r"axillary\s+lymph\s+node\s+dissection|"
+    r"axillary\s+node\s+dissection|"
+    r"axillary\s+dissection|"
+    r"axillary\s+clearance|"
+    r"completion\s+axillary\s+dissection|"
+    r"completion\s+axillary\s+lymph\s+node\s+dissection|"
+    r"completion\s+node\s+dissection|"
+    r"complete\s+axillary\s+dissection|"
+    r"lymph\s+node\s+dissection|"
+    r"\bALND\b"
+    r")\b",
     re.IGNORECASE
 )
 
 SLNB_RX = re.compile(
-    r"\b(sentinel\s+lymph\s+node\s+biopsy|sentinel\s+node\s+biopsy|\bSLNB\b|lymphatic\s+mapping)\b",
+    r"\b("
+    r"sentinel\s+lymph\s+node\s+biopsy|"
+    r"sentinel\s+node\s+biopsy|"
+    r"sentinel\s+lymph\s+node\s+excision|"
+    r"sentinel\s+node\s+excision|"
+    r"sentinel\s+lymphadenectomy|"
+    r"lymphatic\s+mapping|"
+    r"sentinel\s+node\s+mapping|"
+    r"sentinel\s+mapping|"
+    r"sentinel\s+nodes?\s+removed|"
+    r"sentinel\s+node\s+removed|"
+    r"\bSLNB\b"
+    r")\b",
     re.IGNORECASE
 )
 
 LN_DONE_RX = re.compile(
-    r"\b(s/p|status\s+post|underwent|completed|had|has\s+had|received)\b",
+    r"\b("
+    r"s/p|status\s+post|underwent|completed|received|"
+    r"done|performed|had|has\s+had"
+    r")\b",
+    re.IGNORECASE
+)
+
+LN_HISTORY_RX = re.compile(
+    r"\b("
+    r"hx\s+of|history\s+of|prior|previous|"
+    r"s/p|status\s+post|"
+    r"had|has\s+had|"
+    r"underwent|completed|received|"
+    r"done|performed|"
+    r"nodes?\s+removed|"
+    r"sentinel\s+nodes?\s+removed|"
+    r"axillary\s+dissection\s+performed|"
+    r"axillary\s+clearance\s+performed"
+    r")\b",
     re.IGNORECASE
 )
 
 LN_PLAN_RX = re.compile(
-    r"\b(plan|planned|planning|possible|possibly|consider|candidate|may\s+need|might\s+need|if\s+positive|if\s+needed|potential)\b",
+    r"\b("
+    r"plan|planned|planning|"
+    r"possible|possibly|"
+    r"consider|considered|candidate|"
+    r"may\s+need|might\s+need|"
+    r"if\s+positive|if\s+needed|potential|"
+    r"could\s+require|would\s+require|"
+    r"pending|depending\s+on|awaiting"
+    r")\b",
     re.IGNORECASE
 )
 
@@ -409,16 +452,6 @@ KEYWORD_PREFILTER = re.compile(
     r"radiation|xrt|pmrt|chemo|chemotherapy|taxol|herceptin|"
     r"sentinel|axillary|alnd|slnb|prophylactic|carcinoma|dcis|lcis|oncology"
     r")\b",
-    re.IGNORECASE
-)
-
-REVISION_RECON_ONLY_RX = re.compile(
-    r"\b(revision|fat graft|fat grafting|nipple reconstruction|nipple-areolar|tattoo|capsulotomy|capsulectomy|symmetry|scar revision|dog ear|liposuction|capsulorrhaphy)\b",
-    re.IGNORECASE
-)
-
-ANCHOR_RECON_RX = re.compile(
-    r"\b(tissue expander placement|expander placement|implant placement|implant-based reconstruction|direct-to-implant|diep flap|tram flap|siea flap|latissimus dorsi flap|free flap|autologous reconstruction|immediate reconstruction|delayed reconstruction|breast reconstruction)\b",
     re.IGNORECASE
 )
 
@@ -901,29 +934,30 @@ def _lymph_score(value, note_type, note_date, evidence, recon_dt):
         score += 30.0
     elif v == "SLNB":
         score += 20.0
-    else:
-        score += 0.0
 
     if _is_clinic_like_note_type(nt):
-        score += 12.0
+        score += 14.0
     elif _is_op_like_note_type(nt):
-        score += 6.0
+        score += 7.0
 
     if LN_DONE_RX.search(ev):
         score += 10.0
 
+    if LN_HISTORY_RX.search(ev):
+        score += 8.0
+
     if LN_PLAN_RX.search(ev):
-        score -= 20.0
+        score -= 25.0
 
     if recon_dt is not None and nd is not None:
         dd = days_between(nd, recon_dt)
         if dd is not None:
             if dd >= 0 and _is_clinic_like_note_type(nt):
-                score += 25.0
-                if dd <= 120:
+                score += 28.0
+                if dd <= 180:
                     score += 6.0
             elif dd < 0 and _is_clinic_like_note_type(nt):
-                score -= 18.0
+                score -= 15.0
             elif dd >= 0 and _is_op_like_note_type(nt):
                 score += 4.0
 
@@ -1222,6 +1256,7 @@ def main():
     print("- Appended evidence: {0}".format(EVID_PATH))
     print("\nRun:")
     print(" python build_master_rule_CANCER_RECON_PATCH.py")
+
 
 if __name__ == "__main__":
     main()
