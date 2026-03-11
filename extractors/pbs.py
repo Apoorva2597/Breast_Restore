@@ -59,15 +59,24 @@ MASTOPEXY_PATTERNS = [
     re.compile(r"\bbreast\s+lift\b", re.I),
 ]
 
+# -----------------------------
+# REVISED AUGMENTATION PATTERNS
+# -----------------------------
 AUGMENT_PATTERNS = [
     re.compile(r"\bbreast\s+augmentation\b", re.I),
     re.compile(r"\baugmentation\s+mammaplasty\b", re.I),
-    re.compile(r"\bsubpectoral\s+implant\s+placement\b", re.I),
-    re.compile(r"\bbreast\s+implant(?:s)?\b", re.I),
-    re.compile(r"\bimplant\s+placement\b", re.I),
+    re.compile(r"\bcosmetic\s+breast\s+augmentation\b", re.I),
+    re.compile(r"\bcosmetic\s+augmentation\b", re.I),
+    re.compile(r"\bs/p\s+(?:bilateral\s+|left\s+|right\s+)?augmentation\b", re.I),
+    re.compile(r"\bhistory\s+of\s+(?:bilateral\s+|left\s+|right\s+)?breast\s+augmentation\b", re.I),
+    re.compile(r"\bprior\s+(?:bilateral\s+|left\s+|right\s+)?breast\s+augmentation\b", re.I),
+    re.compile(r"\bprevious\s+(?:bilateral\s+|left\s+|right\s+)?breast\s+augmentation\b", re.I),
+    re.compile(r"\bbreast\s+implants?\s+for\s+augmentation\b", re.I),
+    re.compile(r"\bcosmetic\s+breast\s+implants?\b", re.I),
+    re.compile(r"\bsaline\s+breast\s+implants?\b", re.I),
+    re.compile(r"\bsilicone\s+breast\s+implants?\b", re.I),
 ]
 
-# Tightened OTHER: no generic "biopsy"
 OTHER_PATTERNS = [
     re.compile(r"\bexcisional\s+biopsy\b", re.I),
     re.compile(r"\bopen\s+breast\s+biopsy\b", re.I),
@@ -80,7 +89,7 @@ FIELD_CONFIG = [
     ("PBS_Lumpectomy", LUMP_PATTERNS, 0.92, "lumpectomy"),
     ("PBS_Breast Reduction", REDUCTION_PATTERNS, 0.84, "strict_history"),
     ("PBS_Mastopexy", MASTOPEXY_PATTERNS, 0.84, "strict_history"),
-    ("PBS_Augmentation", AUGMENT_PATTERNS, 0.84, "strict_history"),
+    ("PBS_Augmentation", AUGMENT_PATTERNS, 0.86, "augmentation"),
     ("PBS_Other", OTHER_PATTERNS, 0.80, "strict_history"),
 ]
 
@@ -115,6 +124,61 @@ def _lumpectomy_history_near(text, start, end):
 def _strict_history_near(text, start, end):
     ctx = window_around(text, start, end, 180)
     return _has_any(STRONG_HISTORY_PATTERNS, ctx)
+
+
+def _augmentation_history_near(text, start, end):
+    ctx = window_around(text, start, end, 220)
+
+    # positive historical / cosmetic cues
+    positive = [
+        re.compile(r"\bs/p\b", re.I),
+        re.compile(r"\bhistory\s+of\b", re.I),
+        re.compile(r"\bprior\b", re.I),
+        re.compile(r"\bprevious\b", re.I),
+        re.compile(r"\bcosmetic\b", re.I),
+        re.compile(r"\bfor\s+augmentation\b", re.I),
+        re.compile(r"\baugmentation\b", re.I),
+    ]
+
+    # reconstruction-related cues we do NOT want augmentation to fire on
+    negative = [
+        re.compile(r"\breconstruction\b", re.I),
+        re.compile(r"\bimplant[- ]based\s+reconstruction\b", re.I),
+        re.compile(r"\btissue\s+expander\b", re.I),
+        re.compile(r"\bexpander\b", re.I),
+        re.compile(r"\bimplant\s+exchange\b", re.I),
+        re.compile(r"\bexchange\s+of\s+(?:the\s+)?(?:tissue\s+expanders?|implants?)\b", re.I),
+        re.compile(r"\bpermanent\s+(?:silicone|saline)\s+breast\s+implants?\b", re.I),
+        re.compile(r"\bbreast\s+implant\s+reconstruction\b", re.I),
+        re.compile(r"\bpost[- ]mastectomy\b", re.I),
+        re.compile(r"\bmastectomy\b", re.I),
+    ]
+
+    has_positive = False
+    for rx in positive:
+        if rx.search(ctx):
+            has_positive = True
+            break
+
+    has_negative = False
+    for rx in negative:
+        if rx.search(ctx):
+            has_negative = True
+            break
+
+    # Require a positive cue. If strong reconstruction cues dominate,
+    # do not label as augmentation history here.
+    if has_positive and not has_negative:
+        return True
+
+    # allow explicit augmentation phrasing even if surrounding note is noisy
+    explicit = [
+        re.compile(r"\bbreast\s+augmentation\b", re.I),
+        re.compile(r"\baugmentation\s+mammaplasty\b", re.I),
+        re.compile(r"\bcosmetic\s+augmentation\b", re.I),
+        re.compile(r"\bbreast\s+implants?\s+for\s+augmentation\b", re.I),
+    ]
+    return _has_any(explicit, ctx)
 
 
 def _emit(field, text, m, section, note, conf, status):
@@ -152,10 +216,17 @@ def extract_pbs(note: SectionedNote) -> List[Candidate]:
                         hist = _lumpectomy_history_near(text, m.start(), m.end())
                         status = "history_possible" if hist else "procedure_mention"
                         cands.append(_emit(field, text, m, section, note, conf, status))
+
                     elif mode == "strict_history":
                         hist = _strict_history_near(text, m.start(), m.end())
                         status = "history_possible" if hist else "procedure_mention"
                         cands.append(_emit(field, text, m, section, note, conf, status))
+
+                    elif mode == "augmentation":
+                        hist = _augmentation_history_near(text, m.start(), m.end())
+                        status = "history_possible" if hist else "procedure_mention"
+                        cands.append(_emit(field, text, m, section, note, conf, status))
+
                     else:
                         cands.append(_emit(field, text, m, section, note, conf, "procedure_mention"))
 
