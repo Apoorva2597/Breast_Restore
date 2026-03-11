@@ -55,7 +55,7 @@ RECON_RX = re.compile(
 )
 
 # ------------------------------
-# Lymph node procedure patterns
+# Lymph node patterns
 # ------------------------------
 
 ALND_RX = re.compile(
@@ -68,7 +68,6 @@ ALND_RX = re.compile(
     r"completion\s+axillary\s+lymph\s+node\s+dissection|"
     r"completion\s+node\s+dissection|"
     r"complete\s+axillary\s+dissection|"
-    r"lymph\s+node\s+dissection|"
     r"\bALND\b"
     r")\b",
     re.IGNORECASE
@@ -91,6 +90,14 @@ SLNB_RX = re.compile(
     re.IGNORECASE
 )
 
+LN_DONE_RX = re.compile(
+    r"\b("
+    r"s/p|status\s+post|underwent|completed|received|"
+    r"done|performed|had|has\s+had"
+    r")\b",
+    re.IGNORECASE
+)
+
 LN_HISTORY_RX = re.compile(
     r"\b("
     r"hx\s+of|history\s+of|prior|previous|"
@@ -106,14 +113,6 @@ LN_HISTORY_RX = re.compile(
     re.IGNORECASE
 )
 
-LN_COMPLETED_RX = re.compile(
-    r"\b("
-    r"s/p|status\s+post|underwent|completed|received|"
-    r"done|performed|had|has\s+had"
-    r")\b",
-    re.IGNORECASE
-)
-
 LN_PLAN_RX = re.compile(
     r"\b("
     r"plan|planned|planning|"
@@ -123,6 +122,17 @@ LN_PLAN_RX = re.compile(
     r"if\s+positive|if\s+needed|potential|"
     r"could\s+require|would\s+require|"
     r"pending|depending\s+on|awaiting"
+    r")\b",
+    re.IGNORECASE
+)
+
+LN_FAIL_MAP_RX = re.compile(
+    r"\b("
+    r"failed\s+to\s+map|"
+    r"mapping\s+failed|"
+    r"unable\s+to\s+map|"
+    r"no\s+sentinel\s+node\s+identified|"
+    r"no\s+sentinel\s+nodes?\s+identified"
     r")\b",
     re.IGNORECASE
 )
@@ -461,24 +471,29 @@ def _strong_chemo_history(ctx):
 def _lymphnode_value_from_text(text, op_note, clinic_like):
     low = (text or "").lower()
 
+    # failed mapping with conversion -> ALND
+    if LN_FAIL_MAP_RX.search(low) and ALND_RX.search(low):
+        mm = ALND_RX.search(text)
+        return "ALND", mm
+
     alnd_match = ALND_RX.search(text)
     if alnd_match:
-        ctx = _window(low, alnd_match.start(), alnd_match.end(), 140)
+        ctx = _window(low, alnd_match.start(), alnd_match.end(), 160)
         if not _looks_negated_or_planned(ctx, op_note):
             if clinic_like:
-                if LN_COMPLETED_RX.search(ctx) or LN_HISTORY_RX.search(ctx):
+                if LN_DONE_RX.search(ctx) or LN_HISTORY_RX.search(ctx):
                     return "ALND", alnd_match
-            if op_note and CURRENT_PROCEDURE_CUE_RX.search(ctx):
+            if op_note and (CURRENT_PROCEDURE_CUE_RX.search(ctx) or LN_DONE_RX.search(ctx)):
                 return "ALND", alnd_match
 
     slnb_match = SLNB_RX.search(text)
     if slnb_match:
-        ctx = _window(low, slnb_match.start(), slnb_match.end(), 140)
+        ctx = _window(low, slnb_match.start(), slnb_match.end(), 160)
         if not _looks_negated_or_planned(ctx, op_note):
             if clinic_like:
-                if LN_COMPLETED_RX.search(ctx) or LN_HISTORY_RX.search(ctx):
+                if LN_DONE_RX.search(ctx) or LN_HISTORY_RX.search(ctx):
                     return "SLNB", slnb_match
-            if op_note and CURRENT_PROCEDURE_CUE_RX.search(ctx):
+            if op_note and (CURRENT_PROCEDURE_CUE_RX.search(ctx) or LN_DONE_RX.search(ctx)):
                 return "SLNB", slnb_match
 
     return None, None
@@ -604,16 +619,16 @@ def extract_breast_cancer_recon(note):
 
                 lymph_value, lymph_match = _lymphnode_value_from_text(text, op_note, clinic_like)
                 if lymph_value == "ALND":
-                    conf = 0.86 if clinic_like else 0.82
+                    conf = 0.88 if clinic_like else 0.80
                     if op_note:
-                        conf = 0.78
+                        conf = 0.76
                     if section_low_value and not op_note:
                         conf -= 0.10
                     cands.append(_emit("LymphNode", "ALND", text, lymph_match, section, note, conf))
                 elif lymph_value == "SLNB":
-                    conf = 0.84 if clinic_like else 0.80
+                    conf = 0.86 if clinic_like else 0.78
                     if op_note:
-                        conf = 0.76
+                        conf = 0.74
                     if section_low_value and not op_note:
                         conf -= 0.10
                     cands.append(_emit("LymphNode", "SLNB", text, lymph_match, section, note, conf))
