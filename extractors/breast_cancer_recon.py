@@ -110,7 +110,8 @@ NEGATION_RX = re.compile(
 
 PLANNED_RX = re.compile(
     r"\b("
-    r"plan|planned|planning|will|scheduled|schedule|candidate|consider|recommend|discuss"
+    r"plan|planned|planning|will|scheduled|schedule|candidate|consider|recommend|discuss|"
+    r"possible|possibly|may\s+need|might\s+need|if\s+positive|if\s+needed|potential"
     r")\b",
     re.IGNORECASE
 )
@@ -172,20 +173,20 @@ WEAK_TREATMENT_EXCLUDE_RX = re.compile(
     re.IGNORECASE
 )
 
-HISTORY_ONLY_RX = re.compile(
+CURRENT_PROCEDURE_CUE_RX = re.compile(
     r"\b("
-    r"history\s+of|hx\s+of|status\s+post|s/p|previous|prior|remote|"
-    r"has\s+had|had\s+a|underwent"
+    r"procedure|procedures|operation|operative|surgery|surgical|"
+    r"performed|we\s+performed|intraoperative|preoperative|postoperative|"
+    r"placement|reconstruction\s+with|mastectomy\s+with|"
+    r"sentinel\s+lymph\s+node\s+biopsy|axillary\s+lymph\s+node\s+dissection"
     r")\b",
     re.IGNORECASE
 )
 
-CURRENT_PROCEDURE_CUE_RX = re.compile(
+LN_COMPLETED_RX = re.compile(
     r"\b("
-    r"procedure|procedures|operation|operative|surgery|surgical|"
-    r"performed|we\s+performed|underwent|intraoperative|preoperative|postoperative|"
-    r"placement|reconstruction\s+with|mastectomy\s+with|"
-    r"sentinel\s+lymph\s+node\s+biopsy|axillary\s+lymph\s+node\s+dissection"
+    r"s/p|status\s+post|underwent|completed|had|has\s+had|"
+    r"received"
     r")\b",
     re.IGNORECASE
 )
@@ -302,13 +303,6 @@ def _match_side_relation(low, side_terms, clinical_terms, width):
     return bool(p1 or p2)
 
 
-def _is_history_only_context(text):
-    low = (text or "").lower()
-    if HISTORY_ONLY_RX.search(low) and not CURRENT_PROCEDURE_CUE_RX.search(low):
-        return True
-    return False
-
-
 def _sentence_side_local_value(sent, side):
     low = sent.lower()
 
@@ -352,7 +346,6 @@ def _infer_indications(text, lat, op_note=False):
     note_has_pro = bool(PROPHYLAXIS_RX.search(low))
     note_has_mast = bool(MASTECTOMY_RX.search(low))
 
-    # conservative side-local assignments first
     if left_pro:
         left_val = "Prophylactic"
     elif left_cancer:
@@ -363,14 +356,12 @@ def _infer_indications(text, lat, op_note=False):
     elif right_cancer:
         right_val = "Therapeutic"
 
-    # only allow generic fallback if unilateral and cancer present without prophylactic language
     if left_val is None and lat == "LEFT" and note_has_cancer and note_has_mast and not note_has_pro:
         left_val = "Therapeutic"
 
     if right_val is None and lat == "RIGHT" and note_has_cancer and note_has_mast and not note_has_pro:
         right_val = "Therapeutic"
 
-    # sentence-level local pass
     sents = _split_sentences(text)
     for sent in sents:
         if left_val is None:
@@ -382,7 +373,6 @@ def _infer_indications(text, lat, op_note=False):
             if rv is not None:
                 right_val = rv
 
-    # explicit contralateral prophylactic
     if "contralateral prophylactic" in low:
         if left_cancer and right_val is None:
             right_val = "Prophylactic"
@@ -392,9 +382,6 @@ def _infer_indications(text, lat, op_note=False):
             left_val = "Prophylactic"
             if right_val is None:
                 right_val = "Therapeutic"
-
-    # for bilateral text, do NOT auto-impute prophylactic to other side
-    # if only one side has cancer, keep the other side None unless explicit prophylactic is present
 
     return left_val, right_val
 
@@ -423,25 +410,32 @@ def _strong_chemo_history(ctx):
     return False
 
 
-def _lymphnode_value_from_text(text, op_note):
+def _lymphnode_value_from_text(text, op_note, clinic_like):
     low = (text or "").lower()
 
     alnd_match = ALND_RX.search(text)
     if alnd_match:
-        ctx = _window(low, alnd_match.start(), alnd_match.end(), 100)
+        ctx = _window(low, alnd_match.start(), alnd_match.end(), 120)
+
         if not _looks_negated_or_planned(ctx, op_note):
-            if CURRENT_PROCEDURE_CUE_RX.search(ctx) or op_note:
+            if clinic_like:
+                if LN_COMPLETED_RX.search(ctx):
+                    return "ALND", alnd_match
+            if op_note and CURRENT_PROCEDURE_CUE_RX.search(ctx):
                 return "ALND", alnd_match
 
     slnb_match = SLNB_RX.search(text)
     if slnb_match:
-        ctx = _window(low, slnb_match.start(), slnb_match.end(), 100)
+        ctx = _window(low, slnb_match.start(), slnb_match.end(), 120)
+
         if not _looks_negated_or_planned(ctx, op_note):
-            # suppress weak old-history mentions in non-op notes
-            if (CURRENT_PROCEDURE_CUE_RX.search(ctx) or op_note) and not _is_history_only_context(ctx):
+            if clinic_like:
+                if LN_COMPLETED_RX.search(ctx):
+                    return "SLNB", slnb_match
+            if op_note and CURRENT_PROCEDURE_CUE_RX.search(ctx):
                 return "SLNB", slnb_match
 
-    return "none", None
+    return None, None
 
 
 def _infer_recon_type_and_class(text):
@@ -562,24 +556,22 @@ def extract_breast_cancer_recon(note):
                         base_conf -= 0.10
                     cands.append(_emit("Indication_Right", right_ind, text, m, section, note, base_conf))
 
-                lymph_value, lymph_match = _lymphnode_value_from_text(text, op_note)
+                # Do not emit LymphNode here unless strong actual evidence is present.
+                lymph_value, lymph_match = _lymphnode_value_from_text(text, op_note, clinic_like)
                 if lymph_value == "ALND":
-                    conf = 0.88 if op_note else 0.68
+                    conf = 0.86 if clinic_like else 0.82
+                    if op_note:
+                        conf = 0.78
                     if section_low_value and not op_note:
                         conf -= 0.10
                     cands.append(_emit("LymphNode", "ALND", text, lymph_match, section, note, conf))
                 elif lymph_value == "SLNB":
-                    conf = 0.84 if op_note else 0.66
+                    conf = 0.84 if clinic_like else 0.80
+                    if op_note:
+                        conf = 0.76
                     if section_low_value and not op_note:
                         conf -= 0.10
                     cands.append(_emit("LymphNode", "SLNB", text, lymph_match, section, note, conf))
-                else:
-                    # emit none only in stronger operative/procedure contexts
-                    if op_note or CURRENT_PROCEDURE_CUE_RX.search(ctx):
-                        conf = 0.62 if op_note else 0.48
-                        if section_low_value and not op_note:
-                            conf -= 0.10
-                        cands.append(_emit("LymphNode", "none", text, m, section, note, conf))
 
         r = RECON_RX.search(text)
         if r:
