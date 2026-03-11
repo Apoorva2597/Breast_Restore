@@ -12,12 +12,13 @@ PBS-only updater for:
 - PBS_Augmentation
 - PBS_Other
 
-Hybrid logic:
-- Keep improved lumpectomy handling
+Strategy:
+- Restore the better-performing lumpectomy updater behavior
 - Keep reduction/mastopexy/other strict
 - Keep augmentation strict
 - Preserve laterality inference mainly for lumpectomy
 - Derive PastBreastSurgery from accepted subtype hits
+- Add only a narrow lumpectomy FP filter for obvious treatment-planning language
 
 Outputs:
 1) /home/apokol/Breast_Restore/_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv
@@ -496,7 +497,7 @@ RIGHT_RX = re.compile(r"\b(right|rt)\b|\bright\s+breast\b|\bright[- ]sided\b|\(r
 BILAT_RX = re.compile(r"\b(bilateral|bilat|both\s+breasts?)\b", re.I)
 
 HISTORY_CUE_RX = re.compile(
-    r"\b(s/p|status\s+post|history\s+of|with\s+a\s+history\s+of|prior|previous|remote|previously|underwent|treated\s+with|past\s+surgical\s+history)\b",
+    r"\b(s/p|status\s+post|history\s+of|with\s+a\s+history\s+of|prior|previous|remote|previously|underwent|treated\s+with)\b",
     re.I
 )
 
@@ -512,16 +513,6 @@ CANCER_CONTEXT_RX = re.compile(
 
 YEAR_RX = re.compile(r"\b(?:19|20)\d{2}\b", re.I)
 
-LUMPECTOMY_SCAR_SITE_RX = re.compile(
-    r"\b(lumpectomy\s+scar|lumpectomy\s+site|well[- ]healed\s+lumpectomy\s+scar|after\s+lumpectomy|even\s+after\s+lumpectomy)\b",
-    re.I
-)
-
-LUMPECTOMY_HISTORY_TABLE_RX = re.compile(
-    r"\b(past\s+surgical\s+history|procedure\s+laterality\s+date|surgical\s+history)\b",
-    re.I
-)
-
 AUGMENT_NEGATIVE_CONTEXT_RX = re.compile(
     r"\b(reconstruction|implant[- ]based\s+reconstruction|tissue\s+expander|expander|implant\s+exchange|exchange\s+of\s+(?:the\s+)?(?:tissue\s+expanders?|implants?)|permanent\s+(?:silicone|saline)\s+breast\s+implants?|breast\s+implant\s+reconstruction|post[- ]mastectomy|mastectomy)\b",
     re.I
@@ -529,6 +520,11 @@ AUGMENT_NEGATIVE_CONTEXT_RX = re.compile(
 
 AUGMENT_POSITIVE_CONTEXT_RX = re.compile(
     r"\b(cosmetic|augmentation|history\s+of|prior|previous|previously|s/p|submuscular|saline|silicone|(?:19|20)\d{2})\b",
+    re.I
+)
+
+LUMPECTOMY_STRICT_FP_FILTER_RX = re.compile(
+    r"\b(candidate\s+for\s+lumpectomy|not\s+(?:felt\s+to\s+be\s+)?a\s+lumpectomy\s+candidate|lumpectomy\s+vs\.?\s+mastectomy|treatment\s+options?.{0,120}\blumpectomy\b|discussion\s+of\s+lumpectomy|discussed\s+lumpectomy|recommend(?:ed)?\s+lumpectomy|planned\s+lumpectomy|scheduled\s+for\s+lumpectomy)\b",
     re.I
 )
 
@@ -575,21 +571,14 @@ def infer_laterality_from_field_context(field, text):
         return direct
 
     if field == "PBS_Lumpectomy":
-        patterns_left = [
-            r"\bleft\b.{0,140}\b(?:breast\s+cancer|dcis|carcinoma|lumpectomy|lumpectomy\s+scar|lumpectomy\s+site)\b",
-            r"\b(?:breast\s+cancer|dcis|carcinoma|lumpectomy|lumpectomy\s+scar|lumpectomy\s+site)\b.{0,140}\bleft\b",
-        ]
-        patterns_right = [
-            r"\bright\b.{0,140}\b(?:breast\s+cancer|dcis|carcinoma|lumpectomy|lumpectomy\s+scar|lumpectomy\s+site)\b",
-            r"\b(?:breast\s+cancer|dcis|carcinoma|lumpectomy|lumpectomy\s+scar|lumpectomy\s+site)\b.{0,140}\bright\b",
-        ]
+        left_cancer = re.search(r"\bleft\b.{0,100}\b(?:breast\s+cancer|dcis|carcinoma|lumpectomy)\b", ctx, re.I)
+        right_cancer = re.search(r"\bright\b.{0,100}\b(?:breast\s+cancer|dcis|carcinoma|lumpectomy)\b", ctx, re.I)
+        left_reverse = re.search(r"\b(?:breast\s+cancer|dcis|carcinoma|lumpectomy)\b.{0,100}\bleft\b", ctx, re.I)
+        right_reverse = re.search(r"\b(?:breast\s+cancer|dcis|carcinoma|lumpectomy)\b.{0,100}\bright\b", ctx, re.I)
 
-        left_found = any(re.search(p, ctx, re.I) for p in patterns_left)
-        right_found = any(re.search(p, ctx, re.I) for p in patterns_right)
-
-        if left_found and not right_found:
+        if (left_cancer or left_reverse) and not (right_cancer or right_reverse):
             return "left"
-        if right_found and not left_found:
+        if (right_cancer or right_reverse) and not (left_cancer or left_reverse):
             return "right"
 
     return ""
@@ -665,12 +654,8 @@ def has_year_context(text):
     return YEAR_RX.search(clean_cell(text)) is not None
 
 
-def has_lumpectomy_scar_or_site_context(text):
-    return LUMPECTOMY_SCAR_SITE_RX.search(clean_cell(text)) is not None
-
-
-def has_lumpectomy_history_table_context(text):
-    return LUMPECTOMY_HISTORY_TABLE_RX.search(clean_cell(text)) is not None
+def has_strict_lumpectomy_fp_context(text):
+    return LUMPECTOMY_STRICT_FP_FILTER_RX.search(clean_cell(text)) is not None
 
 
 def augmentation_true_history_context(text):
@@ -704,10 +689,6 @@ def field_specific_history_ok(field, combined_context):
         if has_year_context(ctx):
             return True
         if re.search(r"\bunderwent\b", ctx, re.I):
-            return True
-        if has_lumpectomy_scar_or_site_context(ctx):
-            return True
-        if has_lumpectomy_history_table_context(ctx):
             return True
         return False
 
@@ -907,6 +888,10 @@ def main():
                 accept = False
                 reason = "reject_missing_date_diff"
 
+            elif field == "PBS_Lumpectomy" and has_strict_lumpectomy_fp_context(combined_context):
+                accept = False
+                reason = "reject_lumpectomy_planning_context"
+
             elif day_diff < 0:
                 if lat_decision == "accept":
                     if history_ok:
@@ -940,6 +925,7 @@ def main():
 
             else:
                 if field == "PBS_Lumpectomy":
+                    # restore the broader, better-performing post-recon lumpectomy behavior
                     if not history_ok:
                         accept = False
                         reason = "reject_post_recon_not_historical"
@@ -959,17 +945,9 @@ def main():
                                 accept = False
                                 reason = "reject_unknown_laterality_unilateral"
                         else:
-                            # CHANGED: do not broadly accept when recon laterality is unknown.
-                            # Only allow a narrow historical lumpectomy acceptance when the
-                            # context is clearly historical by scar/site or history-table cues.
-                            if has_lumpectomy_scar_or_site_context(combined_context):
+                            if history_ok:
                                 accept = True
-                                reason = "accept_post_recon_scar_history_no_recon_lat"
-                            elif has_lumpectomy_history_table_context(combined_context) and (
-                                has_year_context(combined_context) or is_historical_context(combined_context)
-                            ):
-                                accept = True
-                                reason = "accept_post_recon_history_table_no_recon_lat"
+                                reason = "accept_post_recon_history_no_recon_lat"
                             else:
                                 accept = False
                                 reason = "reject_unknown_recon_laterality"
