@@ -12,13 +12,12 @@ PBS-only updater for:
 - PBS_Augmentation
 - PBS_Other
 
-Revised logic:
-- Uses reconstruction date as anchor
-- Writes back into original master
-- Better historical acceptance for lumpectomy and true prior history
-- Better laterality inference from nearby cancer/procedure context
-- Still blocks reconstruction-related implant language from counting as augmentation
-- Derives PastBreastSurgery from accepted PBS subtype hits
+Hybrid logic:
+- Keep improved lumpectomy handling
+- Keep reduction/mastopexy/other strict
+- Keep augmentation strict
+- Preserve laterality inference mainly for lumpectomy
+- Derive PastBreastSurgery from accepted subtype hits
 
 Outputs:
 1) /home/apokol/Breast_Restore/_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv
@@ -557,34 +556,24 @@ def extract_laterality_from_text(text):
 
 
 def infer_laterality_from_field_context(field, text):
-    """
-    For cases where the exact evidence window lacks side, infer from nearby breast cancer /
-    procedure history context.
-    """
     ctx = clean_cell(text)
     if not ctx:
         return ""
 
-    # direct side in context
     direct = extract_laterality_from_text(ctx)
     if direct:
         return direct
 
     if field == "PBS_Lumpectomy":
-        # examples: "history of left breast cancer ... lumpectomy"
-        left_cancer = re.search(r"\bleft\b.{0,80}\b(?:breast\s+cancer|dcis|carcinoma|lumpectomy)\b", ctx, re.I)
-        right_cancer = re.search(r"\bright\b.{0,80}\b(?:breast\s+cancer|dcis|carcinoma|lumpectomy)\b", ctx, re.I)
-        left_reverse = re.search(r"\b(?:breast\s+cancer|dcis|carcinoma|lumpectomy)\b.{0,80}\bleft\b", ctx, re.I)
-        right_reverse = re.search(r"\b(?:breast\s+cancer|dcis|carcinoma|lumpectomy)\b.{0,80}\bright\b", ctx, re.I)
+        left_cancer = re.search(r"\bleft\b.{0,100}\b(?:breast\s+cancer|dcis|carcinoma|lumpectomy)\b", ctx, re.I)
+        right_cancer = re.search(r"\bright\b.{0,100}\b(?:breast\s+cancer|dcis|carcinoma|lumpectomy)\b", ctx, re.I)
+        left_reverse = re.search(r"\b(?:breast\s+cancer|dcis|carcinoma|lumpectomy)\b.{0,100}\bleft\b", ctx, re.I)
+        right_reverse = re.search(r"\b(?:breast\s+cancer|dcis|carcinoma|lumpectomy)\b.{0,100}\bright\b", ctx, re.I)
 
         if (left_cancer or left_reverse) and not (right_cancer or right_reverse):
             return "left"
         if (right_cancer or right_reverse) and not (left_cancer or left_reverse):
             return "right"
-
-    if field in {"PBS_Breast Reduction", "PBS_Mastopexy"}:
-        if re.search(r"\bfor\s+symmetry\b", ctx, re.I):
-            return extract_laterality_from_text(ctx)
 
     return ""
 
@@ -664,20 +653,19 @@ def augmentation_true_history_context(text):
     if not ctx:
         return False
 
-    pos = AUGMENT_POSITIVE_CONTEXT_RX.search(ctx) is not None
-    neg = AUGMENT_NEGATIVE_CONTEXT_RX.search(ctx) is not None
-
     explicit = re.search(
-        r"\b(breast\s+augmentation|augmentation\s+mammaplasty|cosmetic\s+augmentation|breast\s+implants?\s+for\s+augmentation)\b",
+        r"\b(breast\s+augmentation|augmentation\s+mammaplasty|cosmetic\s+augmentation|breast\s+implants?\s+for\s+augmentation|previous\s+submuscular\s+(?:saline|silicone)\s+breast\s+augmentation)\b",
         ctx,
         re.I
     ) is not None
 
     if explicit:
         return True
-    if pos and not neg:
-        return True
-    return False
+
+    pos = AUGMENT_POSITIVE_CONTEXT_RX.search(ctx) is not None
+    neg = AUGMENT_NEGATIVE_CONTEXT_RX.search(ctx) is not None
+
+    return pos and not neg
 
 
 def field_specific_history_ok(field, combined_context):
@@ -695,30 +683,20 @@ def field_specific_history_ok(field, combined_context):
         return False
 
     if field == "PBS_Breast Reduction":
-        if is_historical_context(ctx):
-            return True
-        if has_year_context(ctx):
-            return True
-        return False
+        # keep strict again
+        return is_historical_context(ctx)
 
     if field == "PBS_Mastopexy":
-        if is_historical_context(ctx):
-            return True
-        if has_year_context(ctx):
-            return True
-        if re.search(r"\bfor\s+symmetry\b", ctx, re.I):
-            return True
-        return False
+        # keep strict again
+        return is_historical_context(ctx)
 
     if field == "PBS_Augmentation":
+        # keep strict
         return augmentation_true_history_context(ctx)
 
     if field == "PBS_Other":
-        if is_historical_context(ctx):
-            return True
-        if has_year_context(ctx):
-            return True
-        return False
+        # keep strict again
+        return is_historical_context(ctx)
 
     return False
 
@@ -884,7 +862,7 @@ def main():
             combined_context = "{0}\n{1}".format(evid, full_note_text)
 
             proc_lat = extract_laterality_from_text(combined_context)
-            if not proc_lat:
+            if (not proc_lat) and field == "PBS_Lumpectomy":
                 proc_lat = infer_laterality_from_field_context(field, combined_context)
 
             lat_decision = laterality_relation(recon_lat, proc_lat, combined_context)
@@ -910,7 +888,6 @@ def main():
                         accept = True
                         reason = "accept_pre_recon_historical"
                     else:
-                        # allow pre-recon lumpectomy a bit more broadly
                         if field == "PBS_Lumpectomy":
                             accept = True
                             reason = "accept_pre_recon_lumpectomy"
@@ -921,10 +898,14 @@ def main():
                     accept = False
                     reason = "reject_contralateral"
                 elif lat_decision == "unknown_unilateral":
-                    # allow lumpectomy if strong same-side disease/procedure context exists
-                    if field == "PBS_Lumpectomy" and history_ok and infer_laterality_from_field_context(field, combined_context):
-                        accept = True
-                        reason = "accept_inferred_laterality"
+                    if field == "PBS_Lumpectomy":
+                        inferred = infer_laterality_from_field_context(field, combined_context)
+                        if inferred and laterality_relation(recon_lat, inferred, combined_context) == "accept":
+                            accept = True
+                            reason = "accept_inferred_laterality"
+                        else:
+                            accept = False
+                            reason = "reject_unknown_laterality_unilateral"
                     else:
                         accept = False
                         reason = "reject_unknown_laterality_unilateral"
@@ -933,29 +914,48 @@ def main():
                     reason = "reject_unknown_recon_laterality"
 
             else:
-                # post-recon notes can still summarize true prior surgeries
-                if not history_ok:
-                    accept = False
-                    reason = "reject_post_recon_not_historical"
-                else:
-                    if lat_decision == "accept":
-                        accept = True
-                        reason = "accept_post_recon_historical"
-                    elif lat_decision == "reject_contralateral":
+                if field == "PBS_Lumpectomy":
+                    # keep lumpectomy more permissive post-recon
+                    if not history_ok:
                         accept = False
-                        reason = "reject_contralateral"
-                    elif lat_decision == "unknown_unilateral":
-                        if field == "PBS_Lumpectomy" and infer_laterality_from_field_context(field, combined_context):
+                        reason = "reject_post_recon_not_historical"
+                    else:
+                        if lat_decision == "accept":
                             accept = True
-                            reason = "accept_post_recon_inferred_laterality"
+                            reason = "accept_post_recon_historical"
+                        elif lat_decision == "reject_contralateral":
+                            accept = False
+                            reason = "reject_contralateral"
+                        elif lat_decision == "unknown_unilateral":
+                            inferred = infer_laterality_from_field_context(field, combined_context)
+                            if inferred and laterality_relation(recon_lat, inferred, combined_context) == "accept":
+                                accept = True
+                                reason = "accept_post_recon_inferred_laterality"
+                            else:
+                                accept = False
+                                reason = "reject_unknown_laterality_unilateral"
                         else:
+                            if history_ok:
+                                accept = True
+                                reason = "accept_post_recon_history_no_recon_lat"
+                            else:
+                                accept = False
+                                reason = "reject_unknown_recon_laterality"
+                else:
+                    # keep other categories strict post-recon
+                    if not history_ok:
+                        accept = False
+                        reason = "reject_post_recon_not_historical"
+                    else:
+                        if lat_decision == "accept":
+                            accept = True
+                            reason = "accept_post_recon_historical"
+                        elif lat_decision == "reject_contralateral":
+                            accept = False
+                            reason = "reject_contralateral"
+                        elif lat_decision == "unknown_unilateral":
                             accept = False
                             reason = "reject_unknown_laterality_unilateral"
-                    else:
-                        # if recon laterality missing, permit true historical lumpectomy/reduction/mastopexy/augmentation evidence
-                        if history_ok:
-                            accept = True
-                            reason = "accept_post_recon_history_no_recon_lat"
                         else:
                             accept = False
                             reason = "reject_unknown_recon_laterality"
