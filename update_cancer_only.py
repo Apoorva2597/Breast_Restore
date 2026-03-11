@@ -240,16 +240,22 @@ def cand_score(c):
     conf = float(getattr(c, "confidence", 0.0) or 0.0)
     nt = str(getattr(c, "note_type", "") or "").lower()
     sec = str(getattr(c, "section", "") or "").upper()
+    evid = str(getattr(c, "evidence", "") or "").lower()
 
-    op_bonus = 0.05 if ("op" in nt or "operative" in nt or "operation" in nt) else 0.0
-    clinic_bonus = 0.03 if (
+    op_bonus = 0.08 if ("op" in nt or "operative" in nt or "operation" in nt) else 0.0
+    clinic_bonus = 0.02 if (
         "clinic" in nt or "progress" in nt or "consult" in nt or
         "oncology" in nt or "follow up" in nt or "follow-up" in nt
     ) else 0.0
     date_bonus = 0.01 if (getattr(c, "note_date", "") or "").strip() else 0.0
-    section_penalty = -0.08 if sec in {"PAST MEDICAL HISTORY", "PAST SURGICAL HISTORY", "SURGICAL HISTORY", "HISTORY", "PMH", "PSH"} else 0.0
+    section_penalty = -0.10 if sec in {
+        "PAST MEDICAL HISTORY", "PAST SURGICAL HISTORY", "SURGICAL HISTORY",
+        "HISTORY", "PMH", "PSH", "GYNECOLOGIC HISTORY", "OB HISTORY"
+    } else 0.0
+    history_penalty = -0.08 if re.search(r"\b(history of|hx of|status post|s/p|prior|previous)\b", evid) else 0.0
+    procedure_bonus = 0.05 if re.search(r"\b(procedure|operative|operation|surgery|performed|placement)\b", evid) else 0.0
 
-    return conf + op_bonus + clinic_bonus + date_bonus + section_penalty
+    return conf + op_bonus + clinic_bonus + date_bonus + section_penalty + history_penalty + procedure_bonus
 
 
 def choose_best(existing, new):
@@ -288,7 +294,6 @@ def choose_best_indication(existing, new):
     if ex_score > nw_score:
         return existing
 
-    # tie-break: Therapeutic > Prophylactic > None
     rank = {"Therapeutic": 3, "Prophylactic": 2, "None": 1, "": 0}
     if rank.get(nw_val, 0) > rank.get(ex_val, 0):
         return new
@@ -302,7 +307,6 @@ def choose_best_lymphnode(existing, new):
     ex_val = clean_cell(getattr(existing, "value", ""))
     nw_val = clean_cell(getattr(new, "value", ""))
 
-    # hard override rule: ALND > SLNB > none
     rank = {"ALND": 3, "SLNB": 2, "none": 1, "": 0}
     ex_rank = rank.get(ex_val, 0)
     nw_rank = rank.get(nw_val, 0)
@@ -313,6 +317,42 @@ def choose_best_lymphnode(existing, new):
         return existing
 
     return choose_best(existing, new)
+
+
+def choose_best_recon(existing, new):
+    if existing is None:
+        return new
+
+    ex_score = cand_score(existing)
+    nw_score = cand_score(new)
+
+    ex_evid = str(getattr(existing, "evidence", "") or "").lower()
+    nw_evid = str(getattr(new, "evidence", "") or "").lower()
+
+    revision_rx = re.compile(
+        r"\b(revision|fat graft|fat grafting|nipple reconstruction|nipple-areolar|tattoo|"
+        r"capsulotomy|capsulectomy|symmetry|symmetrization|scar revision|dog ear|"
+        r"lipofilling|liposuction|capsulorrhaphy)\b",
+        re.IGNORECASE
+    )
+
+    anchor_rx = re.compile(
+        r"\b(tissue expander placement|expander placement|implant placement|"
+        r"implant-based reconstruction|direct-to-implant|diep flap|tram flap|siea flap|"
+        r"latissimus dorsi flap|autologous reconstruction|free flap|immediate reconstruction|"
+        r"delayed reconstruction)\b",
+        re.IGNORECASE
+    )
+
+    ex_revision_only = bool(revision_rx.search(ex_evid)) and not bool(anchor_rx.search(ex_evid))
+    nw_revision_only = bool(revision_rx.search(nw_evid)) and not bool(anchor_rx.search(nw_evid))
+
+    if ex_revision_only and not nw_revision_only:
+        return new
+    if nw_revision_only and not ex_revision_only:
+        return existing
+
+    return new if nw_score > ex_score else existing
 
 
 FIELD_MAP = {
@@ -902,6 +942,8 @@ def main():
                 best_by_mrn[mrn][logical] = choose_best_lymphnode(existing, c)
             elif logical in {"Indication_Left", "Indication_Right"}:
                 best_by_mrn[mrn][logical] = choose_best_indication(existing, c)
+            elif logical in {"Recon_Type", "Recon_Classification"}:
+                best_by_mrn[mrn][logical] = choose_best_recon(existing, c)
             else:
                 best_by_mrn[mrn][logical] = choose_best(existing, c)
 
@@ -933,18 +975,22 @@ def main():
             if logical in TARGET_FIELDS:
                 master.loc[mask, logical] = val
 
+        # structured recon anchor should help stabilize recon fields
         if recon_info is not None:
             current_val = clean_cell(master.loc[mask, "Recon_Laterality"].iloc[0])
-            if not current_val and clean_cell(recon_info.get("recon_laterality", "")):
-                master.loc[mask, "Recon_Laterality"] = recon_info["recon_laterality"]
+            if clean_cell(recon_info.get("recon_laterality", "")):
+                if not current_val or current_val in {"", "BILATERAL"}:
+                    master.loc[mask, "Recon_Laterality"] = recon_info["recon_laterality"]
 
             current_val = clean_cell(master.loc[mask, "Recon_Type"].iloc[0])
-            if not current_val and clean_cell(recon_info.get("recon_type", "")):
-                master.loc[mask, "Recon_Type"] = recon_info["recon_type"]
+            if clean_cell(recon_info.get("recon_type", "")):
+                if not current_val or current_val in {"other"}:
+                    master.loc[mask, "Recon_Type"] = recon_info["recon_type"]
 
             current_val = clean_cell(master.loc[mask, "Recon_Classification"].iloc[0])
-            if not current_val and clean_cell(recon_info.get("recon_classification", "")):
-                master.loc[mask, "Recon_Classification"] = recon_info["recon_classification"]
+            if clean_cell(recon_info.get("recon_classification", "")):
+                if not current_val or current_val in {"other"}:
+                    master.loc[mask, "Recon_Classification"] = recon_info["recon_classification"]
 
         best_mast_ev = choose_best_mastectomy_event(mastectomy_events_map.get(mrn, []), recon_dt)
         current_mast_lat = clean_cell(master.loc[mask, "Mastectomy_Laterality"].iloc[0])
