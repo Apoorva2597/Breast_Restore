@@ -25,7 +25,7 @@ import pandas as pd
 BASE_DIR = "/home/apokol/Breast_Restore"
 
 PRED_PATH = "{0}/_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv".format(BASE_DIR)
-GOLD_PATH = "{0}/_outputs/master_abstraction_gold.csv".format(BASE_DIR)   # <-- change if needed
+GOLD_PATH = "{0}/gold_cleaned_for_cedar.csv".format(BASE_DIR)   
 EVID_PATH = "{0}/_outputs/rule_hit_evidence_FINAL_NO_GOLD.csv".format(BASE_DIR)
 
 OUT_PATH = "{0}/_outputs/qa_exports/QA_LymphNode_IndicationLeft.csv".format(BASE_DIR)
