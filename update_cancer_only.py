@@ -818,3 +818,6 @@ def extract_breast_cancer_recon(note):
                 cands.append(_emit("Chemo", True, text, cc, section, note, conf))
 
     return cands
+
+if __name__ == "__main__":
+    main()
