@@ -29,12 +29,10 @@ STRONG_HISTORY_PATTERNS = [
     re.compile(r"\bwith\s+a\s+history\s+of\b", re.I),
     re.compile(r"\bpreviously\b", re.I),
     re.compile(r"\bund?erwent\b", re.I),
-    re.compile(r"\bhad\s+a\b", re.I),
-    re.compile(r"\bhad\b", re.I),
     re.compile(r"\btreated\s+with\b", re.I),
 ]
 
-# Cancer-treatment context that often indicates true prior lumpectomy history
+# Lumpectomy gets broader historical/cancer context
 LUMPECTOMY_CONTEXT_PATTERNS = [
     re.compile(r"\bs/p\b", re.I),
     re.compile(r"\bstatus\s+post\b", re.I),
@@ -80,6 +78,7 @@ MASTOPEXY_PATTERNS = [
     re.compile(r"\bbreast\s+lift\b", re.I),
 ]
 
+# Keep augmentation strict
 AUGMENT_PATTERNS = [
     re.compile(r"\bbreast\s+augmentation\b", re.I),
     re.compile(r"\baugmentation\s+mammaplasty\b", re.I),
@@ -105,9 +104,9 @@ OTHER_PATTERNS = [
 
 FIELD_CONFIG = [
     ("PBS_Lumpectomy", LUMP_PATTERNS, 0.94, "lumpectomy"),
-    ("PBS_Breast Reduction", REDUCTION_PATTERNS, 0.84, "reduction"),
-    ("PBS_Mastopexy", MASTOPEXY_PATTERNS, 0.84, "mastopexy"),
-    ("PBS_Augmentation", AUGMENT_PATTERNS, 0.86, "augmentation"),
+    ("PBS_Breast Reduction", REDUCTION_PATTERNS, 0.84, "strict_history"),
+    ("PBS_Mastopexy", MASTOPEXY_PATTERNS, 0.84, "strict_history"),
+    ("PBS_Augmentation", AUGMENT_PATTERNS, 0.86, "augmentation_strict"),
     ("PBS_Other", OTHER_PATTERNS, 0.80, "strict_history"),
 ]
 
@@ -137,30 +136,8 @@ def _strict_history_near(text, start, end):
 
 
 def _lumpectomy_history_near(text, start, end):
-    ctx = window_around(text, start, end, 240)
+    ctx = window_around(text, start, end, 260)
     return _has_any(LUMPECTOMY_CONTEXT_PATTERNS, ctx)
-
-
-def _reduction_history_near(text, start, end):
-    ctx = window_around(text, start, end, 220)
-    if _has_any(STRONG_HISTORY_PATTERNS, ctx):
-        return True
-    if re.search(r"\bin\s+(?:19|20)\d{2}\b", ctx, re.I):
-        return True
-    if re.search(r"\b(?:19|20)\d{2}\b", ctx, re.I):
-        return True
-    return False
-
-
-def _mastopexy_history_near(text, start, end):
-    ctx = window_around(text, start, end, 220)
-    if _has_any(STRONG_HISTORY_PATTERNS, ctx):
-        return True
-    if re.search(r"\bfor\s+symmetry\b", ctx, re.I):
-        return True
-    if re.search(r"\bin\s+(?:19|20)\d{2}\b", ctx, re.I):
-        return True
-    return False
 
 
 def _augmentation_history_near(text, start, end):
@@ -197,9 +174,6 @@ def _augmentation_history_near(text, start, end):
         re.compile(r"\bexpander\s+placement\b", re.I),
     ]
 
-    has_positive = _has_any(positive, ctx)
-    has_negative = _has_any(negative, ctx)
-
     explicit = [
         re.compile(r"\bbreast\s+augmentation\b", re.I),
         re.compile(r"\baugmentation\s+mammaplasty\b", re.I),
@@ -211,10 +185,10 @@ def _augmentation_history_near(text, start, end):
     if _has_any(explicit, ctx):
         return True
 
-    if has_positive and not has_negative:
-        return True
+    has_positive = _has_any(positive, ctx)
+    has_negative = _has_any(negative, ctx)
 
-    return False
+    return has_positive and not has_negative
 
 
 def _emit(field, text, m, section, note, conf, status):
@@ -253,23 +227,13 @@ def extract_pbs(note: SectionedNote) -> List[Candidate]:
                         status = "history_possible" if hist else "procedure_mention"
                         cands.append(_emit(field, text, m, section, note, conf, status))
 
-                    elif mode == "reduction":
-                        hist = _reduction_history_near(text, m.start(), m.end())
-                        status = "history_possible" if hist else "procedure_mention"
-                        cands.append(_emit(field, text, m, section, note, conf, status))
-
-                    elif mode == "mastopexy":
-                        hist = _mastopexy_history_near(text, m.start(), m.end())
-                        status = "history_possible" if hist else "procedure_mention"
-                        cands.append(_emit(field, text, m, section, note, conf, status))
-
-                    elif mode == "augmentation":
-                        hist = _augmentation_history_near(text, m.start(), m.end())
-                        status = "history_possible" if hist else "procedure_mention"
-                        cands.append(_emit(field, text, m, section, note, conf, status))
-
                     elif mode == "strict_history":
                         hist = _strict_history_near(text, m.start(), m.end())
+                        status = "history_possible" if hist else "procedure_mention"
+                        cands.append(_emit(field, text, m, section, note, conf, status))
+
+                    elif mode == "augmentation_strict":
+                        hist = _augmentation_history_near(text, m.start(), m.end())
                         status = "history_possible" if hist else "procedure_mention"
                         cands.append(_emit(field, text, m, section, note, conf, status))
 
