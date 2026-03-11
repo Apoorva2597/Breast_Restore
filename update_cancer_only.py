@@ -1269,3 +1269,6 @@ def main():
     print("- Appended evidence: {0}".format(EVID_PATH))
     print("\nRun:")
     print(" python build_master_rule_CANCER_RECON_PATCH.py")
+
+if __name__ == "__main__":
+    main()
