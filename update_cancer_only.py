@@ -76,6 +76,35 @@ TARGET_FIELDS = [
 from models import SectionedNote, Candidate  # noqa: E402
 from extractors.breast_cancer_recon import extract_breast_cancer_recon  # noqa: E402
 
+LEFT_RX = re.compile(r"\b(left|lt)\b", re.IGNORECASE)
+RIGHT_RX = re.compile(r"\b(right|rt)\b", re.IGNORECASE)
+BILAT_RX = re.compile(r"\b(bilateral|bilat)\b", re.IGNORECASE)
+
+MASTECTOMY_RX = re.compile(
+    r"\b(mastectomy|simple\s+mastectomy|total\s+mastectomy|skin[- ]sparing\s+mastectomy|nipple[- ]sparing\s+mastectomy|\bMRM\b)\b",
+    re.IGNORECASE
+)
+
+ALND_RX = re.compile(
+    r"\b(axillary\s+lymph\s+node\s+dissection|axillary\s+dissection|\bALND\b)\b",
+    re.IGNORECASE
+)
+
+SLNB_RX = re.compile(
+    r"\b(sentinel\s+lymph\s+node\s+biopsy|sentinel\s+node\s+biopsy|\bSLNB\b|lymphatic\s+mapping)\b",
+    re.IGNORECASE
+)
+
+LN_DONE_RX = re.compile(
+    r"\b(s/p|status\s+post|underwent|completed|had|has\s+had|received)\b",
+    re.IGNORECASE
+)
+
+LN_PLAN_RX = re.compile(
+    r"\b(plan|planned|planning|possible|possibly|consider|candidate|may\s+need|might\s+need|if\s+positive|if\s+needed|potential)\b",
+    re.IGNORECASE
+)
+
 
 def read_csv_robust(path):
     common_kwargs = dict(dtype=str, engine="python")
@@ -383,12 +412,13 @@ KEYWORD_PREFILTER = re.compile(
     re.IGNORECASE
 )
 
-LEFT_RX = re.compile(r"\b(left|lt)\b", re.IGNORECASE)
-RIGHT_RX = re.compile(r"\b(right|rt)\b", re.IGNORECASE)
-BILAT_RX = re.compile(r"\b(bilateral|bilat)\b", re.IGNORECASE)
+REVISION_RECON_ONLY_RX = re.compile(
+    r"\b(revision|fat graft|fat grafting|nipple reconstruction|nipple-areolar|tattoo|capsulotomy|capsulectomy|symmetry|scar revision|dog ear|liposuction|capsulorrhaphy)\b",
+    re.IGNORECASE
+)
 
-MASTECTOMY_RX = re.compile(
-    r"\b(mastectomy|simple\s+mastectomy|total\s+mastectomy|skin[- ]sparing\s+mastectomy|nipple[- ]sparing\s+mastectomy|\bMRM\b)\b",
+ANCHOR_RECON_RX = re.compile(
+    r"\b(tissue expander placement|expander placement|implant placement|implant-based reconstruction|direct-to-implant|diep flap|tram flap|siea flap|latissimus dorsi flap|free flap|autologous reconstruction|immediate reconstruction|delayed reconstruction|breast reconstruction)\b",
     re.IGNORECASE
 )
 
@@ -837,6 +867,91 @@ def load_existing_evidence():
     ])
 
 
+def _is_clinic_like_note_type(note_type):
+    s = clean_cell(note_type).lower()
+    pats = [
+        "clinic", "progress", "office", "follow up", "follow-up",
+        "consult", "oncology", "h&p", "history and physical"
+    ]
+    for p in pats:
+        if p in s:
+            return True
+    return False
+
+
+def _is_op_like_note_type(note_type):
+    s = clean_cell(note_type).lower()
+    return (
+        ("brief op" in s) or
+        ("op note" in s) or
+        ("operative" in s) or
+        ("operation" in s) or
+        ("oper report" in s)
+    )
+
+
+def _lymph_score(value, note_type, note_date, evidence, recon_dt):
+    score = 0.0
+    v = clean_cell(value)
+    nt = clean_cell(note_type).lower()
+    ev = clean_cell(evidence).lower()
+    nd = parse_date_safe(note_date)
+
+    if v == "ALND":
+        score += 30.0
+    elif v == "SLNB":
+        score += 20.0
+    else:
+        score += 0.0
+
+    if _is_clinic_like_note_type(nt):
+        score += 12.0
+    elif _is_op_like_note_type(nt):
+        score += 6.0
+
+    if LN_DONE_RX.search(ev):
+        score += 10.0
+
+    if LN_PLAN_RX.search(ev):
+        score -= 20.0
+
+    if recon_dt is not None and nd is not None:
+        dd = days_between(nd, recon_dt)
+        if dd is not None:
+            if dd >= 0 and _is_clinic_like_note_type(nt):
+                score += 25.0
+                if dd <= 120:
+                    score += 6.0
+            elif dd < 0 and _is_clinic_like_note_type(nt):
+                score -= 18.0
+            elif dd >= 0 and _is_op_like_note_type(nt):
+                score += 4.0
+
+    return score
+
+
+def choose_best_lymphnode_postrecon(cands, recon_dt):
+    if not cands:
+        return None
+
+    best = None
+    best_score = None
+
+    for c in cands:
+        s = _lymph_score(
+            getattr(c, "value", ""),
+            getattr(c, "note_type", ""),
+            getattr(c, "note_date", ""),
+            getattr(c, "evidence", ""),
+            recon_dt
+        )
+        if best is None or s > best_score:
+            best = c
+            best_score = s
+
+    return best
+
+
 def main():
     print("Loading EXISTING master...")
     master = load_existing_master()
@@ -856,6 +971,7 @@ def main():
     evidence_rows = []
     best_by_mrn = {}
     therapy_dates = {}
+    lymphnode_by_mrn = {}
 
     print("Running patch-only extractor...")
 
@@ -900,6 +1016,8 @@ def main():
             best_by_mrn[mrn] = {}
         if mrn not in therapy_dates:
             therapy_dates[mrn] = {"Radiation": [], "Chemo": [], "Mastectomy_Date": []}
+        if mrn not in lymphnode_by_mrn:
+            lymphnode_by_mrn[mrn] = []
 
         for c in all_cands:
             logical = FIELD_MAP.get(str(c.field))
@@ -934,18 +1052,30 @@ def main():
                 if dt is not None:
                     therapy_dates[mrn]["Mastectomy_Date"].append(dt)
 
+            if logical == "LymphNode":
+                lymphnode_by_mrn[mrn].append(c)
+                continue
+
             existing = best_by_mrn[mrn].get(logical)
 
             if logical in BOOLEAN_FIELDS:
                 best_by_mrn[mrn][logical] = merge_boolean(existing, c)
-            elif logical == "LymphNode":
-                best_by_mrn[mrn][logical] = choose_best_lymphnode(existing, c)
             elif logical in {"Indication_Left", "Indication_Right"}:
                 best_by_mrn[mrn][logical] = choose_best_indication(existing, c)
             elif logical in {"Recon_Type", "Recon_Classification"}:
                 best_by_mrn[mrn][logical] = choose_best_recon(existing, c)
             else:
                 best_by_mrn[mrn][logical] = choose_best(existing, c)
+
+    print("Resolving lymph node using post-recon clinic notes first...")
+    for mrn, cands in lymphnode_by_mrn.items():
+        recon_info = recon_anchor_map.get(mrn)
+        recon_dt = parse_date_safe((recon_info or {}).get("recon_date", ""))
+        best_ln = choose_best_lymphnode_postrecon(cands, recon_dt)
+        if best_ln is not None:
+            if mrn not in best_by_mrn:
+                best_by_mrn[mrn] = {}
+            best_by_mrn[mrn]["LymphNode"] = best_ln
 
     print("Applying updates to EXISTING master only for target fields...")
 
@@ -975,7 +1105,6 @@ def main():
             if logical in TARGET_FIELDS:
                 master.loc[mask, logical] = val
 
-        # structured recon anchor should help stabilize recon fields
         if recon_info is not None:
             current_val = clean_cell(master.loc[mask, "Recon_Laterality"].iloc[0])
             if clean_cell(recon_info.get("recon_laterality", "")):
@@ -1093,7 +1222,3 @@ def main():
     print("- Appended evidence: {0}".format(EVID_PATH))
     print("\nRun:")
     print(" python build_master_rule_CANCER_RECON_PATCH.py")
-
-
-if __name__ == "__main__":
-    main()
