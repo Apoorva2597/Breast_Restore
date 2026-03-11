@@ -1,65 +1,84 @@
-# extractors/breast_cancer_recon.py
+#!/usr/bin/env python3
+# build_master_rule_CANCER_RECON_PATCH.py
+#
+# PATCH-ONLY builder for:
+# - Mastectomy_Laterality
+# - Indication_Left
+# - Indication_Right
+# - LymphNode
+# - Radiation
+# - Radiation_Before
+# - Radiation_After
+# - Chemo
+# - Chemo_Before
+# - Chemo_After
+# - Recon_Laterality
+# - Recon_Type
+# - Recon_Classification
+# - Recon_Timing
+#
 # Python 3.6.8 compatible
 
+import os
 import re
+from glob import glob
+from datetime import datetime
+import pandas as pd
 
-from models import Candidate, SectionedNote
-from extractors.utils import window_around
+BASE_DIR = "/home/apokol/Breast_Restore"
 
-SUPPRESS_SECTIONS = {
-    "FAMILY HISTORY",
-    "REVIEW OF SYSTEMS",
-    "ALLERGIES",
-}
+STRUCT_GLOBS = [
+    "{0}/**/HPI11526*Clinic Encounters.csv".format(BASE_DIR),
+    "{0}/**/HPI11526*Inpatient Encounters.csv".format(BASE_DIR),
+    "{0}/**/HPI11526*Operation Encounters.csv".format(BASE_DIR),
+    "{0}/**/HPI11526*clinic encounters.csv".format(BASE_DIR),
+    "{0}/**/HPI11526*inpatient encounters.csv".format(BASE_DIR),
+    "{0}/**/HPI11526*operation encounters.csv".format(BASE_DIR),
+]
 
-LOW_VALUE_SECTIONS = {
-    "PAST MEDICAL HISTORY",
-    "PAST SURGICAL HISTORY",
-    "SURGICAL HISTORY",
-    "HISTORY",
-    "PMH",
-    "PSH",
-    "GYNECOLOGIC HISTORY",
-    "OB HISTORY",
-    "FAMILY HISTORY",
-}
+NOTE_GLOBS = [
+    "{0}/**/HPI11526*Clinic Notes.csv".format(BASE_DIR),
+    "{0}/**/HPI11526*Inpatient Notes.csv".format(BASE_DIR),
+    "{0}/**/HPI11526*Operation Notes.csv".format(BASE_DIR),
+    "{0}/**/HPI11526*clinic notes.csv".format(BASE_DIR),
+    "{0}/**/HPI11526*inpatient notes.csv".format(BASE_DIR),
+    "{0}/**/HPI11526*operation notes.csv".format(BASE_DIR),
+]
+
+MASTER_PATH = "{0}/_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv".format(BASE_DIR)
+EVID_PATH = "{0}/_outputs/rule_hit_evidence_FINAL_NO_GOLD.csv".format(BASE_DIR)
+
+MERGE_KEY = "MRN"
+
+TARGET_FIELDS = [
+    "Mastectomy_Laterality",
+    "Indication_Left",
+    "Indication_Right",
+    "LymphNode",
+    "Radiation",
+    "Radiation_Before",
+    "Radiation_After",
+    "Chemo",
+    "Chemo_Before",
+    "Chemo_After",
+    "Recon_Laterality",
+    "Recon_Type",
+    "Recon_Classification",
+    "Recon_Timing",
+]
+
+from models import SectionedNote, Candidate  # noqa: E402
+from extractors.breast_cancer_recon import extract_breast_cancer_recon  # noqa: E402
 
 LEFT_RX = re.compile(r"\b(left|lt)\b", re.IGNORECASE)
 RIGHT_RX = re.compile(r"\b(right|rt)\b", re.IGNORECASE)
 BILAT_RX = re.compile(r"\b(bilateral|bilat)\b", re.IGNORECASE)
 
-LEFT_WORDS = r"(left|lt)"
-RIGHT_WORDS = r"(right|rt)"
-
 MASTECTOMY_RX = re.compile(
-    r"\b("
-    r"mastectomy|"
-    r"simple\s+mastectomy|"
-    r"total\s+mastectomy|"
-    r"skin[- ]sparing\s+mastectomy|"
-    r"nipple[- ]sparing\s+mastectomy|"
-    r"modified\s+radical\s+mastectomy|"
-    r"\bMRM\b"
-    r")\b",
+    r"\b(mastectomy|simple\s+mastectomy|total\s+mastectomy|skin[- ]sparing\s+mastectomy|nipple[- ]sparing\s+mastectomy|\bMRM\b)\b",
     re.IGNORECASE
 )
 
-RECON_RX = re.compile(
-    r"\b("
-    r"breast\s+reconstruction|"
-    r"reconstruction|"
-    r"diep|tram|siea|latissimus|flap|"
-    r"tissue\s+expander|expander|"
-    r"implant|alloderm|acellular\s+dermal\s+matrix|"
-    r"direct[- ]to[- ]implant|"
-    r"sgap|igap|gap\s+flap|gluteal\s+artery\s+perforator"
-    r")\b",
-    re.IGNORECASE
-)
-
-# -----------------------------
-# LN patterns
-# -----------------------------
 ALND_RX = re.compile(
     r"\b("
     r"axillary\s+lymph\s+node\s+dissection|"
@@ -133,47 +152,28 @@ LN_HISTORY_RX = re.compile(
 
 LN_PLAN_RX = re.compile(
     r"\b("
-    r"plan|planned|planning|"
-    r"possible|possibly|"
-    r"consider|considered|candidate|"
-    r"may\s+need|might\s+need|"
-    r"if\s+positive|if\s+needed|"
-    r"potential|"
-    r"could\s+require|would\s+require|"
-    r"pending|depending\s+on|awaiting|"
-    r"recommend|recommended|discussed|"
-    r"would\s+do|will\s+do|"
-    r"in\s+the\s+future"
+    r"plan|planned|planning|possible|possibly|consider|considered|candidate|"
+    r"may\s+need|might\s+need|if\s+positive|if\s+needed|potential|"
+    r"could\s+require|would\s+require|pending|depending\s+on|awaiting|"
+    r"recommend|recommended|discussed|would\s+do|will\s+do|in\s+the\s+future"
     r")\b",
     re.IGNORECASE
 )
 
 LN_FAIL_MAP_RX = re.compile(
     r"\b("
-    r"failed\s+to\s+map|"
-    r"mapping\s+failed|"
-    r"unable\s+to\s+map|"
-    r"no\s+sentinel\s+node\s+identified|"
-    r"no\s+sentinel\s+nodes?\s+identified|"
+    r"failed\s+to\s+map|mapping\s+failed|unable\s+to\s+map|"
+    r"no\s+sentinel\s+node\s+identified|no\s+sentinel\s+nodes?\s+identified|"
     r"initial\s+attempt\s+at\s+sentinel\s+lymph\s+node\s+biopsy\s+was\s+apparently\s+unsuccessful|"
-    r"unsuccessful\s+sentinel|"
-    r"non[- ]sentinel\s+axillary\s+dissection\s+was\s+performed"
+    r"unsuccessful\s+sentinel|non[- ]sentinel\s+axillary\s+dissection\s+was\s+performed"
     r")\b",
     re.IGNORECASE
 )
 
 LN_SCAR_SITE_RX = re.compile(
     r"\b("
-    r"scar|"
-    r"site|"
-    r"biopsy\s+scar|"
-    r"slnb\s+scar|"
-    r"sentinel\s+lymph\s+node\s+biopsy\s+scar|"
-    r"tethering|"
-    r"seroma|"
-    r"axillary\s+dissection\s+site|"
-    r"at\s+the\s+site\s+of|"
-    r"tenderness|"
+    r"scar|site|biopsy\s+scar|slnb\s+scar|sentinel\s+lymph\s+node\s+biopsy\s+scar|"
+    r"tethering|seroma|axillary\s+dissection\s+site|at\s+the\s+site\s+of|tenderness|"
     r"deforming\s+the\s+breast\s+contour"
     r")\b",
     re.IGNORECASE
@@ -181,167 +181,17 @@ LN_SCAR_SITE_RX = re.compile(
 
 LN_REMOTE_HISTORY_RX = re.compile(
     r"\b("
-    r"history\s+dates\s+back|"
-    r"treated\s+in\s+\d{4}|"
-    r"diagnosed\s+in\s+\d{4}|"
-    r"back\s+to\s+\d{4}|"
-    r"years\s+ago|"
-    r"remote\s+past|"
-    r"past\s+surgical\s+history|"
-    r"past\s+medical\s+history"
+    r"history\s+dates\s+back|treated\s+in\s+\d{4}|diagnosed\s+in\s+\d{4}|"
+    r"back\s+to\s+\d{4}|years\s+ago|remote\s+past|"
+    r"past\s+surgical\s+history|past\s+medical\s+history"
     r")\b",
     re.IGNORECASE
 )
 
-LN_CURRENT_PROCEDURE_CUE_RX = re.compile(
-    r"\b("
-    r"procedure|procedures|operation|operative|surgery|surgical|"
-    r"performed|we\s+performed|"
-    r"intraoperative|preoperative|postoperative|"
-    r"mastectomy\s+with|"
-    r"operation\s+performed|"
-    r"intraop|"
-    r"date\s+of\s+surgery|"
-    r"date\s+of\s+service"
-    r")\b",
-    re.IGNORECASE
-)
-
-# -----------------------------
-# Other treatment patterns
-# -----------------------------
-RADIATION_RX = re.compile(
-    r"\b("
-    r"radiation|radiation\s+therapy|radiotherapy|xrt|pmrt"
-    r")\b",
-    re.IGNORECASE
-)
-
-CHEMO_RX = re.compile(
-    r"\b("
-    r"chemotherapy|chemo|"
-    r"adriamycin|doxorubicin|"
-    r"cyclophosphamide|cytoxan|"
-    r"taxol|paclitaxel|docetaxel|taxotere|"
-    r"carboplatin|cisplatin|"
-    r"trastuzumab|herceptin|pertuzumab|perjeta|"
-    r"\bTCHP?\b|\bAC\b|\bTC\b|\bACT\b"
-    r")\b",
-    re.IGNORECASE
-)
-
-ENDOCRINE_ONLY_RX = re.compile(
-    r"\b("
-    r"tamoxifen|letrozole|anastrozole|exemestane|"
-    r"fulvestrant|arimidex|femara|aromasin"
-    r")\b",
-    re.IGNORECASE
-)
-
-NEGATION_RX = re.compile(
-    r"\b("
-    r"no|denies|denied|without|not|never|negative\s+for"
-    r")\b",
-    re.IGNORECASE
-)
-
-PLANNED_RX = re.compile(
-    r"\b("
-    r"plan|planned|planning|will|scheduled|schedule|candidate|consider|recommend|discuss|"
-    r"possible|possibly|may\s+need|might\s+need|if\s+positive|if\s+needed|potential"
-    r")\b",
-    re.IGNORECASE
-)
-
-PROPHYLAXIS_RX = re.compile(
-    r"\b("
-    r"prophylactic|risk[- ]reducing|risk\s+reducing|preventive|"
-    r"contralateral\s+prophylactic|"
-    r"\bCPM\b"
-    r")\b",
-    re.IGNORECASE
-)
-
-CANCER_RX = re.compile(
-    r"\b("
-    r"breast\s+cancer|carcinoma|malignancy|malignant|"
-    r"invasive\s+ductal|invasive\s+lobular|dcis|lcis|"
-    r"idc|ilc|recurrent\s+cancer|cancer"
-    r")\b",
-    re.IGNORECASE
-)
-
-TREATMENT_RECEIVED_RX = re.compile(
-    r"\b("
-    r"s/p|status\s+post|history\s+of|hx\s+of|prior|previous|"
-    r"completed|received|underwent|treated\s+with|"
-    r"adjuvant|neoadjuvant|postmastectomy"
-    r")\b",
-    re.IGNORECASE
-)
-
-STRONG_RADIATION_HISTORY_RX = re.compile(
-    r"\b("
-    r"s/p\s+radiation|status\s+post\s+radiation|"
-    r"history\s+of\s+radiation|prior\s+radiation|previous\s+radiation|"
-    r"completed\s+radiation|received\s+radiation|"
-    r"adjuvant\s+radiation|neoadjuvant\s+radiation|"
-    r"radiation\s+therapy\s+completed|postmastectomy\s+radiation"
-    r")\b",
-    re.IGNORECASE
-)
-
-STRONG_CHEMO_HISTORY_RX = re.compile(
-    r"\b("
-    r"s/p\s+chemo|status\s+post\s+chemo|"
-    r"history\s+of\s+chemo|prior\s+chemo|previous\s+chemo|"
-    r"completed\s+chemo|completed\s+chemotherapy|"
-    r"received\s+chemo|received\s+chemotherapy|"
-    r"adjuvant\s+chemo|neoadjuvant\s+chemo|"
-    r"treated\s+with\s+chemotherapy|treated\s+with\s+chemo"
-    r")\b",
-    re.IGNORECASE
-)
-
-WEAK_TREATMENT_EXCLUDE_RX = re.compile(
-    r"\b("
-    r"consider|candidate|discussion|discussed|recommend|recommended|"
-    r"plan|planned|planning|will\s+start|may\s+need|may\s+require|"
-    r"referred\s+to\s+radiation\s+oncology|radiation\s+oncology\s+consult"
-    r")\b",
-    re.IGNORECASE
-)
-
-REVISION_RX = re.compile(
-    r"\b("
-    r"revision|scar\s+revision|capsulotomy|capsulectomy|fat\s+graft|fat\s+grafting|"
-    r"lipofilling|liposuction|nipple\s+reconstruction|nipple[- ]areolar|tattoo|"
-    r"symmetry|symmetrization|dog\s+ear|exchange\s+of\s+implant|implant\s+exchange|"
-    r"removal\s+of\s+intact\s+silicone|removal\s+of\s+implant|capsulorrhaphy|"
-    r"reposition|mastopexy|adjacent\s+tissue\s+transfer"
-    r")\b",
-    re.IGNORECASE
-)
-
-ANCHOR_RECON_RX = re.compile(
-    r"\b("
-    r"tissue\s+expander\s+placement|expander\s+placement|"
-    r"implant\s+placement|implant[- ]based\s+reconstruction|"
-    r"direct[- ]to[- ]implant|"
-    r"diep\s+flap|tram\s+flap|siea\s+flap|latissimus\s+dorsi\s+flap|"
-    r"free\s+flap|autologous\s+reconstruction|"
-    r"immediate\s+reconstruction|delayed\s+reconstruction|"
-    r"breast\s+reconstruction"
-    r")\b",
-    re.IGNORECASE
-)
-
-SIDE_CANCER_RX = re.compile(
+THERAPEUTIC_SIDE_HINT_RX = re.compile(
     r"\b("
     r"left\s+breast\s+cancer|right\s+breast\s+cancer|"
-    r"left\s+dcis|right\s+dcis|"
-    r"left\s+idc|right\s+idc|"
-    r"left\s+ilc|right\s+ilc|"
+    r"left\s+dcis|right\s+dcis|left\s+idc|right\s+idc|left\s+ilc|right\s+ilc|"
     r"cancer\s+on\s+the\s+left|cancer\s+on\s+the\s+right|"
     r"left[- ]sided\s+breast\s+cancer|right[- ]sided\s+breast\s+cancer"
     r")\b",
@@ -349,63 +199,297 @@ SIDE_CANCER_RX = re.compile(
 )
 
 
-def _is_operation_note(note_type):
-    s = (note_type or "").lower()
-    return (
-        ("brief op" in s) or
-        ("op note" in s) or
-        ("operative" in s) or
-        ("operation" in s) or
-        ("oper report" in s)
-    )
+def read_csv_robust(path):
+    common_kwargs = dict(dtype=str, engine="python")
+    try:
+        return pd.read_csv(path, **common_kwargs, on_bad_lines="skip")
+    except TypeError:
+        try:
+            return pd.read_csv(
+                path,
+                **common_kwargs,
+                error_bad_lines=False,
+                warn_bad_lines=True
+            )
+        except UnicodeDecodeError:
+            return pd.read_csv(
+                path,
+                **common_kwargs,
+                encoding="latin-1",
+                error_bad_lines=False,
+                warn_bad_lines=True
+            )
+    except UnicodeDecodeError:
+        try:
+            return pd.read_csv(
+                path,
+                **common_kwargs,
+                encoding="latin-1",
+                on_bad_lines="skip"
+            )
+        except TypeError:
+            return pd.read_csv(
+                path,
+                **common_kwargs,
+                encoding="latin-1",
+                error_bad_lines=False,
+                warn_bad_lines=True
+            )
 
 
-def _is_clinic_like(note_type):
-    s = (note_type or "").lower()
-    pats = [
-        "clinic", "progress", "office", "follow up", "follow-up",
-        "consult", "pre-op", "preop", "history and physical", "h&p",
-        "oncology"
+def clean_cols(df):
+    df.columns = [str(c).strip().replace("\ufeff", "") for c in df.columns]
+    return df
+
+
+def normalize_mrn(df):
+    key_variants = ["MRN", "mrn", "Patient_MRN", "PAT_MRN", "PATIENT_MRN"]
+    for k in key_variants:
+        if k in df.columns:
+            if k != MERGE_KEY:
+                df = df.rename(columns={k: MERGE_KEY})
+            break
+    if MERGE_KEY not in df.columns:
+        raise RuntimeError("MRN column not found. Columns seen: {0}".format(list(df.columns)[:40]))
+    df[MERGE_KEY] = df[MERGE_KEY].astype(str).str.strip()
+    return df
+
+
+def pick_col(df, options, required=True):
+    for c in options:
+        if c in df.columns:
+            return c
+    if required:
+        raise RuntimeError("Required column missing. Tried={0}. Seen={1}".format(
+            options, list(df.columns)[:60]
+        ))
+    return None
+
+
+def clean_cell(x):
+    if x is None:
+        return ""
+    s = str(x).strip()
+    if s.lower() in {"", "nan", "none", "null", "na"}:
+        return ""
+    return s
+
+
+def to_int_safe(x):
+    try:
+        return int(float(str(x).strip()))
+    except Exception:
+        return None
+
+
+def parse_date_safe(x):
+    s = clean_cell(x)
+    if not s:
+        return None
+    fmts = [
+        "%Y-%m-%d",
+        "%Y-%m-%d %H:%M:%S",
+        "%m/%d/%Y",
+        "%m/%d/%Y %H:%M",
+        "%m/%d/%Y %H:%M:%S",
+        "%Y/%m/%d",
+        "%d-%b-%Y",
+        "%d-%b-%Y %H:%M:%S",
     ]
-    for p in pats:
-        if p in s:
-            return True
-    return False
+    for fmt in fmts:
+        try:
+            return datetime.strptime(s, fmt)
+        except Exception:
+            pass
+    try:
+        ts = pd.to_datetime(s, errors="coerce")
+        if pd.isna(ts):
+            return None
+        return ts.to_pydatetime()
+    except Exception:
+        return None
 
 
-def _clean(x):
-    return str(x).strip() if x is not None else ""
+def same_calendar_date(dt1, dt2):
+    if dt1 is None or dt2 is None:
+        return False
+    return dt1.date() == dt2.date()
 
 
-def _emit(field, value, text, m, section, note, conf):
-    return Candidate(
-        field=field,
-        value=value,
-        status="history",
-        evidence=window_around(text, m.start(), m.end(), 220),
-        section=section,
-        note_type=note.note_type,
-        note_id=note.note_id,
-        note_date=note.note_date,
-        confidence=conf,
+def days_between(dt1, dt2):
+    if dt1 is None or dt2 is None:
+        return None
+    return (dt1.date() - dt2.date()).days
+
+
+HEADER_RX = re.compile(r"^\s*([A-Z][A-Z0-9 /&\-]{2,60})\s*:\s*$")
+
+
+def sectionize(text):
+    if not text:
+        return {"FULL": ""}
+    lines = text.splitlines()
+    sections = {}
+    current = "FULL"
+    sections[current] = []
+    for line in lines:
+        m = HEADER_RX.match(line)
+        if m:
+            hdr = m.group(1).strip().upper()
+            current = hdr
+            if current not in sections:
+                sections[current] = []
+            continue
+        sections[current].append(line)
+    out = {}
+    for k, v in sections.items():
+        joined = "\n".join(v).strip()
+        if joined:
+            out[k] = joined
+    return out if out else {"FULL": text}
+
+
+def build_sectioned_note(note_text, note_type, note_id, note_date):
+    return SectionedNote(
+        sections=sectionize(note_text),
+        note_type=note_type or "",
+        note_id=note_id or "",
+        note_date=note_date or ""
     )
 
 
-def _window(text, start, end, width=160):
-    lo = max(0, start - width)
-    hi = min(len(text), end + width)
-    return text[lo:hi]
+def cand_score(c):
+    conf = float(getattr(c, "confidence", 0.0) or 0.0)
+    nt = str(getattr(c, "note_type", "") or "").lower()
+    sec = str(getattr(c, "section", "") or "").upper()
+    evid = str(getattr(c, "evidence", "") or "").lower()
+
+    op_bonus = 0.08 if ("op" in nt or "operative" in nt or "operation" in nt or "brief op" in nt) else 0.0
+    clinic_bonus = 0.04 if (
+        "clinic" in nt or "progress" in nt or "consult" in nt or
+        "oncology" in nt or "follow up" in nt or "follow-up" in nt
+    ) else 0.0
+    date_bonus = 0.01 if (getattr(c, "note_date", "") or "").strip() else 0.0
+    section_penalty = -0.12 if sec in {
+        "PAST MEDICAL HISTORY", "PAST SURGICAL HISTORY", "SURGICAL HISTORY",
+        "HISTORY", "PMH", "PSH", "GYNECOLOGIC HISTORY", "OB HISTORY", "FAMILY HISTORY"
+    } else 0.0
+    history_penalty = -0.04 if re.search(r"\b(history of|hx of|status post|s/p|prior|previous)\b", evid) else 0.0
+    procedure_bonus = 0.05 if re.search(r"\b(procedure|operative|operation|surgery|performed|placement|operation performed)\b", evid) else 0.0
+
+    return conf + op_bonus + clinic_bonus + date_bonus + section_penalty + history_penalty + procedure_bonus
 
 
-def _split_sentences(text):
-    if not text:
-        return []
-    parts = re.split(r"(?<=[\.\?\!\;])\s+|\n+", text)
-    return [p.strip() for p in parts if p and p.strip()]
+def choose_best(existing, new):
+    if existing is None:
+        return new
+    return new if cand_score(new) > cand_score(existing) else existing
 
 
-def _infer_laterality(text):
-    low = (text or "").lower()
+def merge_boolean(existing, new):
+    if existing is None:
+        return new
+    try:
+        exv = bool(existing.value)
+        nwv = bool(new.value)
+    except Exception:
+        return choose_best(existing, new)
+    if nwv and not exv:
+        return new
+    if exv and not nwv:
+        return existing
+    return choose_best(existing, new)
+
+
+def choose_best_indication(existing, new):
+    if existing is None:
+        return new
+
+    ex_score = cand_score(existing)
+    nw_score = cand_score(new)
+
+    ex_val = clean_cell(getattr(existing, "value", ""))
+    nw_val = clean_cell(getattr(new, "value", ""))
+
+    if nw_score > ex_score:
+        return new
+    if ex_score > nw_score:
+        return existing
+
+    rank = {"Therapeutic": 3, "Prophylactic": 2, "None": 1, "": 0}
+    if rank.get(nw_val, 0) > rank.get(ex_val, 0):
+        return new
+    return existing
+
+
+def choose_best_recon(existing, new):
+    if existing is None:
+        return new
+
+    ex_score = cand_score(existing)
+    nw_score = cand_score(new)
+
+    ex_evid = str(getattr(existing, "evidence", "") or "").lower()
+    nw_evid = str(getattr(new, "evidence", "") or "").lower()
+
+    revision_rx = re.compile(
+        r"\b(revision|fat graft|fat grafting|nipple reconstruction|nipple-areolar|tattoo|"
+        r"capsulotomy|capsulectomy|symmetry|symmetrization|scar revision|dog ear|"
+        r"lipofilling|liposuction|capsulorrhaphy)\b",
+        re.IGNORECASE
+    )
+
+    anchor_rx = re.compile(
+        r"\b(tissue expander placement|expander placement|implant placement|"
+        r"implant-based reconstruction|direct-to-implant|diep flap|tram flap|siea flap|"
+        r"latissimus dorsi flap|autologous reconstruction|free flap|immediate reconstruction|"
+        r"delayed reconstruction)\b",
+        re.IGNORECASE
+    )
+
+    ex_revision_only = bool(revision_rx.search(ex_evid)) and not bool(anchor_rx.search(ex_evid))
+    nw_revision_only = bool(revision_rx.search(nw_evid)) and not bool(anchor_rx.search(nw_evid))
+
+    if ex_revision_only and not nw_revision_only:
+        return new
+    if nw_revision_only and not ex_revision_only:
+        return existing
+
+    return new if nw_score > ex_score else existing
+
+
+FIELD_MAP = {
+    "Mastectomy_Laterality": "Mastectomy_Laterality",
+    "Mastectomy_Date": "Mastectomy_Date",
+    "Indication_Left": "Indication_Left",
+    "Indication_Right": "Indication_Right",
+    "LymphNode": "LymphNode",
+    "Radiation": "Radiation",
+    "Chemo": "Chemo",
+    "Recon_Laterality": "Recon_Laterality",
+    "Recon_Type": "Recon_Type",
+    "Recon_Classification": "Recon_Classification",
+    "Recon_Timing": "Recon_Timing",
+}
+
+BOOLEAN_FIELDS = {
+    "Radiation",
+    "Chemo",
+}
+
+KEYWORD_PREFILTER = re.compile(
+    r"\b("
+    r"mastectomy|diep|tram|siea|gap|sgap|igap|latissimus|flap|reconstruction|expander|implant|"
+    r"radiation|xrt|pmrt|chemo|chemotherapy|taxol|herceptin|"
+    r"sentinel|axillary|alnd|slnb|prophylactic|carcinoma|dcis|lcis|oncology|"
+    r"lymphatic\s+mapping"
+    r")\b",
+    re.IGNORECASE
+)
+
+
+def infer_laterality(text):
+    low = clean_cell(text).lower()
     if BILAT_RX.search(low):
         return "BILATERAL"
     has_left = bool(LEFT_RX.search(low))
@@ -419,206 +503,8 @@ def _infer_laterality(text):
     return None
 
 
-def _looks_negated_or_planned(ctx, op_note):
-    low = (ctx or "").lower()
-    if NEGATION_RX.search(low):
-        return True
-    if PLANNED_RX.search(low) and not op_note:
-        return True
-    return False
-
-
-def _has_side_specific_cancer(text, side):
-    low = (text or "").lower()
-    if side == "LEFT":
-        side_pat = LEFT_WORDS
-    else:
-        side_pat = RIGHT_WORDS
-
-    cancer_terms = r"(breast\s+cancer|carcinoma|dcis|lcis|idc|ilc|malignan|invasive|recurrent)"
-    p1 = re.search(side_pat + r".{0,90}" + cancer_terms, low)
-    p2 = re.search(cancer_terms + r".{0,90}" + side_pat, low)
-    return bool(p1 or p2)
-
-
-def _has_side_specific_prophylaxis(text, side):
-    low = (text or "").lower()
-    if side == "LEFT":
-        side_pat = LEFT_WORDS
-    else:
-        side_pat = RIGHT_WORDS
-    pro_terms = r"(prophylactic|risk[- ]reducing|risk\s+reducing|preventive|cpm|contralateral\s+prophylactic)"
-    p1 = re.search(side_pat + r".{0,70}" + pro_terms, low)
-    p2 = re.search(pro_terms + r".{0,70}" + side_pat, low)
-    return bool(p1 or p2)
-
-
-def _paired_side_indications(text):
-    low = (text or "").lower()
-
-    left_val = None
-    right_val = None
-
-    patterns = [
-        (
-            re.compile(
-                r"right.{0,80}(simple\s+mastectomy|total\s+mastectomy|mastectomy).{0,80}"
-                r"left.{0,60}(prophylactic|risk[- ]reducing|preventive)",
-                re.IGNORECASE
-            ),
-            ("Therapeutic", "Prophylactic")
-        ),
-        (
-            re.compile(
-                r"left.{0,80}(simple\s+mastectomy|total\s+mastectomy|mastectomy).{0,80}"
-                r"right.{0,60}(prophylactic|risk[- ]reducing|preventive)",
-                re.IGNORECASE
-            ),
-            ("Prophylactic", "Therapeutic")
-        ),
-        (
-            re.compile(
-                r"left.{0,60}(prophylactic|risk[- ]reducing|preventive).{0,80}"
-                r"right.{0,80}(simple\s+mastectomy|total\s+mastectomy|mastectomy)",
-                re.IGNORECASE
-            ),
-            ("Prophylactic", "Therapeutic")
-        ),
-        (
-            re.compile(
-                r"right.{0,60}(prophylactic|risk[- ]reducing|preventive).{0,80}"
-                r"left.{0,80}(simple\s+mastectomy|total\s+mastectomy|mastectomy)",
-                re.IGNORECASE
-            ),
-            ("Therapeutic", "Prophylactic")
-        ),
-    ]
-
-    for rx, vals in patterns:
-        if rx.search(low):
-            left_val, right_val = vals
-            break
-
-    return left_val, right_val
-
-
-def _infer_indications(text, lat, op_note=False):
-    low = (text or "").lower()
-
-    left_val = None
-    right_val = None
-
-    pair_left, pair_right = _paired_side_indications(text)
-    if pair_left is not None:
-        left_val = pair_left
-    if pair_right is not None:
-        right_val = pair_right
-
-    left_cancer = _has_side_specific_cancer(text, "LEFT")
-    right_cancer = _has_side_specific_cancer(text, "RIGHT")
-    left_pro = _has_side_specific_prophylaxis(text, "LEFT")
-    right_pro = _has_side_specific_prophylaxis(text, "RIGHT")
-
-    if left_val is None:
-        if left_pro:
-            left_val = "Prophylactic"
-        elif left_cancer:
-            left_val = "Therapeutic"
-
-    if right_val is None:
-        if right_pro:
-            right_val = "Prophylactic"
-        elif right_cancer:
-            right_val = "Therapeutic"
-
-    # contralateral prophylactic inference only when the therapeutic side is explicit
-    if "contralateral prophylactic" in low:
-        if left_cancer and right_val is None:
-            right_val = "Prophylactic"
-            if left_val is None:
-                left_val = "Therapeutic"
-        elif right_cancer and left_val is None:
-            left_val = "Prophylactic"
-            if right_val is None:
-                right_val = "Therapeutic"
-
-    # only allow single-side default when note itself is single-sided and cancer is side-specific
-    if lat == "LEFT" and left_val is None and left_cancer and not left_pro:
-        left_val = "Therapeutic"
-    if lat == "RIGHT" and right_val is None and right_cancer and not right_pro:
-        right_val = "Therapeutic"
-
-    return left_val, right_val
-
-
-def _strong_radiation_history(ctx):
-    low = (ctx or "").lower()
-    if WEAK_TREATMENT_EXCLUDE_RX.search(low):
-        return False
-    if STRONG_RADIATION_HISTORY_RX.search(low):
-        return True
-    if RADIATION_RX.search(low) and TREATMENT_RECEIVED_RX.search(low):
-        return True
-    return False
-
-
-def _strong_chemo_history(ctx):
-    low = (ctx or "").lower()
-    if WEAK_TREATMENT_EXCLUDE_RX.search(low):
-        return False
-    if ENDOCRINE_ONLY_RX.search(low) and not CHEMO_RX.search(low):
-        return False
-    if STRONG_CHEMO_HISTORY_RX.search(low):
-        return True
-    if CHEMO_RX.search(low) and TREATMENT_RECEIVED_RX.search(low):
-        return True
-    return False
-
-
-def _infer_side_from_local_ctx(text, match_obj):
-    if match_obj is None:
-        return _infer_laterality(text)
-    ctx = _window(text, match_obj.start(), match_obj.end(), 120)
-    return _infer_laterality(ctx) or _infer_laterality(text)
-
-
-def _lymphnode_value_from_text(text, op_note, clinic_like):
-    low = (text or "").lower()
-
-    if LN_SCAR_SITE_RX.search(low):
-        return None, None
-    if LN_PLAN_RX.search(low) and not LN_DONE_RX.search(low) and not LN_HISTORY_RX.search(low) and not op_note:
-        return None, None
-
-    if LN_FAIL_MAP_RX.search(low) and ALND_RX.search(low):
-        mm = ALND_RX.search(text)
-        return "ALND", mm
-
-    alnd_match = ALND_RX.search(text)
-    if alnd_match:
-        ctx = _window(low, alnd_match.start(), alnd_match.end(), 180)
-        if not _looks_negated_or_planned(ctx, op_note):
-            if clinic_like:
-                if LN_DONE_RX.search(ctx) or LN_HISTORY_RX.search(ctx):
-                    return "ALND", alnd_match
-            if op_note and (LN_CURRENT_PROCEDURE_CUE_RX.search(ctx) or LN_DONE_RX.search(ctx) or LN_FAIL_MAP_RX.search(ctx)):
-                return "ALND", alnd_match
-
-    slnb_match = SLNB_RX.search(text)
-    if slnb_match:
-        ctx = _window(low, slnb_match.start(), slnb_match.end(), 180)
-        if not _looks_negated_or_planned(ctx, op_note):
-            if clinic_like:
-                if LN_DONE_RX.search(ctx) or LN_HISTORY_RX.search(ctx):
-                    return "SLNB", slnb_match
-            if op_note and (LN_CURRENT_PROCEDURE_CUE_RX.search(ctx) or LN_DONE_RX.search(ctx)):
-                return "SLNB", slnb_match
-
-    return None, None
-
-
-def _infer_recon_type_and_class(text):
-    low = (text or "").lower()
+def infer_recon_type_and_class(text):
+    low = clean_cell(text).lower()
 
     flap_types_found = []
 
@@ -684,140 +570,872 @@ def _infer_recon_type_and_class(text):
     return rtype, rclass
 
 
-def _is_revision_only_recon_context(text):
-    low = (text or "").lower()
-    if REVISION_RX.search(low) and not ANCHOR_RECON_RX.search(low):
+def load_existing_master():
+    if not os.path.exists(MASTER_PATH):
+        raise FileNotFoundError(
+            "Existing master file not found: {0}\nRestore your original build first.".format(MASTER_PATH)
+        )
+    master = clean_cols(read_csv_robust(MASTER_PATH))
+    master = normalize_mrn(master)
+
+    for c in TARGET_FIELDS:
+        if c not in master.columns:
+            master[c] = pd.NA
+
+    return master
+
+
+def load_and_reconstruct_notes():
+    note_files = []
+    for g in NOTE_GLOBS:
+        note_files.extend(glob(g, recursive=True))
+    note_files = sorted(set(note_files))
+
+    if not note_files:
+        raise FileNotFoundError("No HPI11526 * Notes.csv files found.")
+
+    all_notes_rows = []
+
+    for fp in note_files:
+        df = clean_cols(read_csv_robust(fp))
+        df = normalize_mrn(df)
+
+        note_text_col = pick_col(df, ["NOTE_TEXT", "NOTE TEXT", "NOTE_TEXT_FULL", "TEXT", "NOTE"])
+        note_id_col = pick_col(df, ["NOTE_ID", "NOTE ID"])
+        line_col = pick_col(df, ["LINE"], required=False)
+        note_type_col = pick_col(df, ["NOTE_TYPE", "NOTE TYPE"], required=False)
+        date_col = pick_col(
+            df,
+            ["NOTE_DATE_OF_SERVICE", "NOTE DATE OF SERVICE", "OPERATION_DATE", "ADMIT_DATE", "HOSP_ADMSN_TIME"],
+            required=False
+        )
+
+        df[note_text_col] = df[note_text_col].fillna("").astype(str)
+        df[note_id_col] = df[note_id_col].fillna("").astype(str)
+        if line_col:
+            df[line_col] = df[line_col].fillna("").astype(str)
+        if note_type_col:
+            df[note_type_col] = df[note_type_col].fillna("").astype(str)
+        if date_col:
+            df[date_col] = df[date_col].fillna("").astype(str)
+
+        df["_SOURCE_FILE_"] = os.path.basename(fp)
+
+        keep_cols = [MERGE_KEY, note_id_col, note_text_col, "_SOURCE_FILE_"]
+        if line_col:
+            keep_cols.append(line_col)
+        if note_type_col:
+            keep_cols.append(note_type_col)
+        if date_col:
+            keep_cols.append(date_col)
+
+        tmp = df[keep_cols].copy()
+        tmp = tmp.rename(columns={note_id_col: "NOTE_ID", note_text_col: "NOTE_TEXT"})
+
+        if line_col and line_col != "LINE":
+            tmp = tmp.rename(columns={line_col: "LINE"})
+        if note_type_col and note_type_col != "NOTE_TYPE":
+            tmp = tmp.rename(columns={note_type_col: "NOTE_TYPE"})
+        if date_col and date_col != "NOTE_DATE_OF_SERVICE":
+            tmp = tmp.rename(columns={date_col: "NOTE_DATE_OF_SERVICE"})
+
+        if "LINE" not in tmp.columns:
+            tmp["LINE"] = ""
+        if "NOTE_TYPE" not in tmp.columns:
+            tmp["NOTE_TYPE"] = ""
+        if "NOTE_DATE_OF_SERVICE" not in tmp.columns:
+            tmp["NOTE_DATE_OF_SERVICE"] = ""
+
+        all_notes_rows.append(tmp)
+
+    notes_raw = pd.concat(all_notes_rows, ignore_index=True)
+
+    def join_note(group):
+        tmp = group.copy()
+        tmp["_LINE_NUM_"] = tmp["LINE"].apply(to_int_safe)
+        tmp = tmp.sort_values(by=["_LINE_NUM_"], na_position="last")
+        return "\n".join(tmp["NOTE_TEXT"].tolist()).strip()
+
+    reconstructed = []
+    grouped = notes_raw.groupby([MERGE_KEY, "NOTE_ID"], dropna=False)
+
+    for (mrn, nid), g in grouped:
+        mrn = str(mrn).strip()
+        nid = str(nid).strip()
+        if not nid:
+            continue
+
+        full_text = join_note(g)
+        if not full_text:
+            continue
+
+        if g["NOTE_TYPE"].astype(str).str.strip().any():
+            note_type = g["NOTE_TYPE"].astype(str).iloc[0]
+        else:
+            note_type = g["_SOURCE_FILE_"].astype(str).iloc[0]
+
+        if g["NOTE_DATE_OF_SERVICE"].astype(str).str.strip().any():
+            note_date = g["NOTE_DATE_OF_SERVICE"].astype(str).iloc[0]
+        else:
+            note_date = ""
+
+        reconstructed.append({
+            MERGE_KEY: mrn,
+            "NOTE_ID": nid,
+            "NOTE_TYPE": note_type,
+            "NOTE_DATE": note_date,
+            "SOURCE_FILE": g["_SOURCE_FILE_"].astype(str).iloc[0],
+            "NOTE_TEXT": full_text
+        })
+
+    return pd.DataFrame(reconstructed)
+
+
+def load_structured_encounters():
+    rows = []
+    struct_files = []
+    for g in STRUCT_GLOBS:
+        struct_files.extend(glob(g, recursive=True))
+
+    for fp in sorted(set(struct_files)):
+        df = clean_cols(read_csv_robust(fp))
+        df = normalize_mrn(df)
+        source_name = os.path.basename(fp).lower()
+
+        if "operation encounters" in source_name:
+            encounter_source = "operation"
+            priority = 1
+        elif "clinic encounters" in source_name:
+            encounter_source = "clinic"
+            priority = 2
+        elif "inpatient encounters" in source_name:
+            encounter_source = "inpatient"
+            priority = 3
+        else:
+            encounter_source = "other"
+            priority = 9
+
+        recon_col = pick_col(df, ["RECONSTRUCTION_DATE", "RECONSTRUCTION DATE"], required=False)
+        cpt_col = pick_col(df, ["CPT_CODE", "CPT CODE", "CPT"], required=False)
+        proc_col = pick_col(df, ["PROCEDURE", "Procedure"], required=False)
+        date_col = pick_col(df, ["OPERATION_DATE", "CHECKOUT_TIME", "DISCHARGE_DATE_DT"], required=False)
+
+        out = pd.DataFrame()
+        out[MERGE_KEY] = df[MERGE_KEY].astype(str).str.strip()
+        out["STRUCT_SOURCE"] = encounter_source
+        out["STRUCT_PRIORITY"] = priority
+        out["STRUCT_DATE_RAW"] = df[date_col].astype(str) if date_col else ""
+        out["RECONSTRUCTION_DATE_STRUCT"] = df[recon_col].astype(str) if recon_col else ""
+        out["CPT_CODE_STRUCT"] = df[cpt_col].astype(str) if cpt_col else ""
+        out["PROCEDURE_STRUCT"] = df[proc_col].astype(str) if proc_col else ""
+        rows.append(out)
+
+    if not rows:
+        return pd.DataFrame(columns=[
+            MERGE_KEY, "STRUCT_SOURCE", "STRUCT_PRIORITY", "STRUCT_DATE_RAW",
+            "RECONSTRUCTION_DATE_STRUCT", "CPT_CODE_STRUCT", "PROCEDURE_STRUCT"
+        ])
+
+    return pd.concat(rows, ignore_index=True)
+
+
+def choose_best_recon_anchor_rows(struct_df):
+    recon_best = {}
+    if len(struct_df) == 0:
+        return recon_best
+
+    source_priority = {
+        "operation": 1,
+        "clinic": 2,
+        "inpatient": 3,
+        "other": 9
+    }
+
+    preferred_cpts = set([
+        "19357", "19340", "19342", "19361", "19364", "19367", "S2068"
+    ])
+    fallback_allowed_cpts = set([
+        "19350", "19380"
+    ])
+    primary_exclude_cpts = set([
+        "19325", "19330"
+    ])
+
+    eligible = struct_df.copy()
+    has_preferred_cpt = {}
+
+    for mrn, g in eligible.groupby(MERGE_KEY):
+        found = False
+        for val in g["CPT_CODE_STRUCT"].fillna("").astype(str).tolist():
+            cpt = clean_cell(val).upper()
+            if cpt in preferred_cpts:
+                found = True
+                break
+        has_preferred_cpt[mrn] = found
+
+    for _, row in eligible.iterrows():
+        mrn = clean_cell(row.get(MERGE_KEY, ""))
+        if not mrn:
+            continue
+
+        source = clean_cell(row.get("STRUCT_SOURCE", "")).lower()
+        recon_date = parse_date_safe(row.get("RECONSTRUCTION_DATE_STRUCT", ""))
+        struct_date = parse_date_safe(row.get("STRUCT_DATE_RAW", ""))
+        cpt_code = clean_cell(row.get("CPT_CODE_STRUCT", "")).upper()
+        procedure = clean_cell(row.get("PROCEDURE_STRUCT", "")).lower()
+
+        if recon_date is None:
+            continue
+        if cpt_code in primary_exclude_cpts:
+            continue
+        if has_preferred_cpt.get(mrn, False) and cpt_code in fallback_allowed_cpts:
+            continue
+
+        is_anchor = False
+        if cpt_code in preferred_cpts:
+            is_anchor = True
+        if (not has_preferred_cpt.get(mrn, False)) and (cpt_code in fallback_allowed_cpts):
+            is_anchor = True
+        if not is_anchor:
+            if (
+                ("breast recon" in procedure) or
+                ("reconstruction" in procedure) or
+                ("diep" in procedure) or
+                ("tram" in procedure) or
+                ("siea" in procedure) or
+                ("latissimus" in procedure) or
+                ("flap" in procedure) or
+                ("expander" in procedure) or
+                ("implant" in procedure) or
+                ("direct-to-implant" in procedure)
+            ):
+                is_anchor = True
+
+        if not is_anchor:
+            continue
+
+        score = (
+            source_priority.get(source, 9),
+            recon_date,
+            struct_date if struct_date is not None else recon_date
+        )
+
+        current = recon_best.get(mrn)
+        if current is None or score < current["score"]:
+            lat = infer_laterality(procedure)
+            rtype, rclass = infer_recon_type_and_class(procedure)
+            recon_best[mrn] = {
+                "recon_date": recon_date.strftime("%Y-%m-%d"),
+                "source": source,
+                "cpt_code": cpt_code,
+                "procedure": clean_cell(row.get("PROCEDURE_STRUCT", "")),
+                "recon_laterality": lat,
+                "recon_type": rtype,
+                "recon_classification": rclass,
+                "score": score
+            }
+
+    return recon_best
+
+
+def build_structured_mastectomy_events(struct_df):
+    out = {}
+    if len(struct_df) == 0:
+        return out
+
+    for _, row in struct_df.iterrows():
+        mrn = clean_cell(row.get(MERGE_KEY, ""))
+        if not mrn:
+            continue
+
+        proc = clean_cell(row.get("PROCEDURE_STRUCT", ""))
+        if not proc:
+            continue
+        if not MASTECTOMY_RX.search(proc):
+            continue
+
+        event_dt = parse_date_safe(row.get("STRUCT_DATE_RAW", ""))
+        if event_dt is None:
+            event_dt = parse_date_safe(row.get("RECONSTRUCTION_DATE_STRUCT", ""))
+
+        lat = infer_laterality(proc)
+
+        if mrn not in out:
+            out[mrn] = []
+
+        out[mrn].append({
+            "date": event_dt,
+            "laterality": lat,
+            "procedure": proc
+        })
+
+    return out
+
+
+def choose_best_mastectomy_event(events, recon_dt):
+    if not events:
+        return None
+
+    best_same_day = None
+    best_prior = None
+
+    for ev in events:
+        ev_dt = ev.get("date")
+        if ev_dt is None:
+            continue
+        if recon_dt is not None and same_calendar_date(ev_dt, recon_dt):
+            if best_same_day is None:
+                best_same_day = ev
+        elif recon_dt is not None and ev_dt.date() < recon_dt.date():
+            if best_prior is None or ev_dt > best_prior.get("date"):
+                best_prior = ev
+        elif recon_dt is None:
+            if best_prior is None or ev_dt > best_prior.get("date"):
+                best_prior = ev
+
+    if best_same_day is not None:
+        return best_same_day
+    return best_prior
+
+
+def append_evidence_rows(existing_evid_df, new_rows):
+    if existing_evid_df is None:
+        return pd.DataFrame(new_rows)
+
+    if len(new_rows) == 0:
+        return existing_evid_df
+
+    add_df = pd.DataFrame(new_rows)
+    for c in existing_evid_df.columns:
+        if c not in add_df.columns:
+            add_df[c] = ""
+    for c in add_df.columns:
+        if c not in existing_evid_df.columns:
+            existing_evid_df[c] = ""
+    return pd.concat([existing_evid_df, add_df[existing_evid_df.columns]], ignore_index=True)
+
+
+def load_existing_evidence():
+    if os.path.exists(EVID_PATH):
+        return clean_cols(read_csv_robust(EVID_PATH))
+    return pd.DataFrame(columns=[
+        MERGE_KEY,
+        "NOTE_ID",
+        "NOTE_DATE",
+        "NOTE_TYPE",
+        "FIELD",
+        "VALUE",
+        "STATUS",
+        "CONFIDENCE",
+        "SECTION",
+        "EVIDENCE"
+    ])
+
+
+def _is_clinic_like_note_type(note_type):
+    s = clean_cell(note_type).lower()
+    pats = [
+        "clinic", "progress", "office", "follow up", "follow-up",
+        "consult", "oncology", "h&p", "history and physical"
+    ]
+    for p in pats:
+        if p in s:
+            return True
+    return False
+
+
+def _is_op_like_note_type(note_type):
+    s = clean_cell(note_type).lower()
+    return (
+        ("brief op" in s) or
+        ("op note" in s) or
+        ("operative" in s) or
+        ("operation" in s) or
+        ("oper report" in s)
+    )
+
+
+def _ln_infer_side_from_evidence(evidence):
+    low = clean_cell(evidence).lower()
+    has_left = bool(LEFT_RX.search(low))
+    has_right = bool(RIGHT_RX.search(low))
+    if BILAT_RX.search(low) or (has_left and has_right):
+        return "BILATERAL"
+    if has_left:
+        return "LEFT"
+    if has_right:
+        return "RIGHT"
+    return "UNKNOWN"
+
+
+def _therapeutic_side_for_mrn(master_row):
+    left_ind = clean_cell(master_row.get("Indication_Left", ""))
+    right_ind = clean_cell(master_row.get("Indication_Right", ""))
+
+    if left_ind == "Therapeutic" and right_ind == "Therapeutic":
+        return "BILATERAL"
+    if left_ind == "Therapeutic":
+        return "LEFT"
+    if right_ind == "Therapeutic":
+        return "RIGHT"
+    return "UNKNOWN"
+
+
+def _ln_is_planned(ev):
+    return bool(LN_PLAN_RX.search(ev)) and not bool(LN_DONE_RX.search(ev)) and not bool(LN_HISTORY_RX.search(ev))
+
+
+def _ln_is_remote(ev, sec):
+    if sec in {
+        "PAST MEDICAL HISTORY", "PAST SURGICAL HISTORY", "SURGICAL HISTORY",
+        "HISTORY", "PMH", "PSH", "OB HISTORY", "GYNECOLOGIC HISTORY", "FAMILY HISTORY"
+    }:
+        return True
+    if LN_REMOTE_HISTORY_RX.search(ev):
         return True
     return False
 
 
-def extract_breast_cancer_recon(note):
-    cands = []
-    op_note = _is_operation_note(note.note_type)
-    clinic_like = _is_clinic_like(note.note_type)
+def _ln_is_scar_or_site_only(ev):
+    if not LN_SCAR_SITE_RX.search(ev):
+        return False
 
-    for section, text in note.sections.items():
-        if section in SUPPRESS_SECTIONS:
+    # if explicit performed/current procedure text is also present, do not auto-drop
+    if ALND_RX.search(ev) or SLNB_RX.search(ev):
+        if LN_DONE_RX.search(ev) or "operation performed" in ev or "procedure performed" in ev:
+            return False
+    return True
+
+
+def _ln_episode_score(cand, mastectomy_dt, recon_dt, therapeutic_side):
+    val = clean_cell(getattr(cand, "value", ""))
+    nt = clean_cell(getattr(cand, "note_type", "")).lower()
+    sec = clean_cell(getattr(cand, "section", "")).upper()
+    ev = clean_cell(getattr(cand, "evidence", "")).lower()
+    nd = parse_date_safe(getattr(cand, "note_date", ""))
+    side = _ln_infer_side_from_evidence(ev)
+
+    score = 0.0
+
+    # class value
+    if val == "ALND":
+        score += 40.0
+    elif val == "SLNB":
+        score += 30.0
+
+    # source priority
+    if _is_clinic_like_note_type(nt):
+        score += 20.0
+    elif _is_op_like_note_type(nt):
+        score += 10.0
+
+    # explicit performed/completed
+    if LN_DONE_RX.search(ev):
+        score += 18.0
+    if LN_HISTORY_RX.search(ev):
+        score += 10.0
+
+    # convert/fail-map -> ALND
+    if LN_FAIL_MAP_RX.search(ev) and ALND_RX.search(ev):
+        score += 35.0
+
+    # strong exclusions
+    if _ln_is_planned(ev):
+        score -= 80.0
+    if _ln_is_scar_or_site_only(ev):
+        score -= 80.0
+    if _ln_is_remote(ev, sec):
+        score -= 30.0
+
+    # side logic
+    if therapeutic_side in {"LEFT", "RIGHT"}:
+        if side == therapeutic_side:
+            score += 18.0
+        elif side == "BILATERAL":
+            score += 8.0
+        elif side in {"LEFT", "RIGHT"} and side != therapeutic_side:
+            score -= 35.0
+    elif therapeutic_side == "BILATERAL":
+        if side in {"LEFT", "RIGHT", "BILATERAL"}:
+            score += 6.0
+
+    # date anchoring
+    anchor_dt = mastectomy_dt if mastectomy_dt is not None else recon_dt
+    if anchor_dt is not None and nd is not None:
+        dd = days_between(nd, anchor_dt)
+        if dd is not None:
+            if -30 <= dd <= 365:
+                score += 22.0
+                if 0 <= dd <= 180:
+                    score += 8.0
+            elif -365 <= dd < -30:
+                score -= 8.0
+            else:
+                score -= 18.0
+
+    # same-day explicit op note fallback should stay viable
+    if anchor_dt is not None and nd is not None and _is_op_like_note_type(nt):
+        if same_calendar_date(nd, anchor_dt):
+            if "operation performed" in ev or "procedure performed" in ev or LN_DONE_RX.search(ev):
+                score += 18.0
+
+    # low confidence notes lose
+    try:
+        score += float(getattr(cand, "confidence", 0.0) or 0.0)
+    except Exception:
+        pass
+
+    return score
+
+
+def choose_best_lymphnode_resolved(cands, mastectomy_dt, recon_dt, therapeutic_side):
+    if not cands:
+        return None
+
+    usable = []
+    for c in cands:
+        ev = clean_cell(getattr(c, "evidence", "")).lower()
+        sec = clean_cell(getattr(c, "section", "")).upper()
+
+        if _ln_is_planned(ev):
             continue
-        if not text:
+        if _ln_is_scar_or_site_only(ev):
             continue
 
-        section_upper = (section or "").upper()
-        section_low_value = section_upper in LOW_VALUE_SECTIONS
+        usable.append(c)
 
-        m = MASTECTOMY_RX.search(text)
-        if m:
-            ctx = _window(text, m.start(), m.end(), 220)
+    if not usable:
+        return None
 
-            if not _looks_negated_or_planned(ctx, op_note):
-                lat = _infer_laterality(ctx) or _infer_laterality(text)
-                if lat:
-                    conf = 0.90 if op_note else 0.74
-                    if section_low_value and not op_note:
-                        conf -= 0.10
-                    cands.append(_emit("Mastectomy_Laterality", lat, text, m, section, note, conf))
+    # step 1: keep strong episode/side-matched pool if available
+    scored = []
+    for c in usable:
+        s = _ln_episode_score(c, mastectomy_dt, recon_dt, therapeutic_side)
+        scored.append((s, c))
 
-                if _clean(note.note_date):
-                    conf = 0.88 if op_note else 0.68
-                    if section_low_value and not op_note:
-                        conf -= 0.10
-                    cands.append(_emit("Mastectomy_Date", _clean(note.note_date), text, m, section, note, conf))
+    scored = sorted(scored, key=lambda x: x[0], reverse=True)
 
-                left_ind, right_ind = _infer_indications(text, lat, op_note=op_note)
-                if left_ind is not None:
-                    conf = 0.84 if op_note else 0.68
-                    if section_low_value and not op_note:
-                        conf -= 0.10
-                    cands.append(_emit("Indication_Left", left_ind, text, m, section, note, conf))
-                if right_ind is not None:
-                    conf = 0.84 if op_note else 0.68
-                    if section_low_value and not op_note:
-                        conf -= 0.10
-                    cands.append(_emit("Indication_Right", right_ind, text, m, section, note, conf))
+    # if any clear positive score, pick highest
+    if scored and scored[0][0] > 0:
+        return scored[0][1]
 
-                lymph_value, lymph_match = _lymphnode_value_from_text(text, op_note, clinic_like)
-                if lymph_value == "ALND":
-                    conf = 0.88 if clinic_like else 0.80
-                    if op_note:
-                        conf = 0.83
-                    if section_low_value and not op_note:
-                        conf -= 0.10
-                    cands.append(_emit("LymphNode", "ALND", text, lymph_match, section, note, conf))
-                elif lymph_value == "SLNB":
-                    conf = 0.86 if clinic_like else 0.78
-                    if op_note:
-                        conf = 0.81
-                    if section_low_value and not op_note:
-                        conf -= 0.10
-                    cands.append(_emit("LymphNode", "SLNB", text, lymph_match, section, note, conf))
+    # fallback: any ALND > any SLNB by score
+    best_alnd = None
+    best_alnd_score = None
+    best_slnb = None
+    best_slnb_score = None
 
-        r = RECON_RX.search(text)
-        if r:
-            ctx = _window(text, r.start(), r.end(), 220)
+    for s, c in scored:
+        v = clean_cell(getattr(c, "value", ""))
+        if v == "ALND":
+            if best_alnd is None or s > best_alnd_score:
+                best_alnd = c
+                best_alnd_score = s
+        elif v == "SLNB":
+            if best_slnb is None or s > best_slnb_score:
+                best_slnb = c
+                best_slnb_score = s
 
-            if not _looks_negated_or_planned(ctx, op_note):
-                if not _is_revision_only_recon_context(text):
-                    lat = _infer_laterality(ctx) or _infer_laterality(text)
-                    if lat:
-                        conf = 0.90 if op_note else 0.74
-                        if section_low_value and not op_note:
-                            conf -= 0.10
-                        cands.append(_emit("Recon_Laterality", lat, text, r, section, note, conf))
+    if best_alnd is not None:
+        return best_alnd
+    if best_slnb is not None:
+        return best_slnb
+    return None
 
-                    rtype, rclass = _infer_recon_type_and_class(text)
-                    if rtype:
-                        conf = 0.88 if op_note else 0.70
-                        if section_low_value and not op_note:
-                            conf -= 0.10
-                        cands.append(_emit("Recon_Type", rtype, text, r, section, note, conf))
-                    if rclass:
-                        conf = 0.88 if op_note else 0.70
-                        if section_low_value and not op_note:
-                            conf -= 0.10
-                        cands.append(_emit("Recon_Classification", rclass, text, r, section, note, conf))
 
-                    if op_note and MASTECTOMY_RX.search(text):
-                        cands.append(_emit("Recon_Timing", "Immediate", text, r, section, note, 0.92))
+def main():
+    print("Loading EXISTING master...")
+    master = load_existing_master()
+    print("Existing master rows: {0}".format(len(master)))
 
-        rr = RADIATION_RX.search(text)
-        if rr:
-            ctx = _window(text, rr.start(), rr.end(), 260)
-            should_emit = False
-            conf = 0.74
+    print("Loading notes...")
+    notes_df = load_and_reconstruct_notes()
+    print("Reconstructed notes: {0}".format(len(notes_df)))
 
-            if _strong_radiation_history(ctx):
-                should_emit = True
-                conf = 0.86 if clinic_like else 0.80
-                if section_low_value and not op_note:
-                    conf -= 0.10
-            elif op_note:
-                should_emit = False
+    print("Loading structured encounters...")
+    struct_df = load_structured_encounters()
+    print("Structured encounter rows: {0}".format(len(struct_df)))
 
-            if should_emit:
-                cands.append(_emit("Radiation", True, text, rr, section, note, conf))
+    recon_anchor_map = choose_best_recon_anchor_rows(struct_df)
+    mastectomy_events_map = build_structured_mastectomy_events(struct_df)
 
-        cc = CHEMO_RX.search(text)
-        if cc:
-            ctx = _window(text, cc.start(), cc.end(), 260)
-            low_ctx = ctx.lower()
+    evidence_rows = []
+    best_by_mrn = {}
+    therapy_dates = {}
+    lymphnode_by_mrn = {}
 
-            should_emit = False
-            conf = 0.74
+    print("Running patch-only extractor...")
 
-            if ENDOCRINE_ONLY_RX.search(low_ctx) and not CHEMO_RX.search(low_ctx):
-                should_emit = False
-            elif _strong_chemo_history(ctx):
-                should_emit = True
-                conf = 0.86 if clinic_like else 0.80
-                if section_low_value and not op_note:
-                    conf -= 0.10
-            elif op_note:
-                should_emit = False
+    for _, row in notes_df.iterrows():
+        mrn = str(row[MERGE_KEY]).strip()
+        note_text = clean_cell(row["NOTE_TEXT"])
+        note_date = clean_cell(row["NOTE_DATE"])
 
-            if should_emit:
-                cands.append(_emit("Chemo", True, text, cc, section, note, conf))
+        if not note_text:
+            continue
+        if not KEYWORD_PREFILTER.search(note_text):
+            continue
 
-    return cands
+        snote = build_sectioned_note(
+            note_text=note_text,
+            note_type=row["NOTE_TYPE"],
+            note_id=row["NOTE_ID"],
+            note_date=note_date
+        )
+
+        try:
+            all_cands = extract_breast_cancer_recon(snote)
+        except Exception as e:
+            evidence_rows.append({
+                MERGE_KEY: mrn,
+                "NOTE_ID": row["NOTE_ID"],
+                "NOTE_DATE": row["NOTE_DATE"],
+                "NOTE_TYPE": row["NOTE_TYPE"],
+                "FIELD": "EXTRACTOR_ERROR",
+                "VALUE": "",
+                "STATUS": "",
+                "CONFIDENCE": "",
+                "SECTION": "",
+                "EVIDENCE": "extract_breast_cancer_recon failed: {0}".format(repr(e))
+            })
+            continue
+
+        if not all_cands:
+            continue
+
+        if mrn not in best_by_mrn:
+            best_by_mrn[mrn] = {}
+        if mrn not in therapy_dates:
+            therapy_dates[mrn] = {"Radiation": [], "Chemo": [], "Mastectomy_Date": []}
+        if mrn not in lymphnode_by_mrn:
+            lymphnode_by_mrn[mrn] = []
+
+        for c in all_cands:
+            logical = FIELD_MAP.get(str(c.field))
+            if not logical:
+                continue
+
+            evidence_rows.append({
+                MERGE_KEY: mrn,
+                "NOTE_ID": getattr(c, "note_id", row["NOTE_ID"]),
+                "NOTE_DATE": getattr(c, "note_date", row["NOTE_DATE"]),
+                "NOTE_TYPE": getattr(c, "note_type", row["NOTE_TYPE"]),
+                "FIELD": logical,
+                "VALUE": getattr(c, "value", ""),
+                "STATUS": getattr(c, "status", ""),
+                "CONFIDENCE": getattr(c, "confidence", ""),
+                "SECTION": getattr(c, "section", ""),
+                "EVIDENCE": getattr(c, "evidence", "")
+            })
+
+            if logical == "Radiation":
+                dt = parse_date_safe(getattr(c, "note_date", row["NOTE_DATE"]))
+                if dt is not None:
+                    therapy_dates[mrn]["Radiation"].append(dt)
+
+            if logical == "Chemo":
+                dt = parse_date_safe(getattr(c, "note_date", row["NOTE_DATE"]))
+                if dt is not None:
+                    therapy_dates[mrn]["Chemo"].append(dt)
+
+            if logical == "Mastectomy_Date":
+                dt = parse_date_safe(getattr(c, "value", ""))
+                if dt is not None:
+                    therapy_dates[mrn]["Mastectomy_Date"].append(dt)
+
+            if logical == "LymphNode":
+                lymphnode_by_mrn[mrn].append(c)
+                continue
+
+            existing = best_by_mrn[mrn].get(logical)
+
+            if logical in BOOLEAN_FIELDS:
+                best_by_mrn[mrn][logical] = merge_boolean(existing, c)
+            elif logical in {"Indication_Left", "Indication_Right"}:
+                best_by_mrn[mrn][logical] = choose_best_indication(existing, c)
+            elif logical in {"Recon_Type", "Recon_Classification"}:
+                best_by_mrn[mrn][logical] = choose_best_recon(existing, c)
+            else:
+                best_by_mrn[mrn][logical] = choose_best(existing, c)
+
+    print("Resolving lymph node using full side/episode-aware logic...")
+    for idx, row in master.iterrows():
+        mrn = clean_cell(row.get(MERGE_KEY, ""))
+        if not mrn:
+            continue
+
+        cands = lymphnode_by_mrn.get(mrn, [])
+        if not cands:
+            continue
+
+        recon_info = recon_anchor_map.get(mrn)
+        recon_dt = parse_date_safe((recon_info or {}).get("recon_date", ""))
+
+        mast_dates = therapy_dates.get(mrn, {}).get("Mastectomy_Date", [])
+        mastectomy_dt = None
+        if mast_dates:
+            mastectomy_dt = sorted(mast_dates)[0]
+
+        therapeutic_side = _therapeutic_side_for_mrn(row)
+
+        best_ln = choose_best_lymphnode_resolved(
+            cands=cands,
+            mastectomy_dt=mastectomy_dt,
+            recon_dt=recon_dt,
+            therapeutic_side=therapeutic_side
+        )
+
+        if best_ln is not None:
+            if mrn not in best_by_mrn:
+                best_by_mrn[mrn] = {}
+            best_by_mrn[mrn]["LymphNode"] = best_ln
+
+    print("Applying updates to EXISTING master only for target fields...")
+
+    all_mrns = master[MERGE_KEY].astype(str).str.strip().tolist()
+
+    for mrn in all_mrns:
+        mask = (master[MERGE_KEY].astype(str).str.strip() == mrn)
+        if not mask.any():
+            continue
+
+        fields = best_by_mrn.get(mrn, {})
+        recon_info = recon_anchor_map.get(mrn)
+        recon_dt = parse_date_safe((recon_info or {}).get("recon_date", ""))
+
+        for logical, cand in fields.items():
+            if logical == "Mastectomy_Date":
+                continue
+
+            val = getattr(cand, "value", pd.NA)
+
+            if logical in BOOLEAN_FIELDS:
+                try:
+                    val = 1 if bool(val) else 0
+                except Exception:
+                    val = pd.NA
+
+            if logical in TARGET_FIELDS:
+                master.loc[mask, logical] = val
+
+        if recon_info is not None:
+            current_val = clean_cell(master.loc[mask, "Recon_Laterality"].iloc[0])
+            if clean_cell(recon_info.get("recon_laterality", "")):
+                if not current_val or current_val in {"", "BILATERAL"}:
+                    master.loc[mask, "Recon_Laterality"] = recon_info["recon_laterality"]
+
+            current_val = clean_cell(master.loc[mask, "Recon_Type"].iloc[0])
+            if clean_cell(recon_info.get("recon_type", "")):
+                if not current_val or current_val in {"other"}:
+                    master.loc[mask, "Recon_Type"] = recon_info["recon_type"]
+
+            current_val = clean_cell(master.loc[mask, "Recon_Classification"].iloc[0])
+            if clean_cell(recon_info.get("recon_classification", "")):
+                if not current_val or current_val in {"other"}:
+                    master.loc[mask, "Recon_Classification"] = recon_info["recon_classification"]
+
+        best_mast_ev = choose_best_mastectomy_event(mastectomy_events_map.get(mrn, []), recon_dt)
+        current_mast_lat = clean_cell(master.loc[mask, "Mastectomy_Laterality"].iloc[0])
+        if not current_mast_lat:
+            if best_mast_ev is not None and clean_cell(best_mast_ev.get("laterality", "")):
+                master.loc[mask, "Mastectomy_Laterality"] = best_mast_ev["laterality"]
+
+        current_lymph = clean_cell(master.loc[mask, "LymphNode"].iloc[0])
+        if not current_lymph:
+            master.loc[mask, "LymphNode"] = "none"
+
+        timing_val = clean_cell(master.loc[mask, "Recon_Timing"].iloc[0])
+        if not timing_val and recon_dt is not None:
+            immediate = False
+            delayed = False
+
+            for ev in mastectomy_events_map.get(mrn, []):
+                ev_dt = ev.get("date")
+                if ev_dt is None:
+                    continue
+                if same_calendar_date(ev_dt, recon_dt):
+                    immediate = True
+                    break
+                if ev_dt.date() < recon_dt.date():
+                    delayed = True
+
+            if not immediate:
+                for ev_dt in therapy_dates.get(mrn, {}).get("Mastectomy_Date", []):
+                    if same_calendar_date(ev_dt, recon_dt):
+                        immediate = True
+                        break
+                    if ev_dt.date() < recon_dt.date():
+                        delayed = True
+
+            if immediate:
+                master.loc[mask, "Recon_Timing"] = "Immediate"
+            elif delayed:
+                master.loc[mask, "Recon_Timing"] = "Delayed"
+
+        rad_dates = therapy_dates.get(mrn, {}).get("Radiation", [])
+        chemo_dates = therapy_dates.get(mrn, {}).get("Chemo", [])
+
+        rad_before = 0
+        rad_after = 0
+        if recon_dt is not None:
+            for dt in rad_dates:
+                dd = days_between(dt, recon_dt)
+                if dd is None:
+                    continue
+                if dd < 0:
+                    rad_before = 1
+                elif dd > 0:
+                    rad_after = 1
+
+        chemo_before = 0
+        chemo_after = 0
+        if recon_dt is not None:
+            for dt in chemo_dates:
+                dd = days_between(dt, recon_dt)
+                if dd is None:
+                    continue
+                if dd < 0:
+                    chemo_before = 1
+                elif dd > 0:
+                    chemo_after = 1
+
+        master.loc[mask, "Radiation_Before"] = rad_before
+        master.loc[mask, "Radiation_After"] = rad_after
+        master.loc[mask, "Chemo_Before"] = chemo_before
+        master.loc[mask, "Chemo_After"] = chemo_after
+
+        if rad_before or rad_after:
+            master.loc[mask, "Radiation"] = 1
+        else:
+            current_rad = clean_cell(master.loc[mask, "Radiation"].iloc[0])
+            if current_rad in {"1", "True", "true"} or len(rad_dates) > 0:
+                master.loc[mask, "Radiation"] = 1
+            else:
+                master.loc[mask, "Radiation"] = 0
+
+        if chemo_before or chemo_after:
+            master.loc[mask, "Chemo"] = 1
+        else:
+            current_chemo = clean_cell(master.loc[mask, "Chemo"].iloc[0])
+            if current_chemo in {"1", "True", "true"} or len(chemo_dates) > 0:
+                master.loc[mask, "Chemo"] = 1
+            else:
+                master.loc[mask, "Chemo"] = 0
+
+    print("Appending evidence without deleting old evidence...")
+    old_evid = load_existing_evidence()
+    new_evid = append_evidence_rows(old_evid, evidence_rows)
+
+    os.makedirs(os.path.dirname(MASTER_PATH), exist_ok=True)
+    master.to_csv(MASTER_PATH, index=False)
+    new_evid.to_csv(EVID_PATH, index=False)
+
+    print("\nDONE.")
+    print("- Patched existing master: {0}".format(MASTER_PATH))
+    print("- Appended evidence: {0}".format(EVID_PATH))
+    print("\nRun:")
+    print(" python build_master_rule_CANCER_RECON_PATCH.py")
+
 
 if __name__ == "__main__":
     main()
