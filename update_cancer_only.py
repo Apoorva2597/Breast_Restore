@@ -966,7 +966,6 @@ def main():
         master.loc[mask, "Chemo_Before"] = chemo_before
         master.loc[mask, "Chemo_After"] = chemo_after
 
-        # overall from before/after first
         if rad_before or rad_after:
             master.loc[mask, "Radiation"] = 1
         else:
@@ -985,16 +984,6 @@ def main():
             else:
                 master.loc[mask, "Chemo"] = 0
 
-        # fill indication None only when that side had mastectomy and no better value
-        mast_lat = clean_cell(master.loc[mask, "Mastectomy_Laterality"].iloc[0])
-        left_ind = clean_cell(master.loc[mask, "Indication_Left"].iloc[0])
-        right_ind = clean_cell(master.loc[mask, "Indication_Right"].iloc[0])
-
-        if mast_lat in {"LEFT", "BILATERAL"} and not left_ind:
-            master.loc[mask, "Indication_Left"] = "None"
-        if mast_lat in {"RIGHT", "BILATERAL"} and not right_ind:
-            master.loc[mask, "Indication_Right"] = "None"
-
     print("Appending evidence without deleting old evidence...")
     old_evid = load_existing_evidence()
     new_evid = append_evidence_rows(old_evid, evidence_rows)
@@ -1008,6 +997,7 @@ def main():
     print("- Appended evidence: {0}".format(EVID_PATH))
     print("\nRun:")
     print(" python build_master_rule_CANCER_RECON_PATCH.py")
+
 
 if __name__ == "__main__":
     main()
