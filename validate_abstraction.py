@@ -31,6 +31,21 @@ Added:
 - PBS_Augmentation
 - PBS_Other
 
+UPDATED CANCER / RECON VALIDATION:
+Added:
+- Mastectomy_Laterality
+- Indication_Left
+- Indication_Right
+- LymphNode
+- Radiation_Before
+- Radiation_After
+- Chemo_Before
+- Chemo_After
+- Recon_Laterality
+- Recon_Type
+- Recon_Classification
+- Recon_Timing
+
 Compatible with Python 3.6.8.
 """
 
@@ -46,7 +61,15 @@ MRN = "MRN"
 CATEGORICAL_VARS = [
     "Race",
     "Ethnicity",
-    "SmokingStatus"
+    "SmokingStatus",
+    "Mastectomy_Laterality",
+    "Indication_Left",
+    "Indication_Right",
+    "LymphNode",
+    "Recon_Laterality",
+    "Recon_Type",
+    "Recon_Classification",
+    "Recon_Timing"
 ]
 
 NUMERIC_VARS = [
@@ -67,7 +90,11 @@ BINARY_VARS = [
     "PBS_Augmentation",
     "PBS_Other",
     "Radiation",
-    "Chemo"
+    "Radiation_Before",
+    "Radiation_After",
+    "Chemo",
+    "Chemo_Before",
+    "Chemo_After"
 ]
 
 ALL_VARIABLES = CATEGORICAL_VARS + NUMERIC_VARS + BINARY_VARS
