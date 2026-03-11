@@ -43,7 +43,7 @@ import pandas as pd
 BASE_DIR = "/home/apokol/Breast_Restore"
 
 MASTER_FILE = "{0}/_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv".format(BASE_DIR)
-OUTPUT_MASTER = "{0}/_outputs/master_abstraction_rule_FINAL_NO_GOLD_PBS_ONLY.csv".format(BASE_DIR)
+OUTPUT_MASTER = "{0}/_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv".format(BASE_DIR)
 OUTPUT_EVID = "{0}/_outputs/pbs_only_evidence.csv".format(BASE_DIR)
 
 MERGE_KEY = "MRN"
