@@ -7,7 +7,7 @@ qa_pbs_confusion.py
 PBS QA script:
 - Merges master and gold on MRN
 - Prints TP / TN / FP / FN counts in terminal
-- Writes a QA CSV with:
+- Writes a QA CSV with ONLY mismatches:
     variable, case_type, gold, pred, snippet
 - Does NOT include MRN in the output file
 - Uses pbs_only_evidence.csv for snippets when available
@@ -21,7 +21,7 @@ import pandas as pd
 MASTER_FILE = "_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv"
 GOLD_FILE = "gold_cleaned_for_cedar.csv"
 EVID_FILE = "_outputs/pbs_only_evidence.csv"
-OUTPUT_QA = "_outputs/pbs_qa_cases.csv"
+OUTPUT_QA = "_outputs/pbs_qa_mismatches.csv"
 
 MRN = "MRN"
 
@@ -76,7 +76,7 @@ def normalize_binary_value(x):
     return pd.NA
 
 
-def shorten_text(x, max_len=400):
+def shorten_text(x, max_len=500):
     s = clean_cell(x)
     if not s:
         return ""
@@ -112,6 +112,8 @@ def rule_rank(rule_decision):
         return 14
     if s == "reject_unknown_recon_laterality":
         return 15
+    if s == "extractor_failed":
+        return 98
 
     return 99
 
@@ -133,10 +135,9 @@ def build_best_evidence_map(evid_df):
     if evid_df is None or len(evid_df) == 0:
         return best_map
 
-    use_cols = list(evid_df.columns)
-
-    for col in ["MRN", "FIELD", "EVIDENCE", "RULE_DECISION", "CONFIDENCE"]:
-        if col not in use_cols:
+    required_cols = ["MRN", "FIELD", "EVIDENCE", "RULE_DECISION", "CONFIDENCE"]
+    for col in required_cols:
+        if col not in evid_df.columns:
             return best_map
 
     tmp = evid_df.copy()
@@ -149,6 +150,8 @@ def build_best_evidence_map(evid_df):
     tmp["RULE_RANK"] = tmp["RULE_DECISION"].apply(rule_rank)
 
     for (mrn, field), g in tmp.groupby(["MRN", "FIELD"], dropna=False):
+        mrn = clean_cell(mrn)
+        field = clean_cell(field)
         if not mrn or not field:
             continue
 
@@ -158,10 +161,11 @@ def build_best_evidence_map(evid_df):
         )
 
         best_row = g.iloc[0]
-        snippet = best_row["EVIDENCE"]
+        snippet = clean_cell(best_row["EVIDENCE"])
+        rule_decision = clean_cell(best_row["RULE_DECISION"])
 
-        if clean_cell(best_row["RULE_DECISION"]):
-            snippet = "[{0}] {1}".format(best_row["RULE_DECISION"], snippet)
+        if rule_decision:
+            snippet = "[{0}] {1}".format(rule_decision, snippet)
 
         best_map[(mrn, field)] = shorten_text(snippet, max_len=500)
 
@@ -250,8 +254,10 @@ def main():
         gold_norm = merged[gold_col].apply(normalize_binary_value)
 
         valid_mask = gold_norm.notna()
+
         pred_norm = pred_norm[valid_mask]
         gold_norm = gold_norm[valid_mask]
+
         sub = merged.loc[valid_mask, [MRN]].copy()
         sub["pred"] = pred_norm.values
         sub["gold"] = gold_norm.values
@@ -279,15 +285,16 @@ def main():
             elif case_type == "FN":
                 fn += 1
 
-            snippet = best_evidence_map.get((mrn, var), "")
-
-            qa_rows.append({
-                "variable": var,
-                "case_type": case_type,
-                "gold": int(goldv),
-                "pred": int(pred),
-                "snippet": snippet
-            })
+            # only keep mismatches in file
+            if case_type in ("FP", "FN"):
+                snippet = best_evidence_map.get((mrn, var), "")
+                qa_rows.append({
+                    "variable": var,
+                    "case_type": case_type,
+                    "gold": int(goldv),
+                    "pred": int(pred),
+                    "snippet": snippet
+                })
 
         total = tp + tn + fp + fn
         acc = float(tp + tn) / float(total) if total > 0 else 0.0
@@ -303,19 +310,16 @@ def main():
 
     qa_df = pd.DataFrame(qa_rows)
 
-    # helpful ordering for manual review
     case_order = {
         "FN": 0,
-        "FP": 1,
-        "TP": 2,
-        "TN": 3
+        "FP": 1
     }
 
     if len(qa_df) > 0:
         qa_df["_case_order"] = qa_df["case_type"].map(case_order).fillna(9)
         qa_df = qa_df.sort_values(
-            by=["variable", "_case_order", "gold", "pred"],
-            ascending=[True, True, False, False]
+            by=["variable", "_case_order"],
+            ascending=[True, True]
         ).drop(columns=["_case_order"])
 
     if not os.path.exists("_outputs"):
@@ -323,9 +327,10 @@ def main():
 
     qa_df.to_csv(OUTPUT_QA, index=False)
 
-    print("QA file written to:", OUTPUT_QA)
+    print("Mismatch QA file written to:", OUTPUT_QA)
     print("\nDone.")
 
 
 if __name__ == "__main__":
     main()
+    
