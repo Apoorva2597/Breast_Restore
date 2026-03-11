@@ -1,307 +1,329 @@
 #!/usr/bin/env python3
-# qa_smoking_mismatches.py
-#
-# Purpose:
-#   QA script for SmokingStatus mismatches only.
-#
-# What it does:
-#   1. Loads gold + predicted/master file
-#   2. Compares SmokingStatus
-#   3. Pulls smoking evidence rows for mismatched MRNs
-#   4. Summarizes which stage/status produced the wrong calls
-#
-# Outputs:
-#   _outputs/qa_smoking_mismatch_summary.csv
-#   _outputs/qa_smoking_mismatch_stage_summary.csv
-#   _outputs/qa_smoking_mismatch_status_summary.csv
-#   _outputs/qa_smoking_mismatch_details.csv
-#
-# Python 3.6.8 compatible
+# -*- coding: utf-8 -*-
+
+"""
+qa_pbs_confusion.py
+
+PBS QA script:
+- Merges master and gold on MRN
+- Prints TP / TN / FP / FN counts in terminal
+- Writes a QA CSV with:
+    variable, case_type, gold, pred, snippet
+- Does NOT include MRN in the output file
+- Uses pbs_only_evidence.csv for snippets when available
+
+Python 3.6.8 compatible.
+"""
 
 import os
 import pandas as pd
 
+MASTER_FILE = "_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv"
+GOLD_FILE = "gold_cleaned_for_cedar.csv"
+EVID_FILE = "_outputs/pbs_only_evidence.csv"
+OUTPUT_QA = "_outputs/pbs_qa_cases.csv"
 
-# --------------------------------------------------
-# EDIT THESE PATHS
-# --------------------------------------------------
-BASE_DIR = "/home/apokol/Breast_Restore"
+MRN = "MRN"
 
-# gold file with true SmokingStatus
-GOLD_FILE = os.path.join(BASE_DIR, "_outputs", "master_abstraction_rule_FINAL.csv")
+PBS_VARS = [
+    "PastBreastSurgery",
+    "PBS_Lumpectomy",
+    "PBS_Breast Reduction",
+    "PBS_Mastopexy",
+    "PBS_Augmentation",
+    "PBS_Other"
+]
 
-# prediction/master file you just updated
-PRED_FILE = os.path.join(BASE_DIR, "_outputs", "master_abstraction_rule_FINAL_NO_GOLD.csv")
-
-# evidence file from updater
-EVID_FILE = os.path.join(BASE_DIR, "_outputs", "bmi_smoking_only_evidence.csv")
-
-OUT_DIR = os.path.join(BASE_DIR, "_outputs")
-MERGE_KEY = "MRN"
-FIELD_NAME = "SmokingStatus"
+MISSING_STRINGS = {"", "nan", "none", "null", "na", "NA", "None", "Null"}
 
 
-# --------------------------------------------------
-# helpers
-# --------------------------------------------------
-def read_csv_robust(path):
-    common_kwargs = dict(dtype=str, engine="python")
+# ---------------------------------------------------
+# Safe CSV reader
+# ---------------------------------------------------
+
+def safe_read_csv(path):
     try:
-        return pd.read_csv(path, **common_kwargs, on_bad_lines="skip")
-    except TypeError:
-        try:
-            return pd.read_csv(
-                path,
-                **common_kwargs,
-                error_bad_lines=False,
-                warn_bad_lines=True
-            )
-        except UnicodeDecodeError:
-            return pd.read_csv(
-                path,
-                **common_kwargs,
-                encoding="latin-1",
-                error_bad_lines=False,
-                warn_bad_lines=True
-            )
-    except UnicodeDecodeError:
-        try:
-            return pd.read_csv(
-                path,
-                **common_kwargs,
-                encoding="latin-1",
-                on_bad_lines="skip"
-            )
-        except TypeError:
-            return pd.read_csv(
-                path,
-                **common_kwargs,
-                encoding="latin-1",
-                error_bad_lines=False,
-                warn_bad_lines=True
-            )
+        return pd.read_csv(path, encoding="utf-8", dtype=str)
+    except Exception:
+        return pd.read_csv(path, encoding="latin1", dtype=str)
 
 
-def clean_cols(df):
-    df.columns = [str(c).strip().replace("\ufeff", "") for c in df.columns]
-    return df
-
+# ---------------------------------------------------
+# Basic cleaning
+# ---------------------------------------------------
 
 def clean_cell(x):
     if x is None:
         return ""
     s = str(x).strip()
-    if s.lower() in {"", "nan", "none", "null", "na", "<na>"}:
+    if s in MISSING_STRINGS:
         return ""
     return s
 
 
-def normalize_mrn(df):
-    key_variants = ["MRN", "mrn", "Patient_MRN", "PAT_MRN", "PATIENT_MRN"]
-    for k in key_variants:
-        if k in df.columns:
-            if k != MERGE_KEY:
-                df = df.rename(columns={k: MERGE_KEY})
-            break
-    if MERGE_KEY not in df.columns:
-        raise RuntimeError("MRN column not found. Seen columns: {0}".format(list(df.columns)[:50]))
-    df[MERGE_KEY] = df[MERGE_KEY].astype(str).str.strip()
-    return df
-
-
-def norm_smoking(x):
+def normalize_binary_value(x):
     s = clean_cell(x).lower()
+
+    if not s:
+        return pd.NA
+
+    if s in ["1", "true", "t", "yes", "y"]:
+        return 1
+
+    if s in ["0", "false", "f", "no", "n"]:
+        return 0
+
+    return pd.NA
+
+
+def shorten_text(x, max_len=400):
+    s = clean_cell(x)
     if not s:
         return ""
-
-    mapping = {
-        "current": "Current",
-        "former": "Former",
-        "never": "Never",
-        "current smoker": "Current",
-        "former smoker": "Former",
-        "never smoker": "Never",
-    }
-    return mapping.get(s, clean_cell(x))
+    s = " ".join(s.split())
+    if len(s) <= max_len:
+        return s
+    return s[:max_len].rstrip() + "..."
 
 
-# --------------------------------------------------
-# main
-# --------------------------------------------------
+# ---------------------------------------------------
+# Evidence ranking
+# ---------------------------------------------------
+
+def rule_rank(rule_decision):
+    s = clean_cell(rule_decision).lower()
+
+    if s == "accept_pre_recon":
+        return 0
+    if s == "accept_pre_recon_strict_history":
+        return 1
+    if s == "accept_post_recon_historical":
+        return 2
+
+    if s == "reject_contralateral":
+        return 10
+    if s == "reject_unknown_laterality_unilateral":
+        return 11
+    if s == "reject_post_recon_not_historical":
+        return 12
+    if s == "reject_pre_recon_no_strict_history":
+        return 13
+    if s == "reject_negative_history":
+        return 14
+    if s == "reject_unknown_recon_laterality":
+        return 15
+
+    return 99
+
+
+def confidence_float(x):
+    try:
+        return float(str(x).strip())
+    except Exception:
+        return -1.0
+
+
+def build_best_evidence_map(evid_df):
+    """
+    Returns:
+        best_map[(mrn, field)] = snippet string
+    """
+    best_map = {}
+
+    if evid_df is None or len(evid_df) == 0:
+        return best_map
+
+    use_cols = list(evid_df.columns)
+
+    for col in ["MRN", "FIELD", "EVIDENCE", "RULE_DECISION", "CONFIDENCE"]:
+        if col not in use_cols:
+            return best_map
+
+    tmp = evid_df.copy()
+
+    tmp["MRN"] = tmp["MRN"].astype(str).str.strip()
+    tmp["FIELD"] = tmp["FIELD"].astype(str).str.strip()
+    tmp["RULE_DECISION"] = tmp["RULE_DECISION"].astype(str).str.strip()
+    tmp["EVIDENCE"] = tmp["EVIDENCE"].astype(str).str.strip()
+    tmp["CONFIDENCE_NUM"] = tmp["CONFIDENCE"].apply(confidence_float)
+    tmp["RULE_RANK"] = tmp["RULE_DECISION"].apply(rule_rank)
+
+    for (mrn, field), g in tmp.groupby(["MRN", "FIELD"], dropna=False):
+        if not mrn or not field:
+            continue
+
+        g = g.sort_values(
+            by=["RULE_RANK", "CONFIDENCE_NUM"],
+            ascending=[True, False]
+        )
+
+        best_row = g.iloc[0]
+        snippet = best_row["EVIDENCE"]
+
+        if clean_cell(best_row["RULE_DECISION"]):
+            snippet = "[{0}] {1}".format(best_row["RULE_DECISION"], snippet)
+
+        best_map[(mrn, field)] = shorten_text(snippet, max_len=500)
+
+    return best_map
+
+
+# ---------------------------------------------------
+# Confusion logic
+# ---------------------------------------------------
+
+def classify_case(pred, gold):
+    if pd.isna(pred) or pd.isna(gold):
+        return None
+
+    if pred == 1 and gold == 1:
+        return "TP"
+    if pred == 0 and gold == 0:
+        return "TN"
+    if pred == 1 and gold == 0:
+        return "FP"
+    if pred == 0 and gold == 1:
+        return "FN"
+
+    return None
+
+
+# ---------------------------------------------------
+# Main
+# ---------------------------------------------------
+
 def main():
-    os.makedirs(OUT_DIR, exist_ok=True)
-
     print("Loading files...")
-    gold = normalize_mrn(clean_cols(read_csv_robust(GOLD_FILE)))
-    pred = normalize_mrn(clean_cols(read_csv_robust(PRED_FILE)))
-    evid = normalize_mrn(clean_cols(read_csv_robust(EVID_FILE)))
 
-    if FIELD_NAME not in gold.columns:
-        raise RuntimeError("Gold file missing SmokingStatus column.")
-    if FIELD_NAME not in pred.columns:
-        raise RuntimeError("Pred file missing SmokingStatus column.")
+    master = safe_read_csv(MASTER_FILE)
+    gold = safe_read_csv(GOLD_FILE)
 
-    gold_sub = gold[[MERGE_KEY, FIELD_NAME]].copy()
-    gold_sub = gold_sub.rename(columns={FIELD_NAME: "SmokingStatus_gold"})
-    gold_sub["SmokingStatus_gold"] = gold_sub["SmokingStatus_gold"].apply(norm_smoking)
+    print("Master rows:", len(master))
+    print("Gold rows:", len(gold))
 
-    pred_sub = pred[[MERGE_KEY, FIELD_NAME]].copy()
-    pred_sub = pred_sub.rename(columns={FIELD_NAME: "SmokingStatus_pred"})
-    pred_sub["SmokingStatus_pred"] = pred_sub["SmokingStatus_pred"].apply(norm_smoking)
-
-    merged = gold_sub.merge(pred_sub, on=MERGE_KEY, how="outer")
-
-    merged["gold_present"] = merged["SmokingStatus_gold"].apply(lambda x: 1 if clean_cell(x) else 0)
-    merged["pred_present"] = merged["SmokingStatus_pred"].apply(lambda x: 1 if clean_cell(x) else 0)
-
-    compare_df = merged[(merged["gold_present"] == 1) | (merged["pred_present"] == 1)].copy()
-    compare_df["match"] = (
-        compare_df["SmokingStatus_gold"].fillna("").astype(str).str.strip()
-        == compare_df["SmokingStatus_pred"].fillna("").astype(str).str.strip()
-    ).astype(int)
-
-    mismatches = compare_df[compare_df["match"] == 0].copy()
-
-    print("Total compared:", len(compare_df))
-    print("Smoking mismatches:", len(mismatches))
-
-    # keep only smoking evidence
-    evid["FIELD"] = evid["FIELD"].apply(clean_cell)
-    smoke_evid = evid[evid["FIELD"] == FIELD_NAME].copy()
-
-    # only evidence for mismatched MRNs
-    mismatch_mrns = set(mismatches[MERGE_KEY].astype(str).str.strip().tolist())
-    smoke_evid = smoke_evid[smoke_evid[MERGE_KEY].astype(str).str.strip().isin(mismatch_mrns)].copy()
-
-    # summarize stages
-    if len(smoke_evid) > 0:
-        stage_summary = (
-            smoke_evid.groupby(["STAGE_USED", "VALUE"])
-            .size()
-            .reset_index(name="n_rows")
-            .sort_values(["n_rows", "STAGE_USED", "VALUE"], ascending=[False, True, True])
-        )
-        status_summary = (
-            smoke_evid.groupby(["STATUS", "VALUE"])
-            .size()
-            .reset_index(name="n_rows")
-            .sort_values(["n_rows", "STATUS", "VALUE"], ascending=[False, True, True])
-        )
+    if not os.path.exists(EVID_FILE):
+        print("Evidence file not found:", EVID_FILE)
+        evid = pd.DataFrame()
     else:
-        stage_summary = pd.DataFrame(columns=["STAGE_USED", "VALUE", "n_rows"])
-        status_summary = pd.DataFrame(columns=["STATUS", "VALUE", "n_rows"])
+        evid = safe_read_csv(EVID_FILE)
+        print("Evidence rows:", len(evid))
 
-    # build detailed QA table
-    detail = mismatches.merge(
-        smoke_evid,
-        on=MERGE_KEY,
-        how="left"
+    if MRN not in master.columns:
+        raise RuntimeError("Master missing MRN column")
+    if MRN not in gold.columns:
+        raise RuntimeError("Gold missing MRN column")
+
+    master[MRN] = master[MRN].astype(str).str.strip()
+    gold[MRN] = gold[MRN].astype(str).str.strip()
+
+    master = master[master[MRN] != ""].copy()
+    gold = gold[gold[MRN] != ""].copy()
+
+    master = master.drop_duplicates(subset=[MRN])
+    gold = gold.drop_duplicates(subset=[MRN])
+
+    merged = pd.merge(
+        master,
+        gold,
+        on=MRN,
+        how="inner",
+        suffixes=("_pred", "_gold")
     )
 
-    detail_cols = [
-        MERGE_KEY,
-        "SmokingStatus_gold",
-        "SmokingStatus_pred",
-        "NOTE_DATE",
-        "NOTE_TYPE",
-        "VALUE",
-        "STATUS",
-        "STAGE_USED",
-        "WINDOW_USED",
-        "SECTION",
-        "CONFIDENCE",
-        "ANCHOR_TYPE",
-        "ANCHOR_DATE",
-        "EVIDENCE",
-    ]
-    detail = detail[[c for c in detail_cols if c in detail.columns]].copy()
-    detail = detail.sort_values(
-        by=[MERGE_KEY, "NOTE_DATE", "STAGE_USED", "STATUS"],
-        ascending=[True, True, True, True]
-    )
+    print("Merged rows:", len(merged))
 
-    # one-row summary per mismatch MRN
-    mismatch_summary = mismatches[[MERGE_KEY, "SmokingStatus_gold", "SmokingStatus_pred"]].copy()
-    mismatch_summary["has_smoking_evidence_rows"] = mismatch_summary[MERGE_KEY].isin(
-        set(smoke_evid[MERGE_KEY].astype(str).str.strip().tolist())
-    ).astype(int)
+    best_evidence_map = build_best_evidence_map(evid)
 
-    # best guess: final deciding evidence row = patient override if present, else fallback, else latest evidence row
-    final_guess_rows = []
-    if len(smoke_evid) > 0:
-        priority_map = {
-            "patient_level_structured_override": 0,
-            "fallback_full_note": 1,
-            "historical_preop": 2,
-            "pm14": 3,
-            "pm7": 4,
-            "day0": 5,
-        }
+    qa_rows = []
 
-        smoke_evid2 = smoke_evid.copy()
-        smoke_evid2["_stage_pri"] = smoke_evid2["STAGE_USED"].apply(lambda x: priority_map.get(clean_cell(x), 99))
-        smoke_evid2["_conf"] = pd.to_numeric(smoke_evid2["CONFIDENCE"], errors="coerce").fillna(0.0)
-        smoke_evid2 = smoke_evid2.sort_values(
-            by=[MERGE_KEY, "_stage_pri", "_conf", "NOTE_DATE"],
+    print("\nPBS confusion counts\n")
+
+    for var in PBS_VARS:
+        pred_col = var + "_pred"
+        gold_col = var + "_gold"
+
+        if pred_col not in merged.columns or gold_col not in merged.columns:
+            print("Skipping variable:", var)
+            continue
+
+        pred_norm = merged[pred_col].apply(normalize_binary_value)
+        gold_norm = merged[gold_col].apply(normalize_binary_value)
+
+        valid_mask = gold_norm.notna()
+        pred_norm = pred_norm[valid_mask]
+        gold_norm = gold_norm[valid_mask]
+        sub = merged.loc[valid_mask, [MRN]].copy()
+        sub["pred"] = pred_norm.values
+        sub["gold"] = gold_norm.values
+
+        tp = 0
+        tn = 0
+        fp = 0
+        fn = 0
+
+        for _, row in sub.iterrows():
+            mrn = clean_cell(row[MRN])
+            pred = row["pred"]
+            goldv = row["gold"]
+
+            case_type = classify_case(pred, goldv)
+            if case_type is None:
+                continue
+
+            if case_type == "TP":
+                tp += 1
+            elif case_type == "TN":
+                tn += 1
+            elif case_type == "FP":
+                fp += 1
+            elif case_type == "FN":
+                fn += 1
+
+            snippet = best_evidence_map.get((mrn, var), "")
+
+            qa_rows.append({
+                "variable": var,
+                "case_type": case_type,
+                "gold": int(goldv),
+                "pred": int(pred),
+                "snippet": snippet
+            })
+
+        total = tp + tn + fp + fn
+        acc = float(tp + tn) / float(total) if total > 0 else 0.0
+
+        print(var)
+        print("  total:", total)
+        print("  TP:", tp)
+        print("  TN:", tn)
+        print("  FP:", fp)
+        print("  FN:", fn)
+        print("  accuracy:", round(acc, 6))
+        print("")
+
+    qa_df = pd.DataFrame(qa_rows)
+
+    # helpful ordering for manual review
+    case_order = {
+        "FN": 0,
+        "FP": 1,
+        "TP": 2,
+        "TN": 3
+    }
+
+    if len(qa_df) > 0:
+        qa_df["_case_order"] = qa_df["case_type"].map(case_order).fillna(9)
+        qa_df = qa_df.sort_values(
+            by=["variable", "_case_order", "gold", "pred"],
             ascending=[True, True, False, False]
-        )
-        final_guess_rows = smoke_evid2.groupby(MERGE_KEY, as_index=False).first()
+        ).drop(columns=["_case_order"])
 
-        final_guess_rows = final_guess_rows[[
-            MERGE_KEY, "VALUE", "STATUS", "STAGE_USED", "NOTE_DATE", "NOTE_TYPE", "CONFIDENCE", "EVIDENCE"
-        ]].copy()
-        final_guess_rows = final_guess_rows.rename(columns={
-            "VALUE": "qa_best_evidence_value",
-            "STATUS": "qa_best_evidence_status",
-            "STAGE_USED": "qa_best_evidence_stage",
-            "NOTE_DATE": "qa_best_evidence_note_date",
-            "NOTE_TYPE": "qa_best_evidence_note_type",
-            "CONFIDENCE": "qa_best_evidence_confidence",
-            "EVIDENCE": "qa_best_evidence_text",
-        })
-    else:
-        final_guess_rows = pd.DataFrame(columns=[
-            MERGE_KEY,
-            "qa_best_evidence_value",
-            "qa_best_evidence_status",
-            "qa_best_evidence_stage",
-            "qa_best_evidence_note_date",
-            "qa_best_evidence_note_type",
-            "qa_best_evidence_confidence",
-            "qa_best_evidence_text",
-        ])
+    if not os.path.exists("_outputs"):
+        os.makedirs("_outputs")
 
-    mismatch_summary = mismatch_summary.merge(final_guess_rows, on=MERGE_KEY, how="left")
+    qa_df.to_csv(OUTPUT_QA, index=False)
 
-    # save
-    mismatch_summary_path = os.path.join(OUT_DIR, "qa_smoking_mismatch_summary.csv")
-    stage_summary_path = os.path.join(OUT_DIR, "qa_smoking_mismatch_stage_summary.csv")
-    status_summary_path = os.path.join(OUT_DIR, "qa_smoking_mismatch_status_summary.csv")
-    detail_path = os.path.join(OUT_DIR, "qa_smoking_mismatch_details.csv")
-
-    mismatch_summary.to_csv(mismatch_summary_path, index=False)
-    stage_summary.to_csv(stage_summary_path, index=False)
-    status_summary.to_csv(status_summary_path, index=False)
-    detail.to_csv(detail_path, index=False)
-
-    print("\nSaved:")
-    print(" ", mismatch_summary_path)
-    print(" ", stage_summary_path)
-    print(" ", status_summary_path)
-    print(" ", detail_path)
-
-    print("\nTop mismatch stage summary:")
-    if len(stage_summary) > 0:
-        print(stage_summary.head(20).to_string(index=False))
-    else:
-        print("No smoking evidence rows found for mismatches.")
-
-    print("\nTop mismatch status summary:")
-    if len(status_summary) > 0:
-        print(status_summary.head(20).to_string(index=False))
-    else:
-        print("No smoking evidence rows found for mismatches.")
-
+    print("QA file written to:", OUTPUT_QA)
     print("\nDone.")
 
 
