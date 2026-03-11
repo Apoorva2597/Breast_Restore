@@ -239,13 +239,17 @@ def build_sectioned_note(note_text, note_type, note_id, note_date):
 def cand_score(c):
     conf = float(getattr(c, "confidence", 0.0) or 0.0)
     nt = str(getattr(c, "note_type", "") or "").lower()
+    sec = str(getattr(c, "section", "") or "").upper()
+
     op_bonus = 0.05 if ("op" in nt or "operative" in nt or "operation" in nt) else 0.0
     clinic_bonus = 0.03 if (
         "clinic" in nt or "progress" in nt or "consult" in nt or
         "oncology" in nt or "follow up" in nt or "follow-up" in nt
     ) else 0.0
     date_bonus = 0.01 if (getattr(c, "note_date", "") or "").strip() else 0.0
-    return conf + op_bonus + clinic_bonus + date_bonus
+    section_penalty = -0.08 if sec in {"PAST MEDICAL HISTORY", "PAST SURGICAL HISTORY", "SURGICAL HISTORY", "HISTORY", "PMH", "PSH"} else 0.0
+
+    return conf + op_bonus + clinic_bonus + date_bonus + section_penalty
 
 
 def choose_best(existing, new):
@@ -266,6 +270,48 @@ def merge_boolean(existing, new):
         return new
     if exv and not nwv:
         return existing
+    return choose_best(existing, new)
+
+
+def choose_best_indication(existing, new):
+    if existing is None:
+        return new
+
+    ex_score = cand_score(existing)
+    nw_score = cand_score(new)
+
+    ex_val = clean_cell(getattr(existing, "value", ""))
+    nw_val = clean_cell(getattr(new, "value", ""))
+
+    if nw_score > ex_score:
+        return new
+    if ex_score > nw_score:
+        return existing
+
+    # tie-break: Therapeutic > Prophylactic > None
+    rank = {"Therapeutic": 3, "Prophylactic": 2, "None": 1, "": 0}
+    if rank.get(nw_val, 0) > rank.get(ex_val, 0):
+        return new
+    return existing
+
+
+def choose_best_lymphnode(existing, new):
+    if existing is None:
+        return new
+
+    ex_val = clean_cell(getattr(existing, "value", ""))
+    nw_val = clean_cell(getattr(new, "value", ""))
+
+    # hard override rule: ALND > SLNB > none
+    rank = {"ALND": 3, "SLNB": 2, "none": 1, "": 0}
+    ex_rank = rank.get(ex_val, 0)
+    nw_rank = rank.get(nw_val, 0)
+
+    if nw_rank > ex_rank:
+        return new
+    if ex_rank > nw_rank:
+        return existing
+
     return choose_best(existing, new)
 
 
@@ -852,6 +898,10 @@ def main():
 
             if logical in BOOLEAN_FIELDS:
                 best_by_mrn[mrn][logical] = merge_boolean(existing, c)
+            elif logical == "LymphNode":
+                best_by_mrn[mrn][logical] = choose_best_lymphnode(existing, c)
+            elif logical in {"Indication_Left", "Indication_Right"}:
+                best_by_mrn[mrn][logical] = choose_best_indication(existing, c)
             else:
                 best_by_mrn[mrn][logical] = choose_best(existing, c)
 
