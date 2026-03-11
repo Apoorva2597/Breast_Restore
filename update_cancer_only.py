@@ -240,8 +240,12 @@ def cand_score(c):
     conf = float(getattr(c, "confidence", 0.0) or 0.0)
     nt = str(getattr(c, "note_type", "") or "").lower()
     op_bonus = 0.05 if ("op" in nt or "operative" in nt or "operation" in nt) else 0.0
+    clinic_bonus = 0.03 if (
+        "clinic" in nt or "progress" in nt or "consult" in nt or
+        "oncology" in nt or "follow up" in nt or "follow-up" in nt
+    ) else 0.0
     date_bonus = 0.01 if (getattr(c, "note_date", "") or "").strip() else 0.0
-    return conf + op_bonus + date_bonus
+    return conf + op_bonus + clinic_bonus + date_bonus
 
 
 def choose_best(existing, new):
@@ -286,9 +290,9 @@ BOOLEAN_FIELDS = {
 
 KEYWORD_PREFILTER = re.compile(
     r"\b("
-    r"mastectomy|diep|tram|flap|reconstruction|expander|implant|"
+    r"mastectomy|diep|tram|siea|gap|sgap|igap|latissimus|flap|reconstruction|expander|implant|"
     r"radiation|xrt|pmrt|chemo|chemotherapy|taxol|herceptin|"
-    r"sentinel|axillary|alnd|slnb|prophylactic|carcinoma|dcis|lcis"
+    r"sentinel|axillary|alnd|slnb|prophylactic|carcinoma|dcis|lcis|oncology"
     r")\b",
     re.IGNORECASE
 )
@@ -321,35 +325,66 @@ def infer_laterality(text):
 def infer_recon_type_and_class(text):
     low = clean_cell(text).lower()
 
-    autologous_terms = ["diep", "tram", "latissimus", "flap"]
-    implant_terms = ["implant", "expander", "tissue expander", "alloderm", "acellular dermal matrix"]
-
-    has_auto = any(t in low for t in autologous_terms)
-    has_implant = any(t in low for t in implant_terms)
+    flap_types_found = []
 
     if "diep" in low:
-        rtype = "DIEP"
-    elif "tram" in low:
-        rtype = "TRAM"
-    elif "latissimus" in low:
-        rtype = "LATISSIMUS"
-    elif "tissue expander" in low or "expander" in low:
-        rtype = "EXPANDER"
-    elif "implant" in low:
-        rtype = "IMPLANT"
-    elif "flap" in low:
-        rtype = "FLAP"
-    else:
-        rtype = None
+        flap_types_found.append("DIEP")
+    if "tram" in low:
+        flap_types_found.append("TRAM")
+    if "siea" in low:
+        flap_types_found.append("SIEA")
+    if (
+        "gluteal artery perforator" in low or
+        "gap flap" in low or
+        re.search(r"\bsgap\b", low) or
+        re.search(r"\bigap\b", low)
+    ):
+        flap_types_found.append("gluteal artery perforator flap")
+    if "latissimus" in low:
+        flap_types_found.append("latissimus dorsi")
 
-    if has_auto and has_implant:
-        rclass = "Hybrid"
-    elif has_auto:
-        rclass = "Autologous"
+    has_any_flap = (
+        len(flap_types_found) > 0 or
+        (" flap" in low) or
+        low.startswith("flap") or
+        ("mixed flaps" in low)
+    )
+
+    has_direct_to_implant = bool(re.search(r"\bdirect[- ]to[- ]implant\b", low))
+    has_expander = ("tissue expander" in low) or ("expander" in low)
+    has_implant = ("implant" in low)
+
+    rtype = None
+    if "mixed flaps" in low:
+        rtype = "mixed flaps"
+    elif len(set(flap_types_found)) >= 2:
+        rtype = "mixed flaps"
+    elif "DIEP" in flap_types_found:
+        rtype = "DIEP"
+    elif "TRAM" in flap_types_found:
+        rtype = "TRAM"
+    elif "SIEA" in flap_types_found:
+        rtype = "SIEA"
+    elif "gluteal artery perforator flap" in flap_types_found:
+        rtype = "gluteal artery perforator flap"
+    elif "latissimus dorsi" in flap_types_found:
+        rtype = "latissimus dorsi"
+    elif has_direct_to_implant:
+        rtype = "direct-to-implant"
+    elif has_expander or (has_implant and not has_any_flap):
+        rtype = "expander/implant"
+    elif has_any_flap:
+        rtype = "other"
     elif has_implant:
-        rclass = "ImplantBased"
-    else:
-        rclass = None
+        rtype = "expander/implant"
+
+    rclass = None
+    if has_any_flap:
+        rclass = "autologous"
+    elif has_direct_to_implant or has_expander or has_implant:
+        rclass = "implant"
+    elif rtype == "other":
+        rclass = "other"
 
     return rtype, rclass
 
@@ -586,10 +621,12 @@ def choose_best_recon_anchor_rows(struct_df):
                 ("reconstruction" in procedure) or
                 ("diep" in procedure) or
                 ("tram" in procedure) or
+                ("siea" in procedure) or
                 ("latissimus" in procedure) or
                 ("flap" in procedure) or
                 ("expander" in procedure) or
-                ("implant" in procedure)
+                ("implant" in procedure) or
+                ("direct-to-implant" in procedure)
             ):
                 is_anchor = True
 
@@ -843,6 +880,7 @@ def main():
             if logical in TARGET_FIELDS:
                 master.loc[mask, logical] = val
 
+        # structured fallback for recon
         if recon_info is not None:
             current_val = clean_cell(master.loc[mask, "Recon_Laterality"].iloc[0])
             if not current_val and clean_cell(recon_info.get("recon_laterality", "")):
@@ -856,12 +894,14 @@ def main():
             if not current_val and clean_cell(recon_info.get("recon_classification", "")):
                 master.loc[mask, "Recon_Classification"] = recon_info["recon_classification"]
 
+        # structured fallback for mastectomy laterality
         best_mast_ev = choose_best_mastectomy_event(mastectomy_events_map.get(mrn, []), recon_dt)
         current_mast_lat = clean_cell(master.loc[mask, "Mastectomy_Laterality"].iloc[0])
         if not current_mast_lat:
             if best_mast_ev is not None and clean_cell(best_mast_ev.get("laterality", "")):
                 master.loc[mask, "Mastectomy_Laterality"] = best_mast_ev["laterality"]
 
+        # timing
         timing_val = clean_cell(master.loc[mask, "Recon_Timing"].iloc[0])
         if not timing_val and recon_dt is not None:
             immediate = False
@@ -890,6 +930,7 @@ def main():
             elif delayed:
                 master.loc[mask, "Recon_Timing"] = "Delayed"
 
+        # derive before/after from dated evidence
         rad_dates = therapy_dates.get(mrn, {}).get("Radiation", [])
         chemo_dates = therapy_dates.get(mrn, {}).get("Chemo", [])
 
@@ -917,19 +958,29 @@ def main():
                 elif dd > 0:
                     chemo_after = 1
 
-        if len(rad_dates) > 0:
-            master.loc[mask, "Radiation"] = 1
         master.loc[mask, "Radiation_Before"] = rad_before
         master.loc[mask, "Radiation_After"] = rad_after
-        if rad_before or rad_after:
-            master.loc[mask, "Radiation"] = 1
-
-        if len(chemo_dates) > 0:
-            master.loc[mask, "Chemo"] = 1
         master.loc[mask, "Chemo_Before"] = chemo_before
         master.loc[mask, "Chemo_After"] = chemo_after
+
+        # overall from before/after first
+        if rad_before or rad_after:
+            master.loc[mask, "Radiation"] = 1
+        else:
+            current_rad = clean_cell(master.loc[mask, "Radiation"].iloc[0])
+            if current_rad in {"1", "True", "true"} or len(rad_dates) > 0:
+                master.loc[mask, "Radiation"] = 1
+            else:
+                master.loc[mask, "Radiation"] = 0
+
         if chemo_before or chemo_after:
             master.loc[mask, "Chemo"] = 1
+        else:
+            current_chemo = clean_cell(master.loc[mask, "Chemo"].iloc[0])
+            if current_chemo in {"1", "True", "true"} or len(chemo_dates) > 0:
+                master.loc[mask, "Chemo"] = 1
+            else:
+                master.loc[mask, "Chemo"] = 0
 
     print("Appending evidence without deleting old evidence...")
     old_evid = load_existing_evidence()
