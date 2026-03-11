@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-# qa_error_review_export.py
+# qa_review_all_fields.py
 #
-# Exports QA-ready error review CSVs for selected fields with:
-# - gold
-# - pred
-# - evidence snippets
-# - note metadata
+# Creates ONE QA CSV with:
+# - one row per case
+# - gold/pred columns for selected fields
+# - match flags
+# - best evidence columns per field
 #
 # IMPORTANT:
-# - Does NOT include MRN in output
-# - Creates one QA CSV per target field
-# - Pulls only mismatch rows by default
+# - Does NOT include MRN in final output
+# - Uses master_abstraction_rule_FINAL_NO_GOLD.csv as prediction file
+# - You must set GOLD_PATH correctly
 #
 # Python 3.6.8 compatible
 
@@ -20,10 +20,11 @@ import pandas as pd
 
 BASE_DIR = "/home/apokol/Breast_Restore"
 
-MASTER_PRED_PATH = "{0}/_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv".format(BASE_DIR)
-GOLD_PATH = "{0}/gold_cleaned_for_cedar.csv".format(BASE_DIR)   
+PRED_PATH = "{0}/_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv".format(BASE_DIR)
+GOLD_PATH = "{0}/_outputs/master_abstraction_gold.csv".format(BASE_DIR)   # <-- CHANGE THIS IF NEEDED
 EVID_PATH = "{0}/_outputs/rule_hit_evidence_FINAL_NO_GOLD.csv".format(BASE_DIR)
-OUT_DIR = "{0}/_outputs/qa_exports".format(BASE_DIR)
+
+OUT_PATH = "{0}/_outputs/qa_exports/QA_ALL_FIELDS_REVIEW.csv".format(BASE_DIR)
 
 MERGE_KEY = "MRN"
 
@@ -36,8 +37,7 @@ TARGET_FIELDS = [
 ]
 
 MAX_SNIPPET_LEN = 500
-MAX_ROWS_PER_FIELD = 50      # set to None to export all mismatches
-MISMATCH_ONLY = True         # True = only errors; False = all rows
+MISMATCH_ONLY = True   # True = only rows with at least one mismatch; False = all rows
 
 
 def read_csv_robust(path):
@@ -91,7 +91,7 @@ def normalize_mrn(df):
             found = k
             break
     if found is None:
-        raise RuntimeError("MRN column not found. Columns seen: {0}".format(list(df.columns)[:50]))
+        raise RuntimeError("MRN column not found. Columns seen: {0}".format(list(df.columns)[:60]))
     if found != MERGE_KEY:
         df = df.rename(columns={found: MERGE_KEY})
     df[MERGE_KEY] = df[MERGE_KEY].fillna("").astype(str).str.strip()
@@ -108,9 +108,9 @@ def clean_cell(x):
 
 
 def norm_compare(x):
-    s = clean_cell(x).strip()
+    s = clean_cell(x)
     s = re.sub(r"\s+", " ", s)
-    return s.lower()
+    return s.strip().lower()
 
 
 def truncate_text(x, n=MAX_SNIPPET_LEN):
@@ -122,24 +122,24 @@ def truncate_text(x, n=MAX_SNIPPET_LEN):
 
 
 def choose_best_evidence_for_field(evid_df, field):
-    """
-    For each MRN + FIELD, keep best evidence row.
-    Priority:
-    1. higher confidence
-    2. op/operative note
-    3. non-history section
-    4. latest non-empty note date string tie-break by lexical sort
-    """
-    tmp = evid_df[evid_df["FIELD"].astype(str).str.strip() == field].copy()
+    tmp = evid_df[evid_df["FIELD"].fillna("").astype(str).str.strip() == field].copy()
     if tmp.empty:
-        return tmp
+        return pd.DataFrame(columns=[
+            MERGE_KEY,
+            "evidence_value",
+            "evidence_snippet",
+            "evidence_note_type",
+            "evidence_note_date",
+            "evidence_section",
+            "evidence_confidence",
+            "evidence_note_id"
+        ])
 
     for c in ["CONFIDENCE", "NOTE_TYPE", "SECTION", "NOTE_DATE", "EVIDENCE", "VALUE", "NOTE_ID"]:
         if c not in tmp.columns:
             tmp[c] = ""
 
     tmp["CONFIDENCE_NUM"] = pd.to_numeric(tmp["CONFIDENCE"], errors="coerce").fillna(0.0)
-
     tmp["NOTE_TYPE_LOW"] = tmp["NOTE_TYPE"].fillna("").astype(str).str.lower()
     tmp["SECTION_UP"] = tmp["SECTION"].fillna("").astype(str).str.upper()
 
@@ -151,28 +151,45 @@ def choose_best_evidence_for_field(evid_df, field):
         "PAST MEDICAL HISTORY", "PAST SURGICAL HISTORY", "SURGICAL HISTORY",
         "HISTORY", "PMH", "PSH"
     ])
-    tmp["SECTION_PENALTY"] = tmp["SECTION_UP"].apply(lambda s: -1 if s in low_value_sections else 0)
+    tmp["SECTION_PENALTY"] = tmp["SECTION_UP"].apply(
+        lambda s: -1 if s in low_value_sections else 0
+    )
 
     tmp = tmp.sort_values(
         by=[MERGE_KEY, "CONFIDENCE_NUM", "OP_BONUS", "SECTION_PENALTY", "NOTE_DATE"],
         ascending=[True, False, False, False, False]
     )
 
-    tmp = tmp.drop_duplicates(subset=[MERGE_KEY], keep="first")
-    return tmp
+    tmp = tmp.drop_duplicates(subset=[MERGE_KEY], keep="first").copy()
+
+    tmp["evidence_snippet"] = tmp["EVIDENCE"].apply(truncate_text)
+
+    out = pd.DataFrame()
+    out[MERGE_KEY] = tmp[MERGE_KEY]
+    out["evidence_value"] = tmp["VALUE"]
+    out["evidence_snippet"] = tmp["evidence_snippet"]
+    out["evidence_note_type"] = tmp["NOTE_TYPE"]
+    out["evidence_note_date"] = tmp["NOTE_DATE"]
+    out["evidence_section"] = tmp["SECTION"]
+    out["evidence_confidence"] = tmp["CONFIDENCE"]
+    out["evidence_note_id"] = tmp["NOTE_ID"]
+
+    return out
 
 
 def main():
-    if not os.path.exists(MASTER_PRED_PATH):
-        raise FileNotFoundError("Pred master not found: {0}".format(MASTER_PRED_PATH))
+    if not os.path.exists(PRED_PATH):
+        raise FileNotFoundError("Prediction file not found: {0}".format(PRED_PATH))
     if not os.path.exists(GOLD_PATH):
         raise FileNotFoundError("Gold file not found: {0}".format(GOLD_PATH))
     if not os.path.exists(EVID_PATH):
         raise FileNotFoundError("Evidence file not found: {0}".format(EVID_PATH))
 
-    os.makedirs(OUT_DIR, exist_ok=True)
+    out_dir = os.path.dirname(OUT_PATH)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
 
-    pred = clean_cols(read_csv_robust(MASTER_PRED_PATH))
+    pred = clean_cols(read_csv_robust(PRED_PATH))
     gold = clean_cols(read_csv_robust(GOLD_PATH))
     evid = clean_cols(read_csv_robust(EVID_PATH))
 
@@ -184,89 +201,90 @@ def main():
     missing_in_gold = [f for f in TARGET_FIELDS if f not in gold.columns]
 
     if missing_in_pred:
-        raise RuntimeError("Missing target fields in pred file: {0}".format(missing_in_pred))
+        raise RuntimeError("Missing target fields in pred: {0}".format(missing_in_pred))
     if missing_in_gold:
-        raise RuntimeError("Missing target fields in gold file: {0}".format(missing_in_gold))
+        raise RuntimeError("Missing target fields in gold: {0}".format(missing_in_gold))
+
+    # Start from gold so all reviewed cases stay in output
+    final_df = gold[[MERGE_KEY]].copy()
 
     for field in TARGET_FIELDS:
-        pred_sub = pred[[MERGE_KEY, field]].copy().rename(columns={field: "pred"})
-        gold_sub = gold[[MERGE_KEY, field]].copy().rename(columns={field: "gold"})
+        gold_sub = gold[[MERGE_KEY, field]].copy().rename(columns={field: field + "_gold"})
+        pred_sub = pred[[MERGE_KEY, field]].copy().rename(columns={field: field + "_pred"})
 
-        merged = gold_sub.merge(pred_sub, on=MERGE_KEY, how="inner")
+        merged = gold_sub.merge(pred_sub, on=MERGE_KEY, how="left")
 
-        merged["gold_norm"] = merged["gold"].apply(norm_compare)
-        merged["pred_norm"] = merged["pred"].apply(norm_compare)
-        merged["is_match"] = merged["gold_norm"] == merged["pred_norm"]
+        merged[field + "_gold_norm"] = merged[field + "_gold"].apply(norm_compare)
+        merged[field + "_pred_norm"] = merged[field + "_pred"].apply(norm_compare)
+        merged[field + "_match"] = merged[field + "_gold_norm"] == merged[field + "_pred_norm"]
 
-        if MISMATCH_ONLY:
-            merged = merged[merged["is_match"] == False].copy()
+        merged[field + "_error_type"] = ""
+        merged.loc[
+            (merged[field + "_gold_norm"] == "") & (merged[field + "_pred_norm"] != ""),
+            field + "_error_type"
+        ] = "false_positive"
+        merged.loc[
+            (merged[field + "_gold_norm"] != "") & (merged[field + "_pred_norm"] == ""),
+            field + "_error_type"
+        ] = "false_negative"
+        merged.loc[
+            (merged[field + "_gold_norm"] != "") &
+            (merged[field + "_pred_norm"] != "") &
+            (merged[field + "_gold_norm"] != merged[field + "_pred_norm"]),
+            field + "_error_type"
+        ] = "wrong_value"
 
         best_evid = choose_best_evidence_for_field(evid, field)
 
-        keep_cols = [MERGE_KEY]
-        for c in ["VALUE", "EVIDENCE", "NOTE_TYPE", "NOTE_DATE", "SECTION", "CONFIDENCE", "NOTE_ID"]:
-            if c in best_evid.columns:
-                keep_cols.append(c)
-
-        best_evid = best_evid[keep_cols].copy()
-
-        rename_map = {
-            "VALUE": "evidence_value",
-            "EVIDENCE": "evidence_snippet",
-            "NOTE_TYPE": "evidence_note_type",
-            "NOTE_DATE": "evidence_note_date",
-            "SECTION": "evidence_section",
-            "CONFIDENCE": "evidence_confidence",
-            "NOTE_ID": "evidence_note_id"
+        evid_rename = {
+            "evidence_value": field + "_evidence_value",
+            "evidence_snippet": field + "_evidence_snippet",
+            "evidence_note_type": field + "_evidence_note_type",
+            "evidence_note_date": field + "_evidence_note_date",
+            "evidence_section": field + "_evidence_section",
+            "evidence_confidence": field + "_evidence_confidence",
+            "evidence_note_id": field + "_evidence_note_id",
         }
-        best_evid = best_evid.rename(columns=rename_map)
+        best_evid = best_evid.rename(columns=evid_rename)
 
-        out = merged.merge(best_evid, on=MERGE_KEY, how="left")
+        merged = merged.merge(best_evid, on=MERGE_KEY, how="left")
 
-        if "evidence_snippet" in out.columns:
-            out["evidence_snippet"] = out["evidence_snippet"].apply(truncate_text)
-
-        # helpful QA labels
-        out["error_type_guess"] = ""
-        out.loc[(out["gold_norm"] == "") & (out["pred_norm"] != ""), "error_type_guess"] = "false_positive"
-        out.loc[(out["gold_norm"] != "") & (out["pred_norm"] == ""), "error_type_guess"] = "false_negative"
-        out.loc[
-            (out["gold_norm"] != "") &
-            (out["pred_norm"] != "") &
-            (out["gold_norm"] != out["pred_norm"]),
-            "error_type_guess"
-        ] = "wrong_value"
-
-        # remove MRN before save
-        if MAX_ROWS_PER_FIELD is not None and len(out) > MAX_ROWS_PER_FIELD:
-            out = out.head(MAX_ROWS_PER_FIELD).copy()
-
-        final_cols = [
-            "gold",
-            "pred",
-            "error_type_guess",
-            "evidence_value",
-            "evidence_snippet",
-            "evidence_note_type",
-            "evidence_note_date",
-            "evidence_section",
-            "evidence_confidence",
-            "evidence_note_id",
+        keep_cols = [
+            MERGE_KEY,
+            field + "_gold",
+            field + "_pred",
+            field + "_match",
+            field + "_error_type",
+            field + "_evidence_value",
+            field + "_evidence_snippet",
+            field + "_evidence_note_type",
+            field + "_evidence_note_date",
+            field + "_evidence_section",
+            field + "_evidence_confidence",
+            field + "_evidence_note_id",
         ]
 
-        for c in final_cols:
-            if c not in out.columns:
-                out[c] = ""
+        merged = merged[keep_cols].copy()
+        final_df = final_df.merge(merged, on=MERGE_KEY, how="left")
 
-        out = out[final_cols].copy()
+    # any mismatch across chosen fields
+    match_cols = [f + "_match" for f in TARGET_FIELDS]
+    final_df["any_mismatch"] = False
+    for c in match_cols:
+        final_df["any_mismatch"] = final_df["any_mismatch"] | (final_df[c] == False)
 
-        out_path = os.path.join(OUT_DIR, "QA_{0}.csv".format(field))
-        out.to_csv(out_path, index=False)
+    if MISMATCH_ONLY:
+        final_df = final_df[final_df["any_mismatch"] == True].copy()
 
-        print("Saved:", out_path, "| rows:", len(out))
+    # drop MRN before export
+    if MERGE_KEY in final_df.columns:
+        final_df = final_df.drop(columns=[MERGE_KEY])
 
-    print("\nDone.")
-    print("Review these files in:", OUT_DIR)
+    final_df.to_csv(OUT_PATH, index=False)
+
+    print("Saved:", OUT_PATH)
+    print("Rows:", len(final_df))
+    print("Columns:", len(final_df.columns))
 
 
 if __name__ == "__main__":
