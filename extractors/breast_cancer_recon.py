@@ -13,8 +13,8 @@ SUPPRESS_SECTIONS = {
     "ALLERGIES",
 }
 
-LEFT_RX = re.compile(r"\b(left|lt|l)\b", re.IGNORECASE)
-RIGHT_RX = re.compile(r"\b(right|rt|r)\b", re.IGNORECASE)
+LEFT_RX = re.compile(r"\b(left|lt)\b", re.IGNORECASE)
+RIGHT_RX = re.compile(r"\b(right|rt)\b", re.IGNORECASE)
 BILAT_RX = re.compile(r"\b(bilateral|bilat)\b", re.IGNORECASE)
 
 MASTECTOMY_RX = re.compile(
@@ -34,9 +34,11 @@ RECON_RX = re.compile(
     r"\b("
     r"breast\s+reconstruction|"
     r"reconstruction|"
-    r"diep|tram|latissimus|flap|"
+    r"diep|tram|siea|latissimus|flap|"
     r"tissue\s+expander|expander|"
-    r"implant|alloderm|acellular\s+dermal\s+matrix"
+    r"implant|alloderm|acellular\s+dermal\s+matrix|"
+    r"direct[- ]to[- ]implant|"
+    r"sgap|igap|gap\s+flap|gluteal\s+artery\s+perforator"
     r")\b",
     re.IGNORECASE
 )
@@ -75,7 +77,7 @@ CHEMO_RX = re.compile(
     r"taxol|paclitaxel|docetaxel|taxotere|"
     r"carboplatin|cisplatin|"
     r"trastuzumab|herceptin|pertuzumab|perjeta|"
-    r"\bTCHP?\b|\bAC\b|\bTC\b"
+    r"\bTCHP?\b|\bAC\b|\bTC\b|\bACT\b"
     r")\b",
     re.IGNORECASE
 )
@@ -97,7 +99,7 @@ NEGATION_RX = re.compile(
 
 PLANNED_RX = re.compile(
     r"\b("
-    r"plan|planned|planning|will|scheduled|schedule|candidate|consider"
+    r"plan|planned|planning|will|scheduled|schedule|candidate|consider|recommend|discuss"
     r")\b",
     re.IGNORECASE
 )
@@ -112,7 +114,48 @@ PROPHYLAXIS_RX = re.compile(
 CANCER_RX = re.compile(
     r"\b("
     r"breast\s+cancer|carcinoma|malignancy|malignant|"
-    r"invasive\s+ductal|invasive\s+lobular|dcis|lcis|cancer"
+    r"invasive\s+ductal|invasive\s+lobular|dcis|lcis|recurrent\s+cancer|cancer"
+    r")\b",
+    re.IGNORECASE
+)
+
+TREATMENT_RECEIVED_RX = re.compile(
+    r"\b("
+    r"s/p|status\s+post|history\s+of|hx\s+of|prior|previous|"
+    r"completed|received|underwent|treated\s+with|"
+    r"adjuvant|neoadjuvant|postmastectomy"
+    r")\b",
+    re.IGNORECASE
+)
+
+STRONG_RADIATION_HISTORY_RX = re.compile(
+    r"\b("
+    r"s/p\s+radiation|status\s+post\s+radiation|"
+    r"history\s+of\s+radiation|prior\s+radiation|previous\s+radiation|"
+    r"completed\s+radiation|received\s+radiation|"
+    r"adjuvant\s+radiation|neoadjuvant\s+radiation|"
+    r"radiation\s+therapy\s+completed|postmastectomy\s+radiation"
+    r")\b",
+    re.IGNORECASE
+)
+
+STRONG_CHEMO_HISTORY_RX = re.compile(
+    r"\b("
+    r"s/p\s+chemo|status\s+post\s+chemo|"
+    r"history\s+of\s+chemo|prior\s+chemo|previous\s+chemo|"
+    r"completed\s+chemo|completed\s+chemotherapy|"
+    r"received\s+chemo|received\s+chemotherapy|"
+    r"adjuvant\s+chemo|neoadjuvant\s+chemo|"
+    r"treated\s+with\s+chemotherapy|treated\s+with\s+chemo"
+    r")\b",
+    re.IGNORECASE
+)
+
+WEAK_TREATMENT_EXCLUDE_RX = re.compile(
+    r"\b("
+    r"consider|candidate|discussion|discussed|recommend|recommended|"
+    r"plan|planned|planning|will\s+start|may\s+need|may\s+require|"
+    r"referred\s+to\s+radiation\s+oncology|radiation\s+oncology\s+consult"
     r")\b",
     re.IGNORECASE
 )
@@ -127,6 +170,19 @@ def _is_operation_note(note_type: str) -> bool:
         ("operation" in s) or
         ("oper report" in s)
     )
+
+
+def _is_clinic_like(note_type: str) -> bool:
+    s = (note_type or "").lower()
+    pats = [
+        "clinic", "progress", "office", "follow up", "follow-up",
+        "consult", "pre-op", "preop", "history and physical", "h&p",
+        "oncology"
+    ]
+    for p in pats:
+        if p in s:
+            return True
+    return False
 
 
 def _clean(x):
@@ -157,8 +213,8 @@ def _infer_laterality(text: str) -> Optional[str]:
     low = (text or "").lower()
     if BILAT_RX.search(low):
         return "BILATERAL"
-    has_left = bool(re.search(r"\b(left|lt)\b", low))
-    has_right = bool(re.search(r"\b(right|rt)\b", low))
+    has_left = bool(LEFT_RX.search(low))
+    has_right = bool(RIGHT_RX.search(low))
     if has_left and has_right:
         return "BILATERAL"
     if has_left:
@@ -180,39 +236,69 @@ def _looks_negated_or_planned(ctx: str, op_note: bool) -> bool:
 def _infer_recon_type_and_class(text: str) -> Tuple[Optional[str], Optional[str]]:
     low = (text or "").lower()
 
-    autologous_terms = [
-        "diep", "tram", "latissimus", "flap"
-    ]
-    implant_terms = [
-        "implant", "expander", "tissue expander", "alloderm", "acellular dermal matrix"
-    ]
-
-    has_auto = any(t in low for t in autologous_terms)
-    has_implant = any(t in low for t in implant_terms)
+    flap_types_found = []
 
     if "diep" in low:
-        rtype = "DIEP"
-    elif "tram" in low:
-        rtype = "TRAM"
-    elif "latissimus" in low:
-        rtype = "LATISSIMUS"
-    elif "tissue expander" in low or "expander" in low:
-        rtype = "EXPANDER"
-    elif "implant" in low:
-        rtype = "IMPLANT"
-    elif "flap" in low:
-        rtype = "FLAP"
-    else:
-        rtype = None
+        flap_types_found.append("DIEP")
+    if "tram" in low:
+        flap_types_found.append("TRAM")
+    if "siea" in low:
+        flap_types_found.append("SIEA")
+    if (
+        "gluteal artery perforator" in low or
+        "gap flap" in low or
+        re.search(r"\bsgap\b", low) or
+        re.search(r"\bigap\b", low)
+    ):
+        flap_types_found.append("gluteal artery perforator flap")
+    if "latissimus" in low:
+        flap_types_found.append("latissimus dorsi")
 
-    if has_auto and has_implant:
-        rclass = "Hybrid"
-    elif has_auto:
-        rclass = "Autologous"
+    has_any_flap = (
+        len(flap_types_found) > 0 or
+        (" flap" in low) or
+        low.startswith("flap") or
+        ("mixed flaps" in low)
+    )
+
+    has_direct_to_implant = bool(re.search(r"\bdirect[- ]to[- ]implant\b", low))
+    has_expander = ("tissue expander" in low) or ("expander" in low)
+    has_implant = ("implant" in low)
+
+    # Recon_Type exact gold label mapping
+    rtype = None
+
+    if "mixed flaps" in low:
+        rtype = "mixed flaps"
+    elif len(set(flap_types_found)) >= 2:
+        rtype = "mixed flaps"
+    elif "DIEP" in flap_types_found:
+        rtype = "DIEP"
+    elif "TRAM" in flap_types_found:
+        rtype = "TRAM"
+    elif "SIEA" in flap_types_found:
+        rtype = "SIEA"
+    elif "gluteal artery perforator flap" in flap_types_found:
+        rtype = "gluteal artery perforator flap"
+    elif "latissimus dorsi" in flap_types_found:
+        rtype = "latissimus dorsi"
+    elif has_direct_to_implant:
+        rtype = "direct-to-implant"
+    elif has_expander or (has_implant and not has_any_flap):
+        rtype = "expander/implant"
+    elif has_any_flap:
+        rtype = "other"
     elif has_implant:
-        rclass = "ImplantBased"
-    else:
-        rclass = None
+        rtype = "expander/implant"
+
+    # Recon_Classification exact requested mapping
+    rclass = None
+    if has_any_flap:
+        rclass = "autologous"
+    elif has_direct_to_implant or has_expander or has_implant:
+        rclass = "implant"
+    elif rtype == "other":
+        rclass = "other"
 
     return rtype, rclass
 
@@ -228,10 +314,10 @@ def _infer_indications(text: str, lat: Optional[str]) -> Tuple[Optional[str], Op
     right_pro = bool(re.search(r"(right|rt).{0,80}(prophylactic|risk[- ]reducing|preventive)", low)) or \
                 bool(re.search(r"(prophylactic|risk[- ]reducing|preventive).{0,80}(right|rt)", low))
 
-    left_cancer = bool(re.search(r"(left|lt).{0,120}(cancer|carcinoma|dcis|lcis|malignan|invasive)", low)) or \
-                  bool(re.search(r"(cancer|carcinoma|dcis|lcis|malignan|invasive).{0,120}(left|lt)", low))
-    right_cancer = bool(re.search(r"(right|rt).{0,120}(cancer|carcinoma|dcis|lcis|malignan|invasive)", low)) or \
-                   bool(re.search(r"(cancer|carcinoma|dcis|lcis|malignan|invasive).{0,120}(right|rt)", low))
+    left_cancer = bool(re.search(r"(left|lt).{0,120}(cancer|carcinoma|dcis|lcis|malignan|invasive|recurrent)", low)) or \
+                  bool(re.search(r"(cancer|carcinoma|dcis|lcis|malignan|invasive|recurrent).{0,120}(left|lt)", low))
+    right_cancer = bool(re.search(r"(right|rt).{0,120}(cancer|carcinoma|dcis|lcis|malignan|invasive|recurrent)", low)) or \
+                   bool(re.search(r"(cancer|carcinoma|dcis|lcis|malignan|invasive|recurrent).{0,120}(right|rt)", low))
 
     note_has_cancer = bool(CANCER_RX.search(low))
     note_has_pro = bool(PROPHYLAXIS_RX.search(low))
@@ -259,17 +345,40 @@ def _infer_indications(text: str, lat: Optional[str]) -> Tuple[Optional[str], Op
     return left_val, right_val
 
 
+def _strong_radiation_history(ctx: str) -> bool:
+    low = (ctx or "").lower()
+    if WEAK_TREATMENT_EXCLUDE_RX.search(low):
+        return False
+    if STRONG_RADIATION_HISTORY_RX.search(low):
+        return True
+    if RADIATION_RX.search(low) and TREATMENT_RECEIVED_RX.search(low):
+        return True
+    return False
+
+
+def _strong_chemo_history(ctx: str) -> bool:
+    low = (ctx or "").lower()
+    if WEAK_TREATMENT_EXCLUDE_RX.search(low):
+        return False
+    if ENDOCRINE_ONLY_RX.search(low) and not CHEMO_RX.search(low):
+        return False
+    if STRONG_CHEMO_HISTORY_RX.search(low):
+        return True
+    if CHEMO_RX.search(low) and TREATMENT_RECEIVED_RX.search(low):
+        return True
+    return False
+
+
 def extract_breast_cancer_recon(note: SectionedNote) -> List[Candidate]:
     cands = []
     op_note = _is_operation_note(note.note_type)
+    clinic_like = _is_clinic_like(note.note_type)
 
     for section, text in note.sections.items():
         if section in SUPPRESS_SECTIONS:
             continue
         if not text:
             continue
-
-        low = text.lower()
 
         # -----------------------
         # Mastectomy block
@@ -291,6 +400,7 @@ def extract_breast_cancer_recon(note: SectionedNote) -> List[Candidate]:
                 if right_ind:
                     cands.append(_emit("Indication_Right", right_ind, text, m, section, note, 0.80 if op_note else 0.66))
 
+                # ALND overrides SLNB if both appear
                 if ALND_RX.search(text):
                     mm = ALND_RX.search(text)
                     cands.append(_emit("LymphNode", "ALND", text, mm, section, note, 0.86 if op_note else 0.72))
@@ -320,24 +430,45 @@ def extract_breast_cancer_recon(note: SectionedNote) -> List[Candidate]:
 
         # -----------------------
         # Radiation block
+        # Clinic/history notes preferred for fallback treatment capture
         # -----------------------
         rr = RADIATION_RX.search(text)
         if rr:
-            ctx = _window(text, rr.start(), rr.end(), 220)
-            if not _looks_negated_or_planned(ctx, False):
-                cands.append(_emit("Radiation", True, text, rr, section, note, 0.80))
+            ctx = _window(text, rr.start(), rr.end(), 260)
+            low_ctx = ctx.lower()
+
+            should_emit = False
+            conf = 0.74
+
+            if _strong_radiation_history(ctx):
+                should_emit = True
+                conf = 0.86 if clinic_like else 0.80
+            elif op_note:
+                should_emit = False
+
+            if should_emit:
+                cands.append(_emit("Radiation", True, text, rr, section, note, conf))
 
         # -----------------------
         # Chemo block
         # -----------------------
         cc = CHEMO_RX.search(text)
         if cc:
-            ctx = _window(text, cc.start(), cc.end(), 220)
+            ctx = _window(text, cc.start(), cc.end(), 260)
             low_ctx = ctx.lower()
 
-            if ENDOCRINE_ONLY_RX.search(low_ctx) and not re.search(r"\b(chemo|chemotherapy)\b", low_ctx):
-                pass
-            elif not _looks_negated_or_planned(ctx, False):
-                cands.append(_emit("Chemo", True, text, cc, section, note, 0.80))
+            should_emit = False
+            conf = 0.74
+
+            if ENDOCRINE_ONLY_RX.search(low_ctx) and not CHEMO_RX.search(low_ctx):
+                should_emit = False
+            elif _strong_chemo_history(ctx):
+                should_emit = True
+                conf = 0.86 if clinic_like else 0.80
+            elif op_note:
+                should_emit = False
+
+            if should_emit:
+                cands.append(_emit("Chemo", True, text, cc, section, note, conf))
 
     return cands
