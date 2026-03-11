@@ -89,6 +89,9 @@ ALND_RX = re.compile(
     r"completion\s+axillary\s+lymph\s+node\s+dissection|"
     r"completion\s+node\s+dissection|"
     r"complete\s+axillary\s+dissection|"
+    r"level\s*i/?ii\s+dissection|"
+    r"level\s*1/?2\s+dissection|"
+    r"axillary\s+contents\s+removed|"
     r"\bALND\b"
     r")\b",
     re.IGNORECASE
@@ -106,6 +109,11 @@ SLNB_RX = re.compile(
     r"sentinel\s+mapping|"
     r"sentinel\s+nodes?\s+removed|"
     r"sentinel\s+node\s+removed|"
+    r"sln\s+biopsy|"
+    r"sentinel\s+node\s+bx|"
+    r"hot\s+node\s+removed|"
+    r"blue\s+dye\s+mapping|"
+    r"radioisotope\s+mapping|"
     r"\bSLNB\b"
     r")\b",
     re.IGNORECASE
@@ -142,7 +150,8 @@ LN_PLAN_RX = re.compile(
     r"may\s+need|might\s+need|"
     r"if\s+positive|if\s+needed|potential|"
     r"could\s+require|would\s+require|"
-    r"pending|depending\s+on|awaiting"
+    r"pending|depending\s+on|awaiting|"
+    r"recommend|recommended|discussed"
     r")\b",
     re.IGNORECASE
 )
@@ -949,42 +958,69 @@ def _lymph_score(value, note_type, note_date, evidence, recon_dt):
         score += 20.0
 
     if _is_clinic_like_note_type(nt):
-        score += 16.0
+        score += 20.0
     elif _is_op_like_note_type(nt):
-        score += 8.0
+        score += 6.0
 
     if LN_DONE_RX.search(ev):
-        score += 10.0
+        score += 12.0
 
     if LN_HISTORY_RX.search(ev):
-        score += 8.0
+        score += 10.0
 
     if LN_PLAN_RX.search(ev):
-        score -= 30.0
+        score -= 40.0
 
     if recon_dt is not None and nd is not None:
         dd = days_between(nd, recon_dt)
         if dd is not None:
             if dd >= 0 and _is_clinic_like_note_type(nt):
-                score += 30.0
+                score += 35.0
                 if dd <= 180:
-                    score += 6.0
+                    score += 8.0
             elif dd < 0 and _is_clinic_like_note_type(nt):
-                score -= 18.0
+                score -= 30.0
             elif dd >= 0 and _is_op_like_note_type(nt):
-                score += 4.0
+                score += 3.0
 
     return score
 
 
-def choose_best_lymphnode_postrecon(cands, recon_dt):
+def choose_best_lymphnode_clinic_first(cands, recon_dt):
     if not cands:
         return None
+
+    clinic_after = []
+    clinic_any = []
+    op_any = []
+
+    for c in cands:
+        nt = clean_cell(getattr(c, "note_type", "")).lower()
+        nd = parse_date_safe(getattr(c, "note_date", ""))
+        is_clinic = _is_clinic_like_note_type(nt)
+        is_op = _is_op_like_note_type(nt)
+
+        if is_clinic:
+            clinic_any.append(c)
+            if recon_dt is not None and nd is not None and nd.date() >= recon_dt.date():
+                clinic_after.append(c)
+        elif is_op:
+            op_any.append(c)
+
+    pool = None
+    if clinic_after:
+        pool = clinic_after
+    elif clinic_any:
+        pool = clinic_any
+    elif op_any:
+        pool = op_any
+    else:
+        pool = cands
 
     best = None
     best_score = None
 
-    for c in cands:
+    for c in pool:
         s = _lymph_score(
             getattr(c, "value", ""),
             getattr(c, "note_type", ""),
@@ -1114,11 +1150,11 @@ def main():
             else:
                 best_by_mrn[mrn][logical] = choose_best(existing, c)
 
-    print("Resolving lymph node using ordered post-recon logic...")
+    print("Resolving lymph node using clinic-first ordered logic...")
     for mrn, cands in lymphnode_by_mrn.items():
         recon_info = recon_anchor_map.get(mrn)
         recon_dt = parse_date_safe((recon_info or {}).get("recon_date", ""))
-        best_ln = choose_best_lymphnode_postrecon(cands, recon_dt)
+        best_ln = choose_best_lymphnode_clinic_first(cands, recon_dt)
         if best_ln is not None:
             if mrn not in best_by_mrn:
                 best_by_mrn[mrn] = {}
@@ -1269,6 +1305,7 @@ def main():
     print("- Appended evidence: {0}".format(EVID_PATH))
     print("\nRun:")
     print(" python build_master_rule_CANCER_RECON_PATCH.py")
+
 
 if __name__ == "__main__":
     main()
