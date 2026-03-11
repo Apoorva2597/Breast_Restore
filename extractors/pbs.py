@@ -107,6 +107,15 @@ LUMPECTOMY_SIDE_CONTEXT = [
     re.compile(r"\b(?:breast\s+cancer|dcis|carcinoma|lumpectomy\s+scar|lumpectomy\s+site)\b.{0,140}\bright\b", re.I),
 ]
 
+LUMPECTOMY_SCAR_HISTORY_PATTERNS = [
+    re.compile(r"\bwell[- ]healed\s+lumpectomy\s+scar\b", re.I),
+    re.compile(r"\blumpectomy\s+scar\b", re.I),
+    re.compile(r"\blumpectomy\s+site\b", re.I),
+    re.compile(r"\bafter\s+lumpectomy\b", re.I),
+    re.compile(r"\beven\s+after\s+lumpectomy\b", re.I),
+    re.compile(r"\bstatus\s+post\s+lumpectomy\b", re.I),
+]
+
 
 LUMP_PATTERNS = [
     re.compile(r"\blumpectomy\b", re.I),
@@ -184,6 +193,11 @@ def _lumpectomy_current_episode_context(text, start, end):
     return _has_any(LUMPECTOMY_CURRENT_EPISODE_PATTERNS, ctx)
 
 
+def _lumpectomy_scar_history_context(text, start, end):
+    ctx = window_around(text, start, end, 260)
+    return _has_any(LUMPECTOMY_SCAR_HISTORY_PATTERNS, ctx)
+
+
 def _lumpectomy_history_near(text, start, end):
     ctx = window_around(text, start, end, 320)
 
@@ -197,6 +211,9 @@ def _lumpectomy_history_near(text, start, end):
         return True
 
     if _has_any(LUMPECTOMY_SIDE_CONTEXT, ctx):
+        return True
+
+    if _has_any(LUMPECTOMY_SCAR_HISTORY_PATTERNS, ctx):
         return True
 
     return False
@@ -235,7 +252,7 @@ def extract_pbs(note: SectionedNote) -> List[Candidate]:
                         continue
 
                     if mode == "lumpectomy":
-                        # Reject treatment-planning and current-episode framing
+                        # Reject treatment planning / current episode mentions
                         if _lumpectomy_planning_context(text, m.start(), m.end()):
                             continue
 
@@ -243,6 +260,11 @@ def extract_pbs(note: SectionedNote) -> List[Candidate]:
                             continue
 
                         hist = _lumpectomy_history_near(text, m.start(), m.end())
+
+                        # scar/site language should always count as historical
+                        if _lumpectomy_scar_history_context(text, m.start(), m.end()):
+                            hist = True
+
                         status = "history_possible" if hist else "procedure_mention"
                         cands.append(_emit(field, text, m, section, note, conf, status))
 
