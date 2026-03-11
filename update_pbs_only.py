@@ -12,22 +12,16 @@ PBS-only updater for:
 - PBS_Augmentation
 - PBS_Other
 
-Design:
+Revised logic:
 - Uses reconstruction date as anchor
-- Uses Recon_Laterality from master when available
-- Falls back to anchor-row procedure text when possible
-- Prioritizes operation notes first, then clinic-like notes
-- Uses notes BEFORE recon first
-- If no qualifying pre-recon match, then checks post-recon notes ONLY if the mention is clearly historical
-- For unilateral recon:
-    * ipsilateral = accept
-    * contralateral = reject
-    * unknown laterality = do not auto-count
-- For bilateral recon:
-    * unknown laterality can count
+- Writes back into original master
+- Better historical acceptance for lumpectomy and true prior history
+- Better laterality inference from nearby cancer/procedure context
+- Still blocks reconstruction-related implant language from counting as augmentation
+- Derives PastBreastSurgery from accepted PBS subtype hits
 
 Outputs:
-1) /home/apokol/Breast_Restore/_outputs/master_abstraction_rule_FINAL_NO_GOLD_PBS_ONLY.csv
+1) /home/apokol/Breast_Restore/_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv
 2) /home/apokol/Breast_Restore/_outputs/pbs_only_evidence.csv
 
 Python 3.6.8 compatible.
@@ -69,7 +63,6 @@ NOTE_GLOBS = [
 from models import SectionedNote  # noqa: E402
 from extractors.pbs import extract_pbs  # noqa: E402
 
-
 PBS_FIELDS = [
     "PastBreastSurgery",
     "PBS_Lumpectomy",
@@ -80,9 +73,6 @@ PBS_FIELDS = [
 ]
 
 
-# -----------------------
-# Robust CSV read
-# -----------------------
 def read_csv_robust(path):
     common_kwargs = dict(dtype=str, engine="python")
     try:
@@ -200,9 +190,6 @@ def days_between(dt1, dt2):
     return (dt1.date() - dt2.date()).days
 
 
-# -----------------------
-# Sectionizer
-# -----------------------
 HEADER_RX = re.compile(r"^\s*([A-Z][A-Z0-9 /&\-]{2,60})\s*:\s*$")
 
 
@@ -239,9 +226,6 @@ def build_sectioned_note(note_text, note_type, note_id, note_date):
     )
 
 
-# -----------------------
-# Notes
-# -----------------------
 def load_and_reconstruct_notes():
     note_files = []
     for g in NOTE_GLOBS:
@@ -351,9 +335,6 @@ def load_and_reconstruct_notes():
     return pd.DataFrame(reconstructed)
 
 
-# -----------------------
-# Structured encounters and recon anchors
-# -----------------------
 def load_structured_encounters():
     rows = []
     struct_files = []
@@ -499,10 +480,8 @@ def choose_best_anchor_rows(struct_df):
         current_best = best.get(mrn)
         if current_best is None or score < current_best["score"]:
             best[mrn] = {
-                "anchor_type": "primary_recon_date",
-                "anchor_date": recon_date.strftime("%Y-%m-%d"),
-                "admit_date": admit_date.strftime("%Y-%m-%d"),
                 "recon_date": recon_date.strftime("%Y-%m-%d"),
+                "admit_date": admit_date.strftime("%Y-%m-%d"),
                 "score": score,
                 "source": source,
                 "cpt_code": clean_cell(row.get("CPT_CODE_STRUCT", "")),
@@ -513,21 +492,34 @@ def choose_best_anchor_rows(struct_df):
     return best
 
 
-# -----------------------
-# Note / laterality helpers
-# -----------------------
-LEFT_RX = re.compile(r"\b(left|lt|l)\b|\(left\)|\(lt\)|\(l\)|\bleft\s+breast\b", re.I)
-RIGHT_RX = re.compile(r"\b(right|rt|r)\b|\(right\)|\(rt\)|\((?:r)\)|\bright\s+breast\b", re.I)
+LEFT_RX = re.compile(r"\b(left|lt)\b|\bleft\s+breast\b|\bleft[- ]sided\b|\(left\)|\(lt\)", re.I)
+RIGHT_RX = re.compile(r"\b(right|rt)\b|\bright\s+breast\b|\bright[- ]sided\b|\(right\)|\(rt\)", re.I)
 BILAT_RX = re.compile(r"\b(bilateral|bilat|both\s+breasts?)\b", re.I)
-CONTRALAT_RX = re.compile(r"\bcontralateral\b", re.I)
 
 HISTORY_CUE_RX = re.compile(
-    r"\b(s/p|status\s+post|history\s+of|with\s+a\s+history\s+of|prior|previous|remote)\b",
+    r"\b(s/p|status\s+post|history\s+of|with\s+a\s+history\s+of|prior|previous|remote|previously|underwent|treated\s+with)\b",
     re.I
 )
 
 NEGATIVE_HISTORY_RX = re.compile(
     r"\b(no\s+prior\s+breast\s+surgery|no\s+history\s+of\s+breast\s+surgery|denies\s+prior\s+breast\s+surgery|never\s+had\s+breast\s+surgery)\b",
+    re.I
+)
+
+CANCER_CONTEXT_RX = re.compile(
+    r"\b(ductal\s+carcinoma|lobular\s+carcinoma|dcis|invasive\s+ductal|breast\s+cancer|sentinel\s+lymph\s+node|slnb|alnd|radiation|chemo|xrt)\b",
+    re.I
+)
+
+YEAR_RX = re.compile(r"\b(?:19|20)\d{2}\b", re.I)
+
+AUGMENT_NEGATIVE_CONTEXT_RX = re.compile(
+    r"\b(reconstruction|implant[- ]based\s+reconstruction|tissue\s+expander|expander|implant\s+exchange|exchange\s+of\s+(?:the\s+)?(?:tissue\s+expanders?|implants?)|permanent\s+(?:silicone|saline)\s+breast\s+implants?|breast\s+implant\s+reconstruction|post[- ]mastectomy|mastectomy)\b",
+    re.I
+)
+
+AUGMENT_POSITIVE_CONTEXT_RX = re.compile(
+    r"\b(cosmetic|augmentation|history\s+of|prior|previous|previously|s/p|submuscular|saline|silicone|(?:19|20)\d{2})\b",
     re.I
 )
 
@@ -538,9 +530,9 @@ def normalize_recon_laterality(x):
         return ""
     if "bilat" in s or "bilateral" in s or "both" in s:
         return "bilateral"
-    if s in {"left", "l"} or "left" in s:
+    if "left" in s or s == "l":
         return "left"
-    if s in {"right", "r"} or "right" in s:
+    if "right" in s or s == "r":
         return "right"
     return ""
 
@@ -549,7 +541,6 @@ def extract_laterality_from_text(text):
     t = clean_cell(text)
     if not t:
         return ""
-
     has_b = BILAT_RX.search(t) is not None
     has_l = LEFT_RX.search(t) is not None
     has_r = RIGHT_RX.search(t) is not None
@@ -565,13 +556,46 @@ def extract_laterality_from_text(text):
     return ""
 
 
+def infer_laterality_from_field_context(field, text):
+    """
+    For cases where the exact evidence window lacks side, infer from nearby breast cancer /
+    procedure history context.
+    """
+    ctx = clean_cell(text)
+    if not ctx:
+        return ""
+
+    # direct side in context
+    direct = extract_laterality_from_text(ctx)
+    if direct:
+        return direct
+
+    if field == "PBS_Lumpectomy":
+        # examples: "history of left breast cancer ... lumpectomy"
+        left_cancer = re.search(r"\bleft\b.{0,80}\b(?:breast\s+cancer|dcis|carcinoma|lumpectomy)\b", ctx, re.I)
+        right_cancer = re.search(r"\bright\b.{0,80}\b(?:breast\s+cancer|dcis|carcinoma|lumpectomy)\b", ctx, re.I)
+        left_reverse = re.search(r"\b(?:breast\s+cancer|dcis|carcinoma|lumpectomy)\b.{0,80}\bleft\b", ctx, re.I)
+        right_reverse = re.search(r"\b(?:breast\s+cancer|dcis|carcinoma|lumpectomy)\b.{0,80}\bright\b", ctx, re.I)
+
+        if (left_cancer or left_reverse) and not (right_cancer or right_reverse):
+            return "left"
+        if (right_cancer or right_reverse) and not (left_cancer or left_reverse):
+            return "right"
+
+    if field in {"PBS_Breast Reduction", "PBS_Mastopexy"}:
+        if re.search(r"\bfor\s+symmetry\b", ctx, re.I):
+            return extract_laterality_from_text(ctx)
+
+    return ""
+
+
 def laterality_relation(recon_lat, proc_lat, context_text):
     recon_lat = normalize_recon_laterality(recon_lat)
     proc_lat = normalize_recon_laterality(proc_lat)
 
+    ctx = clean_cell(context_text).lower()
+
     if recon_lat == "bilateral":
-        if proc_lat:
-            return "accept"
         return "accept"
 
     if recon_lat in {"left", "right"}:
@@ -581,11 +605,8 @@ def laterality_relation(recon_lat, proc_lat, context_text):
             return "accept"
         if proc_lat in {"left", "right"} and proc_lat != recon_lat:
             return "reject_contralateral"
-
-        ctx = clean_cell(context_text).lower()
         if "contralateral" in ctx:
             return "reject_contralateral"
-
         return "unknown_unilateral"
 
     return "unknown_recon"
@@ -593,17 +614,13 @@ def laterality_relation(recon_lat, proc_lat, context_text):
 
 def is_operation_note_type(note_type, source_file):
     s = "{0} {1}".format(clean_cell(note_type).lower(), clean_cell(source_file).lower())
-    if "brief op" in s:
-        return True
-    if "op note" in s:
-        return True
-    if "operative" in s:
-        return True
-    if "operation" in s:
-        return True
-    if "oper report" in s:
-        return True
-    return False
+    return (
+        ("brief op" in s) or
+        ("op note" in s) or
+        ("operative" in s) or
+        ("operation" in s) or
+        ("oper report" in s)
+    )
 
 
 def is_clinic_like_note(note_type, source_file):
@@ -627,24 +644,87 @@ def is_clinic_like_note(note_type, source_file):
 
 
 def is_historical_context(text):
-    t = clean_cell(text)
-    if not t:
+    return HISTORY_CUE_RX.search(clean_cell(text)) is not None
+
+
+def has_negative_history(text):
+    return NEGATIVE_HISTORY_RX.search(clean_cell(text)) is not None
+
+
+def has_cancer_context(text):
+    return CANCER_CONTEXT_RX.search(clean_cell(text)) is not None
+
+
+def has_year_context(text):
+    return YEAR_RX.search(clean_cell(text)) is not None
+
+
+def augmentation_true_history_context(text):
+    ctx = clean_cell(text)
+    if not ctx:
         return False
-    if HISTORY_CUE_RX.search(t):
+
+    pos = AUGMENT_POSITIVE_CONTEXT_RX.search(ctx) is not None
+    neg = AUGMENT_NEGATIVE_CONTEXT_RX.search(ctx) is not None
+
+    explicit = re.search(
+        r"\b(breast\s+augmentation|augmentation\s+mammaplasty|cosmetic\s+augmentation|breast\s+implants?\s+for\s+augmentation)\b",
+        ctx,
+        re.I
+    ) is not None
+
+    if explicit:
+        return True
+    if pos and not neg:
         return True
     return False
 
 
-def has_negative_history(text):
-    t = clean_cell(text)
-    if not t:
+def field_specific_history_ok(field, combined_context):
+    ctx = clean_cell(combined_context)
+
+    if field == "PBS_Lumpectomy":
+        if is_historical_context(ctx):
+            return True
+        if has_cancer_context(ctx):
+            return True
+        if has_year_context(ctx):
+            return True
+        if re.search(r"\bunderwent\b", ctx, re.I):
+            return True
         return False
-    return NEGATIVE_HISTORY_RX.search(t) is not None
+
+    if field == "PBS_Breast Reduction":
+        if is_historical_context(ctx):
+            return True
+        if has_year_context(ctx):
+            return True
+        return False
+
+    if field == "PBS_Mastopexy":
+        if is_historical_context(ctx):
+            return True
+        if has_year_context(ctx):
+            return True
+        if re.search(r"\bfor\s+symmetry\b", ctx, re.I):
+            return True
+        return False
+
+    if field == "PBS_Augmentation":
+        return augmentation_true_history_context(ctx)
+
+    if field == "PBS_Other":
+        if is_historical_context(ctx):
+            return True
+        if has_year_context(ctx):
+            return True
+        return False
+
+    return False
 
 
 def stage_and_rank(note_type, source_file, note_dt, recon_dt, accepted_post_hist):
     dd = days_between(note_dt, recon_dt)
-
     is_op = is_operation_note_type(note_type, source_file)
     is_clinic = is_clinic_like_note(note_type, source_file)
 
@@ -703,9 +783,6 @@ def choose_better_pbs(existing, new, recon_dt):
     return new if candidate_score(new) > candidate_score(existing) else existing
 
 
-# -----------------------
-# Main PBS updater
-# -----------------------
 def main():
     print("Loading master...")
     master = clean_cols(read_csv_robust(MASTER_FILE))
@@ -726,12 +803,10 @@ def main():
     anchor_map = choose_best_anchor_rows(struct_df)
     print("Recon anchors found: {0}".format(len(anchor_map)))
 
-    evidence_rows = []
-
-    # initialize PBS fields to 0
     for c in PBS_FIELDS:
         master[c] = 0
 
+    evidence_rows = []
     best_by_mrn = {}
 
     for _, row in notes_df.iterrows():
@@ -795,23 +870,28 @@ def main():
         if mrn not in best_by_mrn:
             best_by_mrn[mrn] = {}
 
-        for c in cands:
-            logical = str(getattr(c, "field", ""))
+        full_note_text = clean_cell(row.get("NOTE_TEXT", ""))
 
-            if logical not in {"PBS_Lumpectomy", "PBS_Breast Reduction", "PBS_Mastopexy", "PBS_Augmentation", "PBS_Other"}:
+        for c in cands:
+            field = clean_cell(getattr(c, "field", ""))
+            if field not in {"PBS_Lumpectomy", "PBS_Breast Reduction", "PBS_Mastopexy", "PBS_Augmentation", "PBS_Other"}:
                 continue
 
             evid = clean_cell(getattr(c, "evidence", ""))
             if not evid:
                 continue
 
-            proc_lat = extract_laterality_from_text(evid)
-            lat_decision = laterality_relation(recon_lat, proc_lat, evid)
+            combined_context = "{0}\n{1}".format(evid, full_note_text)
 
-            hist_context = is_historical_context(evid)
-            neg_context = has_negative_history(evid)
+            proc_lat = extract_laterality_from_text(combined_context)
+            if not proc_lat:
+                proc_lat = infer_laterality_from_field_context(field, combined_context)
 
+            lat_decision = laterality_relation(recon_lat, proc_lat, combined_context)
+
+            neg_context = has_negative_history(combined_context)
             day_diff = days_between(note_dt, recon_dt)
+            history_ok = field_specific_history_ok(field, combined_context)
 
             accept = False
             reason = ""
@@ -819,25 +899,42 @@ def main():
             if neg_context:
                 accept = False
                 reason = "reject_negative_history"
+
             elif day_diff is None:
                 accept = False
                 reason = "reject_missing_date_diff"
+
             elif day_diff < 0:
                 if lat_decision == "accept":
-                    accept = True
-                    reason = "accept_pre_recon"
+                    if history_ok:
+                        accept = True
+                        reason = "accept_pre_recon_historical"
+                    else:
+                        # allow pre-recon lumpectomy a bit more broadly
+                        if field == "PBS_Lumpectomy":
+                            accept = True
+                            reason = "accept_pre_recon_lumpectomy"
+                        else:
+                            accept = False
+                            reason = "reject_pre_recon_no_history"
                 elif lat_decision == "reject_contralateral":
                     accept = False
                     reason = "reject_contralateral"
                 elif lat_decision == "unknown_unilateral":
-                    accept = False
-                    reason = "reject_unknown_laterality_unilateral"
+                    # allow lumpectomy if strong same-side disease/procedure context exists
+                    if field == "PBS_Lumpectomy" and history_ok and infer_laterality_from_field_context(field, combined_context):
+                        accept = True
+                        reason = "accept_inferred_laterality"
+                    else:
+                        accept = False
+                        reason = "reject_unknown_laterality_unilateral"
                 else:
                     accept = False
                     reason = "reject_unknown_recon_laterality"
+
             else:
-                # post-recon fallback only if clearly historical
-                if not hist_context:
+                # post-recon notes can still summarize true prior surgeries
+                if not history_ok:
                     accept = False
                     reason = "reject_post_recon_not_historical"
                 else:
@@ -848,18 +945,27 @@ def main():
                         accept = False
                         reason = "reject_contralateral"
                     elif lat_decision == "unknown_unilateral":
-                        accept = False
-                        reason = "reject_unknown_laterality_unilateral"
+                        if field == "PBS_Lumpectomy" and infer_laterality_from_field_context(field, combined_context):
+                            accept = True
+                            reason = "accept_post_recon_inferred_laterality"
+                        else:
+                            accept = False
+                            reason = "reject_unknown_laterality_unilateral"
                     else:
-                        accept = False
-                        reason = "reject_unknown_recon_laterality"
+                        # if recon laterality missing, permit true historical lumpectomy/reduction/mastopexy/augmentation evidence
+                        if history_ok:
+                            accept = True
+                            reason = "accept_post_recon_history_no_recon_lat"
+                        else:
+                            accept = False
+                            reason = "reject_unknown_recon_laterality"
 
             evidence_rows.append({
                 MERGE_KEY: mrn,
                 "NOTE_ID": getattr(c, "note_id", row["NOTE_ID"]),
                 "NOTE_DATE": getattr(c, "note_date", row["NOTE_DATE"]),
                 "NOTE_TYPE": getattr(c, "note_type", row["NOTE_TYPE"]),
-                "FIELD": logical,
+                "FIELD": field,
                 "VALUE": getattr(c, "value", True),
                 "STATUS": getattr(c, "status", ""),
                 "CONFIDENCE": getattr(c, "confidence", ""),
@@ -874,16 +980,14 @@ def main():
             if not accept:
                 continue
 
-            # attach helper attrs for ranking
             setattr(c, "_source_file", row.get("SOURCE_FILE", ""))
-            setattr(c, "_accepted_post_hist", bool(day_diff >= 0 and hist_context))
+            setattr(c, "_accepted_post_hist", bool(day_diff >= 0 and history_ok))
 
-            existing = best_by_mrn[mrn].get(logical)
-            best_by_mrn[mrn][logical] = choose_better_pbs(existing, c, recon_dt)
+            existing = best_by_mrn[mrn].get(field)
+            best_by_mrn[mrn][field] = choose_better_pbs(existing, c, recon_dt)
 
     print("Accepted PBS note-based predictions for MRNs: {0}".format(len(best_by_mrn)))
 
-    # write final PBS fields
     for mrn, fields in best_by_mrn.items():
         mask = (master[MERGE_KEY].astype(str).str.strip() == mrn)
         if not mask.any():
@@ -891,16 +995,15 @@ def main():
 
         any_positive = False
 
-        for logical in ["PBS_Lumpectomy", "PBS_Breast Reduction", "PBS_Mastopexy", "PBS_Augmentation", "PBS_Other"]:
-            cand = fields.get(logical)
+        for field in ["PBS_Lumpectomy", "PBS_Breast Reduction", "PBS_Mastopexy", "PBS_Augmentation", "PBS_Other"]:
+            cand = fields.get(field)
             if cand is None:
                 continue
-            master.loc[mask, logical] = 1
+            master.loc[mask, field] = 1
             any_positive = True
 
         master.loc[mask, "PastBreastSurgery"] = 1 if any_positive else 0
 
-    # any MRN without subtype stays 0 for PastBreastSurgery
     subtype_cols = ["PBS_Lumpectomy", "PBS_Breast Reduction", "PBS_Mastopexy", "PBS_Augmentation", "PBS_Other"]
     for idx in master.index:
         any_positive = False
@@ -918,7 +1021,7 @@ def main():
     pd.DataFrame(evidence_rows).to_csv(OUTPUT_EVID, index=False)
 
     print("\nDONE.")
-    print("- Updated PBS-only master: {0}".format(OUTPUT_MASTER))
+    print("- Updated master: {0}".format(OUTPUT_MASTER))
     print("- PBS evidence: {0}".format(OUTPUT_EVID))
     print("\nRun:")
     print(" python update_pbs_only.py")
