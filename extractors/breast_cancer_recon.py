@@ -265,9 +265,7 @@ def _infer_recon_type_and_class(text: str) -> Tuple[Optional[str], Optional[str]
     has_expander = ("tissue expander" in low) or ("expander" in low)
     has_implant = ("implant" in low)
 
-    # Recon_Type exact gold label mapping
     rtype = None
-
     if "mixed flaps" in low:
         rtype = "mixed flaps"
     elif len(set(flap_types_found)) >= 2:
@@ -291,7 +289,6 @@ def _infer_recon_type_and_class(text: str) -> Tuple[Optional[str], Optional[str]
     elif has_implant:
         rtype = "expander/implant"
 
-    # Recon_Classification exact requested mapping
     rclass = None
     if has_any_flap:
         rclass = "autologous"
@@ -342,6 +339,16 @@ def _infer_indications(text: str, lat: Optional[str]) -> Tuple[Optional[str], Op
         if right_val is None and right_cancer:
             right_val = "Therapeutic"
 
+    if lat == "LEFT" and left_val is None:
+        left_val = "None"
+    if lat == "RIGHT" and right_val is None:
+        right_val = "None"
+    if lat == "BILATERAL":
+        if left_val is None:
+            left_val = "None"
+        if right_val is None:
+            right_val = "None"
+
     return left_val, right_val
 
 
@@ -380,9 +387,6 @@ def extract_breast_cancer_recon(note: SectionedNote) -> List[Candidate]:
         if not text:
             continue
 
-        # -----------------------
-        # Mastectomy block
-        # -----------------------
         m = MASTECTOMY_RX.search(text)
         if m:
             ctx = _window(text, m.start(), m.end(), 220)
@@ -395,22 +399,21 @@ def extract_breast_cancer_recon(note: SectionedNote) -> List[Candidate]:
                     cands.append(_emit("Mastectomy_Date", _clean(note.note_date), text, m, section, note, 0.88 if op_note else 0.68))
 
                 left_ind, right_ind = _infer_indications(text, lat)
-                if left_ind:
+                if left_ind is not None:
                     cands.append(_emit("Indication_Left", left_ind, text, m, section, note, 0.80 if op_note else 0.66))
-                if right_ind:
+                if right_ind is not None:
                     cands.append(_emit("Indication_Right", right_ind, text, m, section, note, 0.80 if op_note else 0.66))
 
-                # ALND overrides SLNB if both appear
+                # ALND > SLNB > none
                 if ALND_RX.search(text):
                     mm = ALND_RX.search(text)
                     cands.append(_emit("LymphNode", "ALND", text, mm, section, note, 0.86 if op_note else 0.72))
                 elif SLNB_RX.search(text):
                     mm = SLNB_RX.search(text)
                     cands.append(_emit("LymphNode", "SLNB", text, mm, section, note, 0.82 if op_note else 0.70))
+                else:
+                    cands.append(_emit("LymphNode", "none", text, m, section, note, 0.60 if op_note else 0.50))
 
-        # -----------------------
-        # Reconstruction block
-        # -----------------------
         r = RECON_RX.search(text)
         if r:
             ctx = _window(text, r.start(), r.end(), 220)
@@ -428,15 +431,9 @@ def extract_breast_cancer_recon(note: SectionedNote) -> List[Candidate]:
                 if op_note and MASTECTOMY_RX.search(text):
                     cands.append(_emit("Recon_Timing", "Immediate", text, r, section, note, 0.92))
 
-        # -----------------------
-        # Radiation block
-        # Clinic/history notes preferred for fallback treatment capture
-        # -----------------------
         rr = RADIATION_RX.search(text)
         if rr:
             ctx = _window(text, rr.start(), rr.end(), 260)
-            low_ctx = ctx.lower()
-
             should_emit = False
             conf = 0.74
 
@@ -449,9 +446,6 @@ def extract_breast_cancer_recon(note: SectionedNote) -> List[Candidate]:
             if should_emit:
                 cands.append(_emit("Radiation", True, text, rr, section, note, conf))
 
-        # -----------------------
-        # Chemo block
-        # -----------------------
         cc = CHEMO_RX.search(text)
         if cc:
             ctx = _window(text, cc.start(), cc.end(), 260)
