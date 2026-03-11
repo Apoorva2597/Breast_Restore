@@ -5,52 +5,107 @@ from typing import List
 from models import Candidate, SectionedNote
 from .utils import window_around
 
-SUPPRESS_SECTIONS = {"FAMILY HISTORY", "REVIEW OF SYSTEMS", "ALLERGIES"}
+SUPPRESS_SECTIONS = {
+    "FAMILY HISTORY",
+    "REVIEW OF SYSTEMS",
+    "ALLERGIES"
+}
 
 NEGATE_PATTERNS = [
-    r"\bno\s+prior\s+breast\s+surgery\b",
-    r"\bno\s+history\s+of\s+breast\s+surgery\b",
-    r"\bdenies\s+prior\s+breast\s+surgery\b",
-    r"\bnever\s+had\s+breast\s+surgery\b",
+    re.compile(r"\bno\s+prior\s+breast\s+surgery\b", re.I),
+    re.compile(r"\bno\s+history\s+of\s+breast\s+surgery\b", re.I),
+    re.compile(r"\bdenies\s+prior\s+breast\s+surgery\b", re.I),
+    re.compile(r"\bnever\s+had\s+breast\s+surgery\b", re.I),
+]
+
+HISTORY_CUE_PATTERNS = [
+    re.compile(r"\bs/p\b", re.I),
+    re.compile(r"\bstatus\s+post\b", re.I),
+    re.compile(r"\bhistory\s+of\b", re.I),
+    re.compile(r"\bprior\b", re.I),
+    re.compile(r"\bprevious\b", re.I),
+    re.compile(r"\bremote\b", re.I),
+    re.compile(r"\bwith\s+a\s+history\s+of\b", re.I),
 ]
 
 LUMP_PATTERNS = [
-    r"\blumpectomy\b",
-    r"\bpartial\s+mastectomy\b",
-    r"\bsegmental\s+mastectomy\b",
-    r"\bbreast[- ]conserving\s+surgery\b",
-    r"\bwide\s+local\s+excision\b",
+    re.compile(r"\blumpectomy\b", re.I),
+    re.compile(r"\bpartial\s+mastectomy\b", re.I),
+    re.compile(r"\bsegmental\s+mastectomy\b", re.I),
+    re.compile(r"\bbreast[- ]conserving\s+surgery\b", re.I),
+    re.compile(r"\bwide\s+local\s+excision\b", re.I),
 ]
 
 REDUCTION_PATTERNS = [
-    r"\bbreast\s+reduction\b",
-    r"\breduction\s+mammaplasty\b",
+    re.compile(r"\bbreast\s+reduction\b", re.I),
+    re.compile(r"\breduction\s+mammaplasty\b", re.I),
+    re.compile(r"\breduction\b", re.I),
 ]
 
 MASTOPEXY_PATTERNS = [
-    r"\bmastopexy\b",
-    r"\bbreast\s+lift\b",
+    re.compile(r"\bmastopexy\b", re.I),
+    re.compile(r"\bbreast\s+lift\b", re.I),
 ]
 
 AUGMENT_PATTERNS = [
-    r"\bbreast\s+augmentation\b",
-    r"\baugmentation\s+mammaplasty\b",
-    r"\bimplants?\b.*\baugmentation\b",
+    re.compile(r"\bbreast\s+augmentation\b", re.I),
+    re.compile(r"\baugmentation\s+mammaplasty\b", re.I),
+    re.compile(r"\bsubpectoral\s+implant\s+placement\b", re.I),
+    re.compile(r"\bcosmetic\s+implant(?:s)?\b", re.I),
 ]
 
 OTHER_PATTERNS = [
-    r"\bexcisional\s+biopsy\b",
-    r"\bbenign\s+excision\b",
-    r"\bbiopsy\b",
+    re.compile(r"\bexcisional\s+biopsy\b", re.I),
+    re.compile(r"\bopen\s+breast\s+biopsy\b", re.I),
+    re.compile(r"\bduct\s+excision\b", re.I),
+    re.compile(r"\bfibroadenoma\s+excision\b", re.I),
+    re.compile(r"\bbenign\s+breast\s+excision\b", re.I),
+]
+
+FIELD_PATTERNS = [
+    ("PBS_Lumpectomy", LUMP_PATTERNS, 0.90),
+    ("PBS_Breast Reduction", REDUCTION_PATTERNS, 0.84),
+    ("PBS_Mastopexy", MASTOPEXY_PATTERNS, 0.84),
+    ("PBS_Augmentation", AUGMENT_PATTERNS, 0.84),
+    ("PBS_Other", OTHER_PATTERNS, 0.78),
 ]
 
 
+def _normalize_text(text):
+    text = text or ""
+    text = text.replace("\r", " ")
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def _has_negation_near(text, start, end):
+    ctx = window_around(text, start, end, 140).lower()
+    for rx in NEGATE_PATTERNS:
+        if rx.search(ctx):
+            return True
+    return False
+
+
+def _has_history_cue_near(text, start, end):
+    ctx = window_around(text, start, end, 160)
+    for rx in HISTORY_CUE_PATTERNS:
+        if rx.search(ctx):
+            return True
+    return False
+
+
 def _emit(field, text, m, section, note, conf):
+    hist = _has_history_cue_near(text, m.start(), m.end())
+    evid = window_around(text, m.start(), m.end(), 220)
+
+    if hist:
+        conf = min(0.99, conf + 0.05)
+
     return Candidate(
         field=field,
         value=True,
-        status="history",
-        evidence=window_around(text, m.start(), m.end(), 180),
+        status="history_possible" if hist else "present_or_history",
+        evidence=evid,
         section=section,
         note_type=note.note_type,
         note_id=note.note_id,
@@ -60,70 +115,21 @@ def _emit(field, text, m, section, note, conf):
 
 
 def extract_pbs(note: SectionedNote) -> List[Candidate]:
-    cands: List[Candidate] = []
+    cands = []
 
-    for section, text in note.sections.items():
+    for section, raw_text in note.sections.items():
         if section in SUPPRESS_SECTIONS:
             continue
-        if not text:
+        if not raw_text:
             continue
 
-        low = text.lower()
+        text = _normalize_text(raw_text)
 
-        # whole-block negation
-        if any(re.search(p, low) for p in NEGATE_PATTERNS):
-            continue
-
-        # Lumpectomy
-        for p in LUMP_PATTERNS:
-            m = re.search(p, low)
-            if m:
-                cands.append(_emit("PBS_Lumpectomy", text, m, section, note, 0.80))
-                break
-
-        # Reduction
-        for p in REDUCTION_PATTERNS:
-            m = re.search(p, low)
-            if m:
-                cands.append(_emit("PBS_Breast Reduction", text, m, section, note, 0.78))
-                break
-
-        # Mastopexy
-        for p in MASTOPEXY_PATTERNS:
-            m = re.search(p, low)
-            if m:
-                cands.append(_emit("PBS_Mastopexy", text, m, section, note, 0.78))
-                break
-
-        # Augmentation
-        for p in AUGMENT_PATTERNS:
-            m = re.search(p, low)
-            if m:
-                cands.append(_emit("PBS_Augmentation", text, m, section, note, 0.78))
-                break
-
-        # Other prior breast procedures
-        for p in OTHER_PATTERNS:
-            m = re.search(p, low)
-            if m:
-                cands.append(_emit("PBS_Other", text, m, section, note, 0.72))
-                break
-
-    # Optional: PastBreastSurgery flag if ANY PBS_* true
-    if any(c.field.startswith("PBS_") and c.value is True for c in cands):
-        # make a single summary candidate
-        cands.append(
-            Candidate(
-                field="PastBreastSurgery",
-                value=True,
-                status="history",
-                evidence="Derived from PBS_* hits in note.",
-                section="DERIVED",
-                note_type=note.note_type,
-                note_id=note.note_id,
-                note_date=note.note_date,
-                confidence=0.85,
-            )
-        )
+        for field, patterns, conf in FIELD_PATTERNS:
+            for rx in patterns:
+                for m in rx.finditer(text):
+                    if _has_negation_near(text, m.start(), m.end()):
+                        continue
+                    cands.append(_emit(field, text, m, section, note, conf))
 
     return cands
