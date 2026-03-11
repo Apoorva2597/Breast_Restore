@@ -4,7 +4,7 @@
 import re
 
 from models import Candidate, SectionedNote
-from .utils import window_around
+from extractors.utils import window_around
 
 SUPPRESS_SECTIONS = {
     "FAMILY HISTORY",
