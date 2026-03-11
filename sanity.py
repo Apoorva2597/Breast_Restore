@@ -1,361 +1,272 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-qa_pbs_lumpectomy_targeted.py
-
-Targeted QA script for PBS_Lumpectomy.
-
-What it does:
-- merges master and gold on MRN
-- focuses only on PBS_Lumpectomy
-- prints TP / TN / FP / FN counts in terminal
-- writes ONLY lumpectomy mismatches (FP + FN) to a CSV
-- includes the best evidence snippet from pbs_only_evidence.csv
-- does NOT include MRN in the output file
-
-Output CSV columns:
-- case_type
-- gold
-- pred
-- note_type
-- note_date
-- rule_decision
-- snippet
-
-Python 3.6.8 compatible.
-"""
+# qa_error_review_export.py
+#
+# Exports QA-ready error review CSVs for selected fields with:
+# - gold
+# - pred
+# - evidence snippets
+# - note metadata
+#
+# IMPORTANT:
+# - Does NOT include MRN in output
+# - Creates one QA CSV per target field
+# - Pulls only mismatch rows by default
+#
+# Python 3.6.8 compatible
 
 import os
+import re
 import pandas as pd
 
-MASTER_FILE = "_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv"
-GOLD_FILE = "gold_cleaned_for_cedar.csv"
-EVID_FILE = "_outputs/pbs_only_evidence.csv"
-OUTPUT_QA = "_outputs/pbs_lumpectomy_targeted_qa.csv"
+BASE_DIR = "/home/apokol/Breast_Restore"
 
-MRN = "MRN"
-FIELD = "PBS_Lumpectomy"
+MASTER_PRED_PATH = "{0}/_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv".format(BASE_DIR)
+GOLD_PATH = "{0}/_outputs/master_abstraction_gold.csv".format(BASE_DIR)   # <-- update if needed
+EVID_PATH = "{0}/_outputs/rule_hit_evidence_FINAL_NO_GOLD.csv".format(BASE_DIR)
+OUT_DIR = "{0}/_outputs/qa_exports".format(BASE_DIR)
 
-MISSING_STRINGS = {"", "nan", "none", "null", "na", "NA", "None", "Null"}
+MERGE_KEY = "MRN"
+
+TARGET_FIELDS = [
+    "Indication_Left",
+    "Indication_Right",
+    "LymphNode",
+    "Recon_Type",
+    "Recon_Classification",
+]
+
+MAX_SNIPPET_LEN = 500
+MAX_ROWS_PER_FIELD = 50      # set to None to export all mismatches
+MISMATCH_ONLY = True         # True = only errors; False = all rows
 
 
-# ---------------------------------------------------
-# Safe CSV reader
-# ---------------------------------------------------
-
-def safe_read_csv(path):
+def read_csv_robust(path):
+    common_kwargs = dict(dtype=str, engine="python")
     try:
-        return pd.read_csv(path, encoding="utf-8", dtype=str)
-    except Exception:
-        return pd.read_csv(path, encoding="latin1", dtype=str)
+        return pd.read_csv(path, **common_kwargs, on_bad_lines="skip")
+    except TypeError:
+        try:
+            return pd.read_csv(
+                path,
+                **common_kwargs,
+                error_bad_lines=False,
+                warn_bad_lines=True
+            )
+        except UnicodeDecodeError:
+            return pd.read_csv(
+                path,
+                **common_kwargs,
+                encoding="latin-1",
+                error_bad_lines=False,
+                warn_bad_lines=True
+            )
+    except UnicodeDecodeError:
+        try:
+            return pd.read_csv(
+                path,
+                **common_kwargs,
+                encoding="latin-1",
+                on_bad_lines="skip"
+            )
+        except TypeError:
+            return pd.read_csv(
+                path,
+                **common_kwargs,
+                encoding="latin-1",
+                error_bad_lines=False,
+                warn_bad_lines=True
+            )
 
 
-# ---------------------------------------------------
-# Basic cleaning
-# ---------------------------------------------------
+def clean_cols(df):
+    df.columns = [str(c).strip().replace("\ufeff", "") for c in df.columns]
+    return df
+
+
+def normalize_mrn(df):
+    key_variants = ["MRN", "mrn", "Patient_MRN", "PAT_MRN", "PATIENT_MRN"]
+    found = None
+    for k in key_variants:
+        if k in df.columns:
+            found = k
+            break
+    if found is None:
+        raise RuntimeError("MRN column not found. Columns seen: {0}".format(list(df.columns)[:50]))
+    if found != MERGE_KEY:
+        df = df.rename(columns={found: MERGE_KEY})
+    df[MERGE_KEY] = df[MERGE_KEY].fillna("").astype(str).str.strip()
+    return df
+
 
 def clean_cell(x):
     if x is None:
         return ""
     s = str(x).strip()
-    if s in MISSING_STRINGS:
+    if s.lower() in {"nan", "none", "null", "na"}:
         return ""
     return s
 
 
-def normalize_binary_value(x):
-    s = clean_cell(x).lower()
-
-    if not s:
-        return pd.NA
-
-    if s in ["1", "true", "t", "yes", "y"]:
-        return 1
-
-    if s in ["0", "false", "f", "no", "n"]:
-        return 0
-
-    return pd.NA
+def norm_compare(x):
+    s = clean_cell(x).strip()
+    s = re.sub(r"\s+", " ", s)
+    return s.lower()
 
 
-def shorten_text(x, max_len=700):
+def truncate_text(x, n=MAX_SNIPPET_LEN):
     s = clean_cell(x)
-    if not s:
-        return ""
-    s = " ".join(s.split())
-    if len(s) <= max_len:
+    s = re.sub(r"\s+", " ", s)
+    if len(s) <= n:
         return s
-    return s[:max_len].rstrip() + "..."
+    return s[:n] + " ..."
 
 
-# ---------------------------------------------------
-# Evidence ranking
-# ---------------------------------------------------
-
-def rule_rank(rule_decision):
-    s = clean_cell(rule_decision).lower()
-
-    if s == "accept_pre_recon":
-        return 0
-    if s == "accept_pre_recon_historical":
-        return 1
-    if s == "accept_pre_recon_lumpectomy":
-        return 2
-    if s == "accept_post_recon_historical":
-        return 3
-    if s == "accept_post_recon_inferred_laterality":
-        return 4
-    if s == "accept_inferred_laterality":
-        return 5
-
-    if s == "reject_post_recon_not_historical":
-        return 20
-    if s == "reject_unknown_laterality_unilateral":
-        return 21
-    if s == "reject_unknown_recon_laterality":
-        return 22
-    if s == "reject_contralateral":
-        return 23
-    if s == "reject_pre_recon_no_history":
-        return 24
-    if s == "reject_negative_history":
-        return 25
-    if s == "reject_missing_date_diff":
-        return 26
-    if s == "extractor_failed":
-        return 98
-
-    return 99
-
-
-def confidence_float(x):
-    try:
-        return float(str(x).strip())
-    except Exception:
-        return -1.0
-
-
-def build_best_evidence_map(evid_df):
+def choose_best_evidence_for_field(evid_df, field):
     """
-    Returns:
-        best_map[mrn] = {
-            "snippet": ...,
-            "rule_decision": ...,
-            "note_type": ...,
-            "note_date": ...
-        }
+    For each MRN + FIELD, keep best evidence row.
+    Priority:
+    1. higher confidence
+    2. op/operative note
+    3. non-history section
+    4. latest non-empty note date string tie-break by lexical sort
     """
-    best_map = {}
+    tmp = evid_df[evid_df["FIELD"].astype(str).str.strip() == field].copy()
+    if tmp.empty:
+        return tmp
 
-    if evid_df is None or len(evid_df) == 0:
-        return best_map
+    for c in ["CONFIDENCE", "NOTE_TYPE", "SECTION", "NOTE_DATE", "EVIDENCE", "VALUE", "NOTE_ID"]:
+        if c not in tmp.columns:
+            tmp[c] = ""
 
-    required_cols = [
-        "MRN", "FIELD", "EVIDENCE", "RULE_DECISION",
-        "CONFIDENCE", "NOTE_TYPE", "NOTE_DATE"
-    ]
-    for col in required_cols:
-        if col not in evid_df.columns:
-            return best_map
+    tmp["CONFIDENCE_NUM"] = pd.to_numeric(tmp["CONFIDENCE"], errors="coerce").fillna(0.0)
 
-    tmp = evid_df.copy()
-    tmp["MRN"] = tmp["MRN"].astype(str).str.strip()
-    tmp["FIELD"] = tmp["FIELD"].astype(str).str.strip()
+    tmp["NOTE_TYPE_LOW"] = tmp["NOTE_TYPE"].fillna("").astype(str).str.lower()
+    tmp["SECTION_UP"] = tmp["SECTION"].fillna("").astype(str).str.upper()
 
-    tmp = tmp[tmp["FIELD"] == FIELD].copy()
-    if len(tmp) == 0:
-        return best_map
-
-    tmp["RULE_DECISION"] = tmp["RULE_DECISION"].astype(str).str.strip()
-    tmp["EVIDENCE"] = tmp["EVIDENCE"].astype(str).str.strip()
-    tmp["NOTE_TYPE"] = tmp["NOTE_TYPE"].astype(str).str.strip()
-    tmp["NOTE_DATE"] = tmp["NOTE_DATE"].astype(str).str.strip()
-    tmp["CONFIDENCE_NUM"] = tmp["CONFIDENCE"].apply(confidence_float)
-    tmp["RULE_RANK"] = tmp["RULE_DECISION"].apply(rule_rank)
-
-    for mrn, g in tmp.groupby("MRN", dropna=False):
-        mrn = clean_cell(mrn)
-        if not mrn:
-            continue
-
-        g = g.sort_values(
-            by=["RULE_RANK", "CONFIDENCE_NUM"],
-            ascending=[True, False]
-        )
-
-        best_row = g.iloc[0]
-
-        snippet = clean_cell(best_row["EVIDENCE"])
-        rule_decision = clean_cell(best_row["RULE_DECISION"])
-        note_type = clean_cell(best_row["NOTE_TYPE"])
-        note_date = clean_cell(best_row["NOTE_DATE"])
-
-        if rule_decision:
-            snippet = "[{0}] {1}".format(rule_decision, snippet)
-
-        best_map[mrn] = {
-            "snippet": shorten_text(snippet, max_len=700),
-            "rule_decision": rule_decision,
-            "note_type": note_type,
-            "note_date": note_date
-        }
-
-    return best_map
-
-
-# ---------------------------------------------------
-# Confusion logic
-# ---------------------------------------------------
-
-def classify_case(pred, gold):
-    if pd.isna(pred) or pd.isna(gold):
-        return None
-
-    if pred == 1 and gold == 1:
-        return "TP"
-    if pred == 0 and gold == 0:
-        return "TN"
-    if pred == 1 and gold == 0:
-        return "FP"
-    if pred == 0 and gold == 1:
-        return "FN"
-
-    return None
-
-
-# ---------------------------------------------------
-# Main
-# ---------------------------------------------------
-
-def main():
-    print("Loading files...")
-
-    master = safe_read_csv(MASTER_FILE)
-    gold = safe_read_csv(GOLD_FILE)
-
-    print("Master rows:", len(master))
-    print("Gold rows:", len(gold))
-
-    if not os.path.exists(EVID_FILE):
-        print("Evidence file not found:", EVID_FILE)
-        evid = pd.DataFrame()
-    else:
-        evid = safe_read_csv(EVID_FILE)
-        print("Evidence rows:", len(evid))
-
-    if MRN not in master.columns:
-        raise RuntimeError("Master missing MRN column")
-    if MRN not in gold.columns:
-        raise RuntimeError("Gold missing MRN column")
-
-    master[MRN] = master[MRN].astype(str).str.strip()
-    gold[MRN] = gold[MRN].astype(str).str.strip()
-
-    master = master[master[MRN] != ""].copy()
-    gold = gold[gold[MRN] != ""].copy()
-
-    master = master.drop_duplicates(subset=[MRN])
-    gold = gold.drop_duplicates(subset=[MRN])
-
-    pred_col = FIELD
-    gold_col = FIELD
-
-    if pred_col not in master.columns:
-        raise RuntimeError("Master missing field: {0}".format(FIELD))
-    if gold_col not in gold.columns:
-        raise RuntimeError("Gold missing field: {0}".format(FIELD))
-
-    merged = pd.merge(
-        master[[MRN, pred_col]],
-        gold[[MRN, gold_col]],
-        on=MRN,
-        how="inner",
-        suffixes=("_pred", "_gold")
+    tmp["OP_BONUS"] = tmp["NOTE_TYPE_LOW"].apply(
+        lambda s: 1 if ("op" in s or "operative" in s or "operation" in s) else 0
     )
 
-    print("Merged rows:", len(merged))
+    low_value_sections = set([
+        "PAST MEDICAL HISTORY", "PAST SURGICAL HISTORY", "SURGICAL HISTORY",
+        "HISTORY", "PMH", "PSH"
+    ])
+    tmp["SECTION_PENALTY"] = tmp["SECTION_UP"].apply(lambda s: -1 if s in low_value_sections else 0)
 
-    pred_norm = merged[pred_col + "_pred"].apply(normalize_binary_value)
-    gold_norm = merged[pred_col + "_gold"].apply(normalize_binary_value)
+    tmp = tmp.sort_values(
+        by=[MERGE_KEY, "CONFIDENCE_NUM", "OP_BONUS", "SECTION_PENALTY", "NOTE_DATE"],
+        ascending=[True, False, False, False, False]
+    )
 
-    valid_mask = gold_norm.notna()
+    tmp = tmp.drop_duplicates(subset=[MERGE_KEY], keep="first")
+    return tmp
 
-    sub = merged.loc[valid_mask, [MRN]].copy()
-    sub["pred"] = pred_norm[valid_mask].values
-    sub["gold"] = gold_norm[valid_mask].values
 
-    best_evidence_map = build_best_evidence_map(evid)
+def main():
+    if not os.path.exists(MASTER_PRED_PATH):
+        raise FileNotFoundError("Pred master not found: {0}".format(MASTER_PRED_PATH))
+    if not os.path.exists(GOLD_PATH):
+        raise FileNotFoundError("Gold file not found: {0}".format(GOLD_PATH))
+    if not os.path.exists(EVID_PATH):
+        raise FileNotFoundError("Evidence file not found: {0}".format(EVID_PATH))
 
-    tp = 0
-    tn = 0
-    fp = 0
-    fn = 0
+    os.makedirs(OUT_DIR, exist_ok=True)
 
-    qa_rows = []
+    pred = clean_cols(read_csv_robust(MASTER_PRED_PATH))
+    gold = clean_cols(read_csv_robust(GOLD_PATH))
+    evid = clean_cols(read_csv_robust(EVID_PATH))
 
-    for _, row in sub.iterrows():
-        mrn = clean_cell(row[MRN])
-        pred = row["pred"]
-        goldv = row["gold"]
+    pred = normalize_mrn(pred)
+    gold = normalize_mrn(gold)
+    evid = normalize_mrn(evid)
 
-        case_type = classify_case(pred, goldv)
-        if case_type is None:
-            continue
+    missing_in_pred = [f for f in TARGET_FIELDS if f not in pred.columns]
+    missing_in_gold = [f for f in TARGET_FIELDS if f not in gold.columns]
 
-        if case_type == "TP":
-            tp += 1
-        elif case_type == "TN":
-            tn += 1
-        elif case_type == "FP":
-            fp += 1
-        elif case_type == "FN":
-            fn += 1
+    if missing_in_pred:
+        raise RuntimeError("Missing target fields in pred file: {0}".format(missing_in_pred))
+    if missing_in_gold:
+        raise RuntimeError("Missing target fields in gold file: {0}".format(missing_in_gold))
 
-        if case_type in ("FP", "FN"):
-            ev = best_evidence_map.get(mrn, {})
-            qa_rows.append({
-                "case_type": case_type,
-                "gold": int(goldv),
-                "pred": int(pred),
-                "note_type": clean_cell(ev.get("note_type", "")),
-                "note_date": clean_cell(ev.get("note_date", "")),
-                "rule_decision": clean_cell(ev.get("rule_decision", "")),
-                "snippet": clean_cell(ev.get("snippet", ""))
-            })
+    for field in TARGET_FIELDS:
+        pred_sub = pred[[MERGE_KEY, field]].copy().rename(columns={field: "pred"})
+        gold_sub = gold[[MERGE_KEY, field]].copy().rename(columns={field: "gold"})
 
-    total = tp + tn + fp + fn
-    acc = float(tp + tn) / float(total) if total > 0 else 0.0
+        merged = gold_sub.merge(pred_sub, on=MERGE_KEY, how="inner")
 
-    print("\nTargeted QA for {0}\n".format(FIELD))
-    print("total:", total)
-    print("TP:", tp)
-    print("TN:", tn)
-    print("FP:", fp)
-    print("FN:", fn)
-    print("accuracy:", round(acc, 6))
+        merged["gold_norm"] = merged["gold"].apply(norm_compare)
+        merged["pred_norm"] = merged["pred"].apply(norm_compare)
+        merged["is_match"] = merged["gold_norm"] == merged["pred_norm"]
 
-    qa_df = pd.DataFrame(qa_rows)
+        if MISMATCH_ONLY:
+            merged = merged[merged["is_match"] == False].copy()
 
-    case_order = {
-        "FN": 0,
-        "FP": 1
-    }
+        best_evid = choose_best_evidence_for_field(evid, field)
 
-    if len(qa_df) > 0:
-        qa_df["_case_order"] = qa_df["case_type"].map(case_order).fillna(9)
-        qa_df = qa_df.sort_values(
-            by=["_case_order", "rule_decision", "note_date"],
-            ascending=[True, True, True]
-        ).drop(columns=["_case_order"])
+        keep_cols = [MERGE_KEY]
+        for c in ["VALUE", "EVIDENCE", "NOTE_TYPE", "NOTE_DATE", "SECTION", "CONFIDENCE", "NOTE_ID"]:
+            if c in best_evid.columns:
+                keep_cols.append(c)
 
-    if not os.path.exists("_outputs"):
-        os.makedirs("_outputs")
+        best_evid = best_evid[keep_cols].copy()
 
-    qa_df.to_csv(OUTPUT_QA, index=False)
+        rename_map = {
+            "VALUE": "evidence_value",
+            "EVIDENCE": "evidence_snippet",
+            "NOTE_TYPE": "evidence_note_type",
+            "NOTE_DATE": "evidence_note_date",
+            "SECTION": "evidence_section",
+            "CONFIDENCE": "evidence_confidence",
+            "NOTE_ID": "evidence_note_id"
+        }
+        best_evid = best_evid.rename(columns=rename_map)
 
-    print("\nTargeted mismatch file written to:", OUTPUT_QA)
-    print("Done.")
+        out = merged.merge(best_evid, on=MERGE_KEY, how="left")
+
+        if "evidence_snippet" in out.columns:
+            out["evidence_snippet"] = out["evidence_snippet"].apply(truncate_text)
+
+        # helpful QA labels
+        out["error_type_guess"] = ""
+        out.loc[(out["gold_norm"] == "") & (out["pred_norm"] != ""), "error_type_guess"] = "false_positive"
+        out.loc[(out["gold_norm"] != "") & (out["pred_norm"] == ""), "error_type_guess"] = "false_negative"
+        out.loc[
+            (out["gold_norm"] != "") &
+            (out["pred_norm"] != "") &
+            (out["gold_norm"] != out["pred_norm"]),
+            "error_type_guess"
+        ] = "wrong_value"
+
+        # remove MRN before save
+        if MAX_ROWS_PER_FIELD is not None and len(out) > MAX_ROWS_PER_FIELD:
+            out = out.head(MAX_ROWS_PER_FIELD).copy()
+
+        final_cols = [
+            "gold",
+            "pred",
+            "error_type_guess",
+            "evidence_value",
+            "evidence_snippet",
+            "evidence_note_type",
+            "evidence_note_date",
+            "evidence_section",
+            "evidence_confidence",
+            "evidence_note_id",
+        ]
+
+        for c in final_cols:
+            if c not in out.columns:
+                out[c] = ""
+
+        out = out[final_cols].copy()
+
+        out_path = os.path.join(OUT_DIR, "QA_{0}.csv".format(field))
+        out.to_csv(out_path, index=False)
+
+        print("Saved:", out_path, "| rows:", len(out))
+
+    print("\nDone.")
+    print("Review these files in:", OUT_DIR)
 
 
 if __name__ == "__main__":
