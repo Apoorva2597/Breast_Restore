@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# build_master_rule_CANCER_RECON_ONLY.py
+# build_master_rule_CANCER_RECON_PATCH.py
 #
-# Focused builder for:
+# PATCH-ONLY builder for:
 # - Mastectomy_Laterality
 # - Indication_Left
 # - Indication_Right
@@ -18,8 +18,10 @@
 # - Recon_Timing
 #
 # IMPORTANT:
-# This writes BACK into the original master/evidence output paths so your
-# existing validation script can run on the same master CSV name.
+# - Reads the EXISTING original master file
+# - Updates ONLY the target variables above
+# - Preserves all other columns exactly as they already are
+# - Writes back to the SAME original master/evidence paths
 #
 # Python 3.6.8 compatible
 
@@ -49,33 +51,68 @@ NOTE_GLOBS = [
     "{0}/**/HPI11526*operation notes.csv".format(BASE_DIR),
 ]
 
-# ORIGINAL output names preserved
-OUTPUT_MASTER = "{0}/_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv".format(BASE_DIR)
-OUTPUT_EVID = "{0}/_outputs/rule_hit_evidence_FINAL_NO_GOLD.csv".format(BASE_DIR)
+MASTER_PATH = "{0}/_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv".format(BASE_DIR)
+EVID_PATH = "{0}/_outputs/rule_hit_evidence_FINAL_NO_GOLD.csv".format(BASE_DIR)
 
 MERGE_KEY = "MRN"
+
+TARGET_FIELDS = [
+    "Mastectomy_Laterality",
+    "Indication_Left",
+    "Indication_Right",
+    "LymphNode",
+    "Radiation",
+    "Radiation_Before",
+    "Radiation_After",
+    "Chemo",
+    "Chemo_Before",
+    "Chemo_After",
+    "Recon_Laterality",
+    "Recon_Type",
+    "Recon_Classification",
+    "Recon_Timing",
+]
 
 from models import SectionedNote, Candidate  # noqa: E402
 from extractors.breast_cancer_recon import extract_breast_cancer_recon  # noqa: E402
 
 
-# -----------------------
-# Utilities
-# -----------------------
 def read_csv_robust(path):
     common_kwargs = dict(dtype=str, engine="python")
     try:
         return pd.read_csv(path, **common_kwargs, on_bad_lines="skip")
     except TypeError:
         try:
-            return pd.read_csv(path, **common_kwargs, error_bad_lines=False, warn_bad_lines=True)
+            return pd.read_csv(
+                path,
+                **common_kwargs,
+                error_bad_lines=False,
+                warn_bad_lines=True
+            )
         except UnicodeDecodeError:
-            return pd.read_csv(path, **common_kwargs, encoding="latin-1", error_bad_lines=False, warn_bad_lines=True)
+            return pd.read_csv(
+                path,
+                **common_kwargs,
+                encoding="latin-1",
+                error_bad_lines=False,
+                warn_bad_lines=True
+            )
     except UnicodeDecodeError:
         try:
-            return pd.read_csv(path, **common_kwargs, encoding="latin-1", on_bad_lines="skip")
+            return pd.read_csv(
+                path,
+                **common_kwargs,
+                encoding="latin-1",
+                on_bad_lines="skip"
+            )
         except TypeError:
-            return pd.read_csv(path, **common_kwargs, encoding="latin-1", error_bad_lines=False, warn_bad_lines=True)
+            return pd.read_csv(
+                path,
+                **common_kwargs,
+                encoding="latin-1",
+                error_bad_lines=False,
+                warn_bad_lines=True
+            )
 
 
 def clean_cols(df):
@@ -101,7 +138,9 @@ def pick_col(df, options, required=True):
         if c in df.columns:
             return c
     if required:
-        raise RuntimeError("Required column missing. Tried={0}. Seen={1}".format(options, list(df.columns)[:60]))
+        raise RuntimeError("Required column missing. Tried={0}. Seen={1}".format(
+            options, list(df.columns)[:60]
+        ))
     return None
 
 
@@ -226,68 +265,6 @@ def merge_boolean(existing, new):
     return choose_best(existing, new)
 
 
-def choose_categorical(existing, new):
-    if existing is None:
-        return new
-    return choose_best(existing, new)
-
-
-# -----------------------
-# ORIGINAL master structure preserved
-# -----------------------
-MASTER_COLUMNS = [
-    "MRN",
-    "ENCRYPTED_PAT_ID",
-    "Last name",
-    "DOB",
-    "PatientID",
-    "Race",
-    "Ethnicity",
-    "Age",
-    "BMI",
-    "CCI",
-    "SmokingStatus",
-    "Diabetes",
-    "Obesity",
-    "Hypertension",
-    "CardiacDisease",
-    "VenousThromboembolism",
-    "Steroid",
-    "PastBreastSurgery",
-    "PBS_Lumpectomy",
-    "PBS_Breast Reduction",
-    "PBS_Mastopexy",
-    "PBS_Augmentation",
-    "PBS_Other",
-    "Mastectomy_Laterality",
-    "Indication_Left",
-    "Indication_Right",
-    "LymphNode",
-    "Radiation",
-    "Radiation_Before",
-    "Radiation_After",
-    "Chemo",
-    "Chemo_Before",
-    "Chemo_After",
-    "Recon_Laterality",
-    "Recon_Type",
-    "Recon_Classification",
-    "Recon_Timing",
-    "Stage1_MinorComp",
-    "Stage1_Reoperation",
-    "Stage1_Rehospitalization",
-    "Stage1_MajorComp",
-    "Stage1_Failure",
-    "Stage1_Revision",
-    "Stage2_MinorComp",
-    "Stage2_Reoperation",
-    "Stage2_Rehospitalization",
-    "Stage2_MajorComp",
-    "Stage2_Failure",
-    "Stage2_Revision",
-    "Stage2_Applicable",
-]
-
 FIELD_MAP = {
     "Mastectomy_Laterality": "Mastectomy_Laterality",
     "Mastectomy_Date": "Mastectomy_Date",
@@ -304,11 +281,7 @@ FIELD_MAP = {
 
 BOOLEAN_FIELDS = {
     "Radiation",
-    "Radiation_Before",
-    "Radiation_After",
     "Chemo",
-    "Chemo_Before",
-    "Chemo_After",
 }
 
 KEYWORD_PREFILTER = re.compile(
@@ -381,40 +354,19 @@ def infer_recon_type_and_class(text):
     return rtype, rclass
 
 
-# -----------------------
-# Data loading
-# -----------------------
-def seed_master_from_structured():
-    struct_files = []
-    for g in STRUCT_GLOBS:
-        struct_files.extend(glob(g, recursive=True))
-    struct_files = sorted(set(struct_files))
+def load_existing_master():
+    if not os.path.exists(MASTER_PATH):
+        raise FileNotFoundError(
+            "Existing master file not found: {0}\nRestore your original build first.".format(MASTER_PATH)
+        )
+    master = clean_cols(read_csv_robust(MASTER_PATH))
+    master = normalize_mrn(master)
 
-    mrns = set()
-    if struct_files:
-        for fp in struct_files:
-            df = clean_cols(read_csv_robust(fp))
-            df = normalize_mrn(df)
-            mrns.update(df[MERGE_KEY].dropna().astype(str).str.strip().tolist())
-    else:
-        note_files = []
-        for g in NOTE_GLOBS:
-            note_files.extend(glob(g, recursive=True))
-        note_files = sorted(set(note_files))
-        if not note_files:
-            raise FileNotFoundError("No structured encounters OR notes found.")
-        for fp in note_files:
-            df = clean_cols(read_csv_robust(fp))
-            df = normalize_mrn(df)
-            mrns.update(df[MERGE_KEY].dropna().astype(str).str.strip().tolist())
-
-    mrns = sorted([m for m in mrns if m])
-    master = pd.DataFrame({MERGE_KEY: mrns})
-    master["ENCRYPTED_PAT_ID"] = master[MERGE_KEY]
-    for c in MASTER_COLUMNS:
+    for c in TARGET_FIELDS:
         if c not in master.columns:
             master[c] = pd.NA
-    return master[MASTER_COLUMNS]
+
+    return master
 
 
 def load_and_reconstruct_notes():
@@ -571,9 +523,6 @@ def load_structured_encounters():
     return pd.concat(rows, ignore_index=True)
 
 
-# -----------------------
-# Anchor / structured helpers
-# -----------------------
 def choose_best_recon_anchor_rows(struct_df):
     recon_best = {}
     if len(struct_df) == 0:
@@ -589,11 +538,9 @@ def choose_best_recon_anchor_rows(struct_df):
     preferred_cpts = set([
         "19357", "19340", "19342", "19361", "19364", "19367", "S2068"
     ])
-
     fallback_allowed_cpts = set([
         "19350", "19380"
     ])
-
     primary_exclude_cpts = set([
         "19325", "19330"
     ])
@@ -664,7 +611,6 @@ def choose_best_recon_anchor_rows(struct_df):
                 "source": source,
                 "cpt_code": cpt_code,
                 "procedure": clean_cell(row.get("PROCEDURE_STRUCT", "")),
-                "struct_date": struct_date.strftime("%Y-%m-%d") if struct_date else "",
                 "recon_laterality": lat,
                 "recon_type": rtype,
                 "recon_classification": rclass,
@@ -695,7 +641,6 @@ def build_structured_mastectomy_events(struct_df):
             event_dt = parse_date_safe(row.get("RECONSTRUCTION_DATE_STRUCT", ""))
 
         lat = infer_laterality(proc)
-        cpt = clean_cell(row.get("CPT_CODE_STRUCT", ""))
 
         if mrn not in out:
             out[mrn] = []
@@ -703,9 +648,7 @@ def build_structured_mastectomy_events(struct_df):
         out[mrn].append({
             "date": event_dt,
             "laterality": lat,
-            "source": clean_cell(row.get("STRUCT_SOURCE", "")),
-            "procedure": proc,
-            "cpt": cpt
+            "procedure": proc
         })
 
     return out
@@ -737,17 +680,44 @@ def choose_best_mastectomy_event(events, recon_dt):
     return best_prior
 
 
-# -----------------------
-# Main
-# -----------------------
-def main():
-    print("Seeding master with ORIGINAL output structure...")
-    master = seed_master_from_structured()
-    master = normalize_mrn(master)
-    if "ENCRYPTED_PAT_ID" in master.columns:
-        master["ENCRYPTED_PAT_ID"] = master["MRN"].astype(str).str.strip()
+def append_evidence_rows(existing_evid_df, new_rows):
+    if existing_evid_df is None:
+        return pd.DataFrame(new_rows)
 
-    print("Master seeded: {0} MRNs".format(len(master)))
+    if len(new_rows) == 0:
+        return existing_evid_df
+
+    add_df = pd.DataFrame(new_rows)
+    for c in existing_evid_df.columns:
+        if c not in add_df.columns:
+            add_df[c] = ""
+    for c in add_df.columns:
+        if c not in existing_evid_df.columns:
+            existing_evid_df[c] = ""
+    return pd.concat([existing_evid_df, add_df[existing_evid_df.columns]], ignore_index=True)
+
+
+def load_existing_evidence():
+    if os.path.exists(EVID_PATH):
+        return clean_cols(read_csv_robust(EVID_PATH))
+    return pd.DataFrame(columns=[
+        MERGE_KEY,
+        "NOTE_ID",
+        "NOTE_DATE",
+        "NOTE_TYPE",
+        "FIELD",
+        "VALUE",
+        "STATUS",
+        "CONFIDENCE",
+        "SECTION",
+        "EVIDENCE"
+    ])
+
+
+def main():
+    print("Loading EXISTING master...")
+    master = load_existing_master()
+    print("Existing master rows: {0}".format(len(master)))
 
     print("Loading notes...")
     notes_df = load_and_reconstruct_notes()
@@ -760,14 +730,11 @@ def main():
     recon_anchor_map = choose_best_recon_anchor_rows(struct_df)
     mastectomy_events_map = build_structured_mastectomy_events(struct_df)
 
-    print("Recon anchors found: {0}".format(len(recon_anchor_map)))
-    print("Structured mastectomy events found: {0}".format(len(mastectomy_events_map)))
-
     evidence_rows = []
     best_by_mrn = {}
     therapy_dates = {}
 
-    print("Running focused extractor...")
+    print("Running patch-only extractor...")
 
     for _, row in notes_df.iterrows():
         mrn = str(row[MERGE_KEY]).strip()
@@ -846,39 +813,36 @@ def main():
 
             existing = best_by_mrn[mrn].get(logical)
 
-            if logical in {"Radiation", "Chemo"}:
+            if logical in BOOLEAN_FIELDS:
                 best_by_mrn[mrn][logical] = merge_boolean(existing, c)
             else:
-                best_by_mrn[mrn][logical] = choose_categorical(existing, c)
+                best_by_mrn[mrn][logical] = choose_best(existing, c)
 
-    print("Aggregated focused predictions for {0} MRNs".format(len(best_by_mrn)))
+    print("Applying updates to EXISTING master only for target fields...")
 
-    for mrn in master[MERGE_KEY].astype(str).str.strip().tolist():
+    for mrn, fields in best_by_mrn.items():
         mask = (master[MERGE_KEY].astype(str).str.strip() == mrn)
         if not mask.any():
             continue
 
-        fields = best_by_mrn.get(mrn, {})
         recon_info = recon_anchor_map.get(mrn)
         recon_dt = parse_date_safe((recon_info or {}).get("recon_date", ""))
 
-        # direct note-based fields
         for logical, cand in fields.items():
             if logical == "Mastectomy_Date":
                 continue
 
             val = getattr(cand, "value", pd.NA)
 
-            if logical in {"Radiation", "Chemo"}:
+            if logical in BOOLEAN_FIELDS:
                 try:
                     val = 1 if bool(val) else 0
                 except Exception:
                     val = pd.NA
 
-            if logical in master.columns:
+            if logical in TARGET_FIELDS:
                 master.loc[mask, logical] = val
 
-        # structured fallback for reconstruction fields
         if recon_info is not None:
             current_val = clean_cell(master.loc[mask, "Recon_Laterality"].iloc[0])
             if not current_val and clean_cell(recon_info.get("recon_laterality", "")):
@@ -892,34 +856,13 @@ def main():
             if not current_val and clean_cell(recon_info.get("recon_classification", "")):
                 master.loc[mask, "Recon_Classification"] = recon_info["recon_classification"]
 
-            evidence_rows.append({
-                MERGE_KEY: mrn,
-                "NOTE_ID": "",
-                "NOTE_DATE": recon_info.get("recon_date", ""),
-                "NOTE_TYPE": "STRUCTURED_RECON_ANCHOR",
-                "FIELD": "Recon_Anchor",
-                "VALUE": recon_info.get("recon_date", ""),
-                "STATUS": "structured_fill",
-                "CONFIDENCE": "1.0",
-                "SECTION": "STRUCTURED_ENCOUNTER",
-                "EVIDENCE": "RECON_DATE={0} | SOURCE={1} | CPT={2} | PROCEDURE={3}".format(
-                    recon_info.get("recon_date", ""),
-                    recon_info.get("source", ""),
-                    recon_info.get("cpt_code", ""),
-                    recon_info.get("procedure", "")
-                )
-            })
-
-        # structured fallback for mastectomy laterality
         best_mast_ev = choose_best_mastectomy_event(mastectomy_events_map.get(mrn, []), recon_dt)
         current_mast_lat = clean_cell(master.loc[mask, "Mastectomy_Laterality"].iloc[0])
         if not current_mast_lat:
             if best_mast_ev is not None and clean_cell(best_mast_ev.get("laterality", "")):
                 master.loc[mask, "Mastectomy_Laterality"] = best_mast_ev["laterality"]
 
-        # derive timing
         timing_val = clean_cell(master.loc[mask, "Recon_Timing"].iloc[0])
-
         if not timing_val and recon_dt is not None:
             immediate = False
             delayed = False
@@ -947,17 +890,8 @@ def main():
             elif delayed:
                 master.loc[mask, "Recon_Timing"] = "Delayed"
 
-        # derive radiation before/after using recon anchor
         rad_dates = therapy_dates.get(mrn, {}).get("Radiation", [])
         chemo_dates = therapy_dates.get(mrn, {}).get("Chemo", [])
-
-        rad_any = len(rad_dates) > 0 or str(master.loc[mask, "Radiation"].iloc[0]) in {"1", "True", "true"}
-        chemo_any = len(chemo_dates) > 0 or str(master.loc[mask, "Chemo"].iloc[0]) in {"1", "True", "true"}
-
-        if rad_any:
-            master.loc[mask, "Radiation"] = 1
-        if chemo_any:
-            master.loc[mask, "Chemo"] = 1
 
         rad_before = 0
         rad_after = 0
@@ -983,26 +917,33 @@ def main():
                 elif dd > 0:
                     chemo_after = 1
 
+        if len(rad_dates) > 0:
+            master.loc[mask, "Radiation"] = 1
         master.loc[mask, "Radiation_Before"] = rad_before
         master.loc[mask, "Radiation_After"] = rad_after
-        master.loc[mask, "Chemo_Before"] = chemo_before
-        master.loc[mask, "Chemo_After"] = chemo_after
-
         if rad_before or rad_after:
             master.loc[mask, "Radiation"] = 1
+
+        if len(chemo_dates) > 0:
+            master.loc[mask, "Chemo"] = 1
+        master.loc[mask, "Chemo_Before"] = chemo_before
+        master.loc[mask, "Chemo_After"] = chemo_after
         if chemo_before or chemo_after:
             master.loc[mask, "Chemo"] = 1
 
-    os.makedirs(os.path.dirname(OUTPUT_MASTER), exist_ok=True)
-    master = master[MASTER_COLUMNS]
-    master.to_csv(OUTPUT_MASTER, index=False)
-    pd.DataFrame(evidence_rows).to_csv(OUTPUT_EVID, index=False)
+    print("Appending evidence without deleting old evidence...")
+    old_evid = load_existing_evidence()
+    new_evid = append_evidence_rows(old_evid, evidence_rows)
+
+    os.makedirs(os.path.dirname(MASTER_PATH), exist_ok=True)
+    master.to_csv(MASTER_PATH, index=False)
+    new_evid.to_csv(EVID_PATH, index=False)
 
     print("\nDONE.")
-    print("- Master (ORIGINAL NAME): {0}".format(OUTPUT_MASTER))
-    print("- Evidence (ORIGINAL NAME): {0}".format(OUTPUT_EVID))
+    print("- Patched existing master: {0}".format(MASTER_PATH))
+    print("- Appended evidence: {0}".format(EVID_PATH))
     print("\nRun:")
-    print(" python build_master_rule_CANCER_RECON_ONLY.py")
+    print(" python build_master_rule_CANCER_RECON_PATCH.py")
 
 
 if __name__ == "__main__":
