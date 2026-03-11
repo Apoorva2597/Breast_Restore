@@ -161,7 +161,7 @@ WEAK_TREATMENT_EXCLUDE_RX = re.compile(
 )
 
 
-def _is_operation_note(note_type: str) -> bool:
+def _is_operation_note(note_type):
     s = (note_type or "").lower()
     return (
         ("brief op" in s) or
@@ -172,7 +172,7 @@ def _is_operation_note(note_type: str) -> bool:
     )
 
 
-def _is_clinic_like(note_type: str) -> bool:
+def _is_clinic_like(note_type):
     s = (note_type or "").lower()
     pats = [
         "clinic", "progress", "office", "follow up", "follow-up",
@@ -203,13 +203,13 @@ def _emit(field, value, text, m, section, note, conf):
     )
 
 
-def _window(text: str, start: int, end: int, width: int = 160) -> str:
+def _window(text, start, end, width=160):
     lo = max(0, start - width)
     hi = min(len(text), end + width)
     return text[lo:hi]
 
 
-def _infer_laterality(text: str) -> Optional[str]:
+def _infer_laterality(text):
     low = (text or "").lower()
     if BILAT_RX.search(low):
         return "BILATERAL"
@@ -224,7 +224,7 @@ def _infer_laterality(text: str) -> Optional[str]:
     return None
 
 
-def _looks_negated_or_planned(ctx: str, op_note: bool) -> bool:
+def _looks_negated_or_planned(ctx, op_note):
     low = (ctx or "").lower()
     if NEGATION_RX.search(low):
         return True
@@ -233,7 +233,7 @@ def _looks_negated_or_planned(ctx: str, op_note: bool) -> bool:
     return False
 
 
-def _infer_recon_type_and_class(text: str) -> Tuple[Optional[str], Optional[str]]:
+def _infer_recon_type_and_class(text):
     low = (text or "").lower()
 
     flap_types_found = []
@@ -300,7 +300,7 @@ def _infer_recon_type_and_class(text: str) -> Tuple[Optional[str], Optional[str]
     return rtype, rclass
 
 
-def _infer_indications(text: str, lat: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+def _infer_indications(text, lat):
     low = (text or "").lower()
 
     left_val = None
@@ -339,20 +339,10 @@ def _infer_indications(text: str, lat: Optional[str]) -> Tuple[Optional[str], Op
         if right_val is None and right_cancer:
             right_val = "Therapeutic"
 
-    if lat == "LEFT" and left_val is None:
-        left_val = "None"
-    if lat == "RIGHT" and right_val is None:
-        right_val = "None"
-    if lat == "BILATERAL":
-        if left_val is None:
-            left_val = "None"
-        if right_val is None:
-            right_val = "None"
-
     return left_val, right_val
 
 
-def _strong_radiation_history(ctx: str) -> bool:
+def _strong_radiation_history(ctx):
     low = (ctx or "").lower()
     if WEAK_TREATMENT_EXCLUDE_RX.search(low):
         return False
@@ -363,7 +353,7 @@ def _strong_radiation_history(ctx: str) -> bool:
     return False
 
 
-def _strong_chemo_history(ctx: str) -> bool:
+def _strong_chemo_history(ctx):
     low = (ctx or "").lower()
     if WEAK_TREATMENT_EXCLUDE_RX.search(low):
         return False
@@ -376,7 +366,7 @@ def _strong_chemo_history(ctx: str) -> bool:
     return False
 
 
-def extract_breast_cancer_recon(note: SectionedNote) -> List[Candidate]:
+def extract_breast_cancer_recon(note):
     cands = []
     op_note = _is_operation_note(note.note_type)
     clinic_like = _is_clinic_like(note.note_type)
