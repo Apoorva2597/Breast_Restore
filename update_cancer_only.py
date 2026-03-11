@@ -1009,5 +1009,5 @@ def main():
     print("\nRun:")
     print(" python build_master_rule_CANCER_RECON_PATCH.py")
 
-    if __name__ == "__main__":
+if __name__ == "__main__":
     main()
