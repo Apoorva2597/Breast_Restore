@@ -54,21 +54,75 @@ RECON_RX = re.compile(
     re.IGNORECASE
 )
 
-SLNB_RX = re.compile(
-    r"\b("
-    r"sentinel\s+lymph\s+node\s+biopsy|"
-    r"sentinel\s+node\s+biopsy|"
-    r"\bSLNB\b|"
-    r"lymphatic\s+mapping"
-    r")\b",
-    re.IGNORECASE
-)
+# ------------------------------
+# Lymph node procedure patterns
+# ------------------------------
 
 ALND_RX = re.compile(
     r"\b("
     r"axillary\s+lymph\s+node\s+dissection|"
+    r"axillary\s+node\s+dissection|"
     r"axillary\s+dissection|"
+    r"axillary\s+clearance|"
+    r"completion\s+axillary\s+dissection|"
+    r"completion\s+axillary\s+lymph\s+node\s+dissection|"
+    r"completion\s+node\s+dissection|"
+    r"complete\s+axillary\s+dissection|"
+    r"lymph\s+node\s+dissection|"
     r"\bALND\b"
+    r")\b",
+    re.IGNORECASE
+)
+
+SLNB_RX = re.compile(
+    r"\b("
+    r"sentinel\s+lymph\s+node\s+biopsy|"
+    r"sentinel\s+node\s+biopsy|"
+    r"sentinel\s+lymph\s+node\s+excision|"
+    r"sentinel\s+node\s+excision|"
+    r"sentinel\s+lymphadenectomy|"
+    r"lymphatic\s+mapping|"
+    r"sentinel\s+node\s+mapping|"
+    r"sentinel\s+mapping|"
+    r"sentinel\s+nodes?\s+removed|"
+    r"sentinel\s+node\s+removed|"
+    r"\bSLNB\b"
+    r")\b",
+    re.IGNORECASE
+)
+
+LN_HISTORY_RX = re.compile(
+    r"\b("
+    r"hx\s+of|history\s+of|prior|previous|"
+    r"s/p|status\s+post|"
+    r"had|has\s+had|"
+    r"underwent|completed|received|"
+    r"done|performed|"
+    r"nodes?\s+removed|"
+    r"sentinel\s+nodes?\s+removed|"
+    r"axillary\s+dissection\s+performed|"
+    r"axillary\s+clearance\s+performed"
+    r")\b",
+    re.IGNORECASE
+)
+
+LN_COMPLETED_RX = re.compile(
+    r"\b("
+    r"s/p|status\s+post|underwent|completed|received|"
+    r"done|performed|had|has\s+had"
+    r")\b",
+    re.IGNORECASE
+)
+
+LN_PLAN_RX = re.compile(
+    r"\b("
+    r"plan|planned|planning|"
+    r"possible|possibly|"
+    r"consider|considered|candidate|"
+    r"may\s+need|might\s+need|"
+    r"if\s+positive|if\s+needed|potential|"
+    r"could\s+require|would\s+require|"
+    r"pending|depending\s+on|awaiting"
     r")\b",
     re.IGNORECASE
 )
@@ -118,7 +172,8 @@ PLANNED_RX = re.compile(
 
 PROPHYLAXIS_RX = re.compile(
     r"\b("
-    r"prophylactic|risk[- ]reducing|risk\s+reducing|preventive|contralateral\s+prophylactic"
+    r"prophylactic|risk[- ]reducing|risk\s+reducing|preventive|contralateral\s+prophylactic|"
+    r"\bCPM\b"
     r")\b",
     re.IGNORECASE
 )
@@ -178,15 +233,8 @@ CURRENT_PROCEDURE_CUE_RX = re.compile(
     r"procedure|procedures|operation|operative|surgery|surgical|"
     r"performed|we\s+performed|intraoperative|preoperative|postoperative|"
     r"placement|reconstruction\s+with|mastectomy\s+with|"
-    r"sentinel\s+lymph\s+node\s+biopsy|axillary\s+lymph\s+node\s+dissection"
-    r")\b",
-    re.IGNORECASE
-)
-
-LN_COMPLETED_RX = re.compile(
-    r"\b("
-    r"s/p|status\s+post|underwent|completed|had|has\s+had|"
-    r"received"
+    r"sentinel\s+lymph\s+node\s+biopsy|axillary\s+lymph\s+node\s+dissection|"
+    r"axillary\s+clearance|lymphatic\s+mapping"
     r")\b",
     re.IGNORECASE
 )
@@ -333,7 +381,7 @@ def _infer_indications(text, lat, op_note=False):
 
     side_left = r"left|lt"
     side_right = r"right|rt"
-    pro_terms = r"prophylactic|risk[- ]reducing|risk\s+reducing|preventive|contralateral\s+prophylactic"
+    pro_terms = r"prophylactic|risk[- ]reducing|risk\s+reducing|preventive|contralateral\s+prophylactic|cpm"
     cancer_terms = r"cancer|carcinoma|dcis|lcis|malignan|invasive|recurrent|idc|ilc"
 
     left_pro = _match_side_relation(low, side_left, pro_terms, 60)
@@ -415,22 +463,20 @@ def _lymphnode_value_from_text(text, op_note, clinic_like):
 
     alnd_match = ALND_RX.search(text)
     if alnd_match:
-        ctx = _window(low, alnd_match.start(), alnd_match.end(), 120)
-
+        ctx = _window(low, alnd_match.start(), alnd_match.end(), 140)
         if not _looks_negated_or_planned(ctx, op_note):
             if clinic_like:
-                if LN_COMPLETED_RX.search(ctx):
+                if LN_COMPLETED_RX.search(ctx) or LN_HISTORY_RX.search(ctx):
                     return "ALND", alnd_match
             if op_note and CURRENT_PROCEDURE_CUE_RX.search(ctx):
                 return "ALND", alnd_match
 
     slnb_match = SLNB_RX.search(text)
     if slnb_match:
-        ctx = _window(low, slnb_match.start(), slnb_match.end(), 120)
-
+        ctx = _window(low, slnb_match.start(), slnb_match.end(), 140)
         if not _looks_negated_or_planned(ctx, op_note):
             if clinic_like:
-                if LN_COMPLETED_RX.search(ctx):
+                if LN_COMPLETED_RX.search(ctx) or LN_HISTORY_RX.search(ctx):
                     return "SLNB", slnb_match
             if op_note and CURRENT_PROCEDURE_CUE_RX.search(ctx):
                 return "SLNB", slnb_match
@@ -556,7 +602,6 @@ def extract_breast_cancer_recon(note):
                         base_conf -= 0.10
                     cands.append(_emit("Indication_Right", right_ind, text, m, section, note, base_conf))
 
-                # Do not emit LymphNode here unless strong actual evidence is present.
                 lymph_value, lymph_match = _lymphnode_value_from_text(text, op_note, clinic_like)
                 if lymph_value == "ALND":
                     conf = 0.86 if clinic_like else 0.82
