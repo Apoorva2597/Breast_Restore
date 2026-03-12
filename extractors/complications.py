@@ -37,10 +37,18 @@ PREFERRED_SECTIONS = {
 LOW_VALUE_SECTIONS = {
     "PAST MEDICAL HISTORY",
     "PMH",
-    "PAST SURGICAL HISTORY",
-    "PSH",
     "MEDICATIONS",
     "SOCIAL HISTORY",
+}
+
+# sections to strongly suppress for revision/history leakage
+REVISION_SUPPRESS_SECTIONS = {
+    "PAST SURGICAL HISTORY",
+    "PSH",
+    "SURGICAL HISTORY",
+    "PROCEDURE HISTORY",
+    "PAST SURGICAL HISTORY/PROCEDURE HISTORY",
+    "PAST SURGICAL HISTORY / PROCEDURE HISTORY",
 }
 
 
@@ -57,6 +65,16 @@ PLAN_RX = re.compile(
     r"plan|planned|planning|scheduled|schedule|will|would|to be|consider|considered|"
     r"candidate for|upcoming|electing to proceed|discussed today|request was entered|"
     r"preoperative history and physical|pre-op|preop"
+    r")\b",
+    re.IGNORECASE
+)
+
+REVISION_PLAN_RX = re.compile(
+    r"\b("
+    r"will discuss|discuss revision|discuss nipple reconstruction|interested in revision|"
+    r"interested in undergoing|candidate for revision|may require revision|"
+    r"would like revision|wants revision|plan revision|planning revision|"
+    r"future revision|next stage of surgery|will include|upcoming procedure"
     r")\b",
     re.IGNORECASE
 )
@@ -110,20 +128,13 @@ COMPLICATION_REASON_RX = re.compile(
     re.IGNORECASE
 )
 
-REVISION_COMPLICATION_REASON_RX = re.compile(
-    r"\b("
-    r"capsular contracture|contracture|malposition|exposure|extrusion|rupture|"
-    r"implant malposition|painful scar|hypertrophic scar|open wound|dehiscence|"
-    r"fat necrosis|flap deformity due to necrosis|animation deformity|rippling"
-    r")\b",
-    re.IGNORECASE
-)
-
 RISK_DISCUSSION_RX = re.compile(
     r"\b("
     r"risk of|risks of|risks include|risk includes|possible complications|potential complications|"
+    r"potential consequences|possible need for|need for additional surgeries|"
     r"complications include|signs and symptoms of|counsel(ed|ing)? on|educated on|"
-    r"warning signs|what to expect|long-term maintenance/failure rate|maintenance/failure rate"
+    r"warning signs|what to expect|long-term maintenance/failure rate|maintenance/failure rate|"
+    r"if she develops|future procedures|we discussed the risks|risks and benefits"
     r")\b",
     re.IGNORECASE
 )
@@ -146,20 +157,52 @@ ROUTINE_STAGE2_EXCHANGE_RX = re.compile(
     re.IGNORECASE
 )
 
-# performed revision language that should count even if cosmetic
 REVISION_PERFORMED_RX = re.compile(
     r"\b("
     r"revision of (the )?(reconstructed )?breast|revision of reconstructed breast|"
     r"underwent revision|status post revision|s/p revision|"
     r"procedure performed|operations performed|operation performed|"
     r"capsulectomy|capsulotomy|capsulorrhaphy|fat grafting|fat transfer|lipofilling|"
-    r"scar revision|mastopexy|reduction|dog[- ]ear revision|standing cutaneous deformity"
+    r"scar revision|mastopexy|reduction|dog[- ]ear revision|standing cutaneous deformity|"
+    r"implant exchange|placement of new implants|exchange of .* implant|"
+    r"exchange of .* expander|revised bilateral breast reconstruction|"
+    r"breast lateralis?ation|capsulopexy"
     r")\b",
     re.IGNORECASE
 )
 
-NOT_REVISION_ONLY_RX = re.compile(
-    r"\bnipple reconstruction\b",
+# exclude nipple reconstruction by itself
+NIPPLE_ONLY_RX = re.compile(
+    r"\b("
+    r"nipple reconstruction|nipple-areola reconstruction|nipple areolar reconstruction|"
+    r"areolar reconstruction|skate flap|nipple-areolar complex reconstruction"
+    r")\b",
+    re.IGNORECASE
+)
+
+NIPPLE_WITH_REAL_REVISION_RX = re.compile(
+    r"\b("
+    r"implant|fat graft|fat transfer|capsulotomy|capsulectomy|capsulorrhaphy|"
+    r"exchange|revision of reconstructed breast|mastopexy|reduction"
+    r")\b",
+    re.IGNORECASE
+)
+
+# pathology / cancer necrosis leakage for minor comp
+PATHOLOGY_CONTEXT_RX = re.compile(
+    r"\b("
+    r"core biopsy|microcalcifications|dcis|pathology|margins|ductal carcinoma|"
+    r"lobular carcinoma|cribriform|solid patterns|grade\s+[1-4]|retroareolar|"
+    r"invasive ductal|carcinoma"
+    r")\b",
+    re.IGNORECASE
+)
+
+# strong history-list pattern
+SURGICAL_HISTORY_LINE_RX = re.compile(
+    r"(\b\d{1,2}/\d{1,2}/\d{2,4}\b.*\b(procedure|surgery|mastectomy|reconstruction|flap|implant|expander)\b)|"
+    r"(\b[A-Z][a-z]+\s+\d{1,2},\s+\d{4}\b.*\b(procedure|surgery|mastectomy|reconstruction|flap|implant|expander)\b)|"
+    r"(\b(?:port placement|mastectomy|hysterectomy|oophorectomy|biopsy|diep flap|tram flap)\b.*(?:\||□))",
     re.IGNORECASE
 )
 
@@ -265,7 +308,11 @@ REVISION_POS = [
     r"\bbalancing\s+procedure\b",
     r"\bmastopexy\b",
     r"\breduction\b",
+    r"\bimplant exchange\b",
+    r"\bexchange of .* implant\b",
+    r"\bexchange of .* expander\b",
 ]
+
 
 # --------------------------------------------------
 # Helpers
@@ -276,6 +323,8 @@ def _section_rank(section):
         return 0
     if s in LOW_VALUE_SECTIONS:
         return 2
+    if s in REVISION_SUPPRESS_SECTIONS:
+        return 3
     return 1
 
 
@@ -341,6 +390,8 @@ def _base_conf(section, note_type):
         conf += 0.08
     elif rank == 2:
         conf -= 0.08
+    elif rank == 3:
+        conf -= 0.12
     if "op" in nt or "operative" in nt or "operation" in nt:
         conf += 0.08
     return max(0.55, min(0.95, conf))
@@ -363,9 +414,30 @@ def _emit(field, value, status, evid, section, note, conf):
 def _current_complication_ok(low):
     if _is_risk_discussion(low):
         return False
+    if PATHOLOGY_CONTEXT_RX.search(low) and not _has_breast_recon_context(low):
+        return False
     if (_is_historical_only(low) or _is_resolved_only(low)) and not _has_acute_event(low):
         return False
     return True
+
+
+def _has_major_treatment_context(low):
+    return bool(re.search(
+        r"\b("
+        r"washout|debridement|admitted|iv antibiotics|readmitted|rehospitalized|"
+        r"explant|removal|evacuation|returned to the or|drain placed|aspirated"
+        r")\b",
+        low,
+        re.IGNORECASE
+    ))
+
+
+def _revision_history_block(section, low):
+    if (section or "").strip().upper() in REVISION_SUPPRESS_SECTIONS:
+        return True
+    if SURGICAL_HISTORY_LINE_RX.search(low):
+        return True
+    return False
 
 
 # --------------------------------------------------
@@ -390,12 +462,21 @@ def _extract_minor_comp(note):
         if _is_negated(low):
             cands.append(_emit("ComplicationSignal", False, "denied", evid, section, note, 0.60))
             continue
-        if _is_planned(low):
+
+        # allow true acute/treated complication even if note has some planning language elsewhere
+        if _is_planned(low) and not re.search(
+            r"\b(treated with|started on|prescribed|drain placed|aspirated|developed|cellulitis|seroma|hematoma|infection)\b",
+            low,
+            re.IGNORECASE
+        ):
             cands.append(_emit("ComplicationSignal", False, "planned", evid, section, note, 0.55))
             continue
+
         if not _current_complication_ok(low):
             continue
 
+        # if clearly major-treatment context, still emit raw signal;
+        # minor outcome will be derived later in patch script
         conf = _base_conf(section, note.note_type)
         if _has_acute_event(low):
             conf += 0.03
@@ -527,7 +608,7 @@ def _extract_revision(note):
         if not m:
             continue
 
-        evid = window_around(text, m.start(), m.end(), 280)
+        evid = window_around(text, m.start(), m.end(), 300)
         low = evid.lower()
 
         if _is_family(low):
@@ -535,22 +616,33 @@ def _extract_revision(note):
         if not _has_breast_recon_context(low):
             continue
 
+        # suppress surgical history blocks
+        if _revision_history_block(section, low):
+            continue
+
         if _is_negated(low):
             cands.append(_emit("StageOutcome_Revision", False, "denied", evid, section, note, 0.60))
             continue
-        if _is_planned(low):
+
+        # stronger planned suppression for revision
+        if _is_planned(low) or REVISION_PLAN_RX.search(low):
             cands.append(_emit("StageOutcome_Revision", False, "planned", evid, section, note, 0.55))
             continue
-        if NOT_REVISION_ONLY_RX.search(low):
-            continue
+
         if _is_risk_discussion(low):
             continue
-        if (_is_historical_only(low) or _is_resolved_only(low)) and not _has_acute_event(low):
+
+        # historical mention alone should not count
+        if (_is_historical_only(low) or _is_resolved_only(low)) and not (
+            REVISION_PERFORMED_RX.search(low) or _has_acute_event(low)
+        ):
             continue
 
-        # Relaxed revision logic:
-        # Count performed revision procedures, even if cosmetic/elective,
-        # as long as this is not just future planning or abstract discussion.
+        # nipple reconstruction alone should not count
+        if NIPPLE_ONLY_RX.search(low) and not NIPPLE_WITH_REAL_REVISION_RX.search(low):
+            continue
+
+        # require performed revision signal
         if not REVISION_PERFORMED_RX.search(low):
             continue
 
