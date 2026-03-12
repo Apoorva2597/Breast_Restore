@@ -68,7 +68,7 @@ import os
 import sys
 import pandas as pd
 
-MASTER_FILE = "_outputs/master_abstraction_rule_FINAL_NO_GOLD_with_stage2_preds.csv"
+MASTER_FILE = "_outputs/master_abstraction_rule_FINAL_NO_GOLD_with_stage2_preds_complications.csv"
 GOLD_FILE = "gold_cleaned_for_cedar.csv"
 
 MRN = "MRN"
