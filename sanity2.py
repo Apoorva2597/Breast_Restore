@@ -1,18 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-confusion_complications.py
-
-Compute confusion matrices for Stage1 and Stage2 complication variables.
-
-Input:
-    _outputs/validation_merged.csv
-
-Outputs:
-    printed confusion matrices
-"""
-
 import pandas as pd
 
 FILE = "_frozen_stage2/20260228_200052/validation_merged.csv"
@@ -32,56 +20,57 @@ COMPLICATION_VARS = [
     "Stage2_Revision",
 ]
 
-
 def normalize_binary(x):
     if pd.isna(x):
-        return 0
+        return pd.NA
     s = str(x).strip().lower()
     if s in {"1", "true", "yes", "y"}:
         return 1
-    return 0
-
+    if s in {"0", "false", "no", "n", ""}:
+        return 0
+    return pd.NA
 
 def confusion(pred, gold):
-    TP = ((pred == 1) & (gold == 1)).sum()
-    TN = ((pred == 0) & (gold == 0)).sum()
-    FP = ((pred == 1) & (gold == 0)).sum()
-    FN = ((pred == 0) & (gold == 1)).sum()
-    return TP, FP, FN, TN
-
+    tp = ((pred == 1) & (gold == 1)).sum()
+    fp = ((pred == 1) & (gold == 0)).sum()
+    fn = ((pred == 0) & (gold == 1)).sum()
+    tn = ((pred == 0) & (gold == 0)).sum()
+    return tp, fp, fn, tn
 
 def main():
-
     df = pd.read_csv(FILE, dtype=str)
 
     print("\nConfusion Matrices\n")
 
     for var in COMPLICATION_VARS:
-
-        pred_col = "PRED_" + var if "PRED_" + var in df.columns else var
-        gold_col = "GOLD_" + var if "GOLD_" + var in df.columns else var
+        pred_col = var + "_pred"
+        gold_col = var + "_gold"
 
         if pred_col not in df.columns or gold_col not in df.columns:
+            print("Skipping:", var)
             continue
 
         pred = df[pred_col].apply(normalize_binary)
         gold = df[gold_col].apply(normalize_binary)
 
-        TP, FP, FN, TN = confusion(pred, gold)
+        # only compare rows where gold is non-missing
+        mask = gold.notna()
+        pred = pred[mask].fillna(0)
+        gold = gold[mask]
 
-        print("\n", var)
+        tp, fp, fn, tn = confusion(pred, gold)
+
+        precision = float(tp) / float(tp + fp) if (tp + fp) else 0.0
+        recall = float(tp) / float(tp + fn) if (tp + fn) else 0.0
+
+        print("\n{0}".format(var))
         print("--------------------------")
-        print("TP:", TP)
-        print("FP:", FP)
-        print("FN:", FN)
-        print("TN:", TN)
-
-        precision = TP / (TP + FP) if (TP + FP) else 0
-        recall = TP / (TP + FN) if (TP + FN) else 0
-
+        print("TP:", int(tp))
+        print("FP:", int(fp))
+        print("FN:", int(fn))
+        print("TN:", int(tn))
         print("Precision:", round(precision, 3))
         print("Recall:", round(recall, 3))
-
 
 if __name__ == "__main__":
     main()
