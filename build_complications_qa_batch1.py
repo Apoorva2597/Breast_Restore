@@ -2,10 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
-build_complications_qa_batch1.py
+build_complications_qa_batch2.py
 
 Purpose:
-- Build a single-file QA sample for 5 complication outcome variables
+- Build a single-file QA sample for the 4 complication outcome variables
+  that still need focused review
 - Use existing master + complications evidence
 - Output ONE CSV
 - Final QA file contains NO MRN column
@@ -14,8 +15,14 @@ Sampling:
 - 10 predicted-positive rows per field
 - 10 predicted-negative rows per field
 
+Focused fields:
+- Stage1_MinorComp
+- Stage1_Revision
+- Stage2_MinorComp
+- Stage2_Revision
+
 Output:
-- /home/apokol/Breast_Restore/_outputs/complications_qa_batch1.csv
+- /home/apokol/Breast_Restore/_outputs/complications_qa_batch2.csv
 
 Python 3.6.8 compatible.
 """
@@ -28,16 +35,15 @@ BASE_DIR = "/home/apokol/Breast_Restore"
 
 MASTER_FILE = "{0}/_outputs/master_abstraction_rule_FINAL_NO_GOLD_with_stage2_preds_complications.csv".format(BASE_DIR)
 EVID_FILE = "{0}/_outputs/complications_patch_evidence.csv".format(BASE_DIR)
-OUTPUT_QA = "{0}/_outputs/complications_qa_batch1.csv".format(BASE_DIR)
+OUTPUT_QA = "{0}/_outputs/complications_qa_batch2.csv".format(BASE_DIR)
 
 MERGE_KEY = "MRN"
 
 FIELDS = [
-    "Stage1_Reoperation",
-    "Stage1_Rehospitalization",
-    "Stage1_Failure",
-    "Stage2_Reoperation",
-    "Stage2_Failure",
+    "Stage1_MinorComp",
+    "Stage1_Revision",
+    "Stage2_MinorComp",
+    "Stage2_Revision",
 ]
 
 POSITIVES_N = 10
@@ -119,7 +125,7 @@ def to_binary_01(x):
     return 0
 
 
-def truncate_text(x, limit=900):
+def truncate_text(x, limit=350):
     s = clean_cell(x)
     if len(s) <= limit:
         return s
@@ -222,7 +228,7 @@ def build_rows_for_field(master_df, best_evidence, field_name, positives_n, nega
             "note_type": clean_cell(ev.get("NOTE_TYPE", "")),
             "note_date": clean_cell(ev.get("NOTE_DATE", "")),
             "stage_assigned": clean_cell(ev.get("STAGE_ASSIGNED", "")),
-            "evidence_snippet": truncate_text(ev.get("EVIDENCE", ""), 900),
+            "evidence_snippet": truncate_text(ev.get("EVIDENCE", ""), 350),
         })
 
     for i, idx in enumerate(neg_idxs, 1):
@@ -244,7 +250,7 @@ def build_rows_for_field(master_df, best_evidence, field_name, positives_n, nega
             "note_type": clean_cell(ev.get("NOTE_TYPE", "")),
             "note_date": clean_cell(ev.get("NOTE_DATE", "")),
             "stage_assigned": clean_cell(ev.get("STAGE_ASSIGNED", "")),
-            "evidence_snippet": truncate_text(ev.get("EVIDENCE", ""), 900),
+            "evidence_snippet": truncate_text(ev.get("EVIDENCE", ""), 350),
         })
 
     return out
