@@ -46,6 +46,21 @@ Added:
 - Recon_Classification
 - Recon_Timing
 
+UPDATED STAGE 2 VALIDATION:
+Added:
+- PRED_HAS_STAGE2
+- Stage2_MinorComp
+- Stage2_Reoperation
+- Stage2_Rehospitalization
+- Stage2_MajorComp
+- Stage2_Failure
+- Stage2_Revision
+
+Reference only, not validated:
+- STAGE2_DATE
+- WINDOW_START
+- WINDOW_END
+
 Compatible with Python 3.6.8.
 """
 
@@ -53,7 +68,7 @@ import os
 import sys
 import pandas as pd
 
-MASTER_FILE = "_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv"
+MASTER_FILE = "_outputs/master_abstraction_rule_FINAL_NO_GOLD_with_stage2_preds.csv"
 GOLD_FILE = "gold_cleaned_for_cedar.csv"
 
 MRN = "MRN"
@@ -94,7 +109,14 @@ BINARY_VARS = [
     "Radiation_After",
     "Chemo",
     "Chemo_Before",
-    "Chemo_After"
+    "Chemo_After",
+    "PRED_HAS_STAGE2",
+    "Stage2_MinorComp",
+    "Stage2_Reoperation",
+    "Stage2_Rehospitalization",
+    "Stage2_MajorComp",
+    "Stage2_Failure",
+    "Stage2_Revision"
 ]
 
 ALL_VARIABLES = CATEGORICAL_VARS + NUMERIC_VARS + BINARY_VARS
@@ -589,3 +611,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
