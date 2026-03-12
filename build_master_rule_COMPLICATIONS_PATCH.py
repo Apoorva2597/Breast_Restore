@@ -10,6 +10,16 @@ Purpose:
 - DOES NOT overwrite original master
 - Writes a new patched master + evidence file
 
+Important update:
+- MinorComp is now DERIVED after aggregation
+- We no longer directly write MinorComp from ComplicationSignal
+- Final rule:
+    MinorComp = 1 only if:
+        any complication signal for that stage
+        AND Reoperation == 0
+        AND Rehospitalization == 0
+        AND Failure == 0
+
 Input master:
     /home/apokol/Breast_Restore/_outputs/master_abstraction_rule_FINAL_NO_GOLD_with_stage2_preds.csv
 
@@ -386,6 +396,7 @@ def field_for_stage(stage_label, base_field):
             "Revision": "Stage1_Revision",
         }
         return mapping.get(base_field)
+
     if stage_label == "STAGE2":
         mapping = {
             "MinorComp": "Stage2_MinorComp",
@@ -396,6 +407,7 @@ def field_for_stage(stage_label, base_field):
             "Revision": "Stage2_Revision",
         }
         return mapping.get(base_field)
+
     return None
 
 
@@ -403,6 +415,7 @@ def ensure_target_columns(master):
     for col in TARGET_FIELDS:
         if col not in master.columns:
             master[col] = 0
+
         master[col] = master[col].fillna(0)
 
         try:
@@ -426,6 +439,15 @@ def ensure_target_columns(master):
     return master
 
 
+def _cand_to01(cand):
+    if cand is None:
+        return 0
+    try:
+        return 1 if bool(getattr(cand, "value", "")) else 0
+    except Exception:
+        return 0
+
+
 def main():
     if not os.path.exists(MASTER_FILE):
         raise FileNotFoundError("Master file not found: {0}".format(MASTER_FILE))
@@ -433,7 +455,6 @@ def main():
     print("Loading master:", MASTER_FILE)
     master = clean_cols(read_csv_robust(MASTER_FILE))
     master = normalize_mrn(master)
-
     master = ensure_target_columns(master)
 
     master_lookup = {}
@@ -451,6 +472,9 @@ def main():
 
     evidence_rows = []
     best_by_mrn = {}
+
+    # raw complication-signal tracker by stage
+    comp_signal_by_mrn = {}
 
     for _, row in notes_df.iterrows():
         mrn = clean_cell(row.get(MERGE_KEY, ""))
@@ -501,24 +525,49 @@ def main():
         if mrn not in best_by_mrn:
             best_by_mrn[mrn] = {}
 
+        if mrn not in comp_signal_by_mrn:
+            comp_signal_by_mrn[mrn] = {
+                "STAGE1": None,
+                "STAGE2": None,
+            }
+
         for c in cands:
+            raw_field = str(getattr(c, "field", ""))
+
+            # Track raw complication signal separately; do NOT directly map to MinorComp
+            if raw_field == "ComplicationSignal":
+                existing_signal = comp_signal_by_mrn[mrn].get(stage_label)
+                comp_signal_by_mrn[mrn][stage_label] = merge_boolean(existing_signal, c)
+
+                evidence_rows.append({
+                    MERGE_KEY: mrn,
+                    "NOTE_ID": getattr(c, "note_id", row.get("NOTE_ID", "")),
+                    "NOTE_DATE": getattr(c, "note_date", row.get("NOTE_DATE", "")),
+                    "NOTE_TYPE": getattr(c, "note_type", row.get("NOTE_TYPE", "")),
+                    "STAGE_ASSIGNED": stage_label,
+                    "FIELD": "RAW_{0}_ComplicationSignal".format(stage_label),
+                    "VALUE": getattr(c, "value", ""),
+                    "STATUS": getattr(c, "status", ""),
+                    "CONFIDENCE": getattr(c, "confidence", ""),
+                    "SECTION": getattr(c, "section", ""),
+                    "EVIDENCE": getattr(c, "evidence", "")
+                })
+                continue
+
             logical_fields = []
 
-            if str(c.field) == "ComplicationSignal":
-                logical_fields.append(field_for_stage(stage_label, "MinorComp"))
-
-            elif str(c.field) == "StageOutcome_Reoperation":
+            if raw_field == "StageOutcome_Reoperation":
                 logical_fields.append(field_for_stage(stage_label, "Reoperation"))
                 logical_fields.append(field_for_stage(stage_label, "MajorComp"))
 
-            elif str(c.field) == "StageOutcome_Rehospitalization":
+            elif raw_field == "StageOutcome_Rehospitalization":
                 logical_fields.append(field_for_stage(stage_label, "Rehospitalization"))
                 logical_fields.append(field_for_stage(stage_label, "MajorComp"))
 
-            elif str(c.field) == "StageOutcome_Failure":
+            elif raw_field == "StageOutcome_Failure":
                 logical_fields.append(field_for_stage(stage_label, "Failure"))
 
-            elif str(c.field) == "StageOutcome_Revision":
+            elif raw_field == "StageOutcome_Revision":
                 logical_fields.append(field_for_stage(stage_label, "Revision"))
 
             for logical in logical_fields:
@@ -544,20 +593,49 @@ def main():
 
     print("Aggregated complication predictions for MRNs:", len(best_by_mrn))
 
+    # write direct stage outcomes first
     for mrn, fields in best_by_mrn.items():
         mask = (master[MERGE_KEY].astype(str).str.strip() == mrn)
         if not mask.any():
             continue
 
         for logical, cand in fields.items():
-            val = getattr(cand, "value", "")
-            try:
-                val = 1 if bool(val) else 0
-            except Exception:
-                val = 0
+            val = _cand_to01(cand)
             master.loc[mask, logical] = val
 
-    # final cleanup so blanks never remain in outcome columns
+    # derive MinorComp AFTER final stage-level outcomes are in place
+    for mrn, stage_signals in comp_signal_by_mrn.items():
+        mask = (master[MERGE_KEY].astype(str).str.strip() == mrn)
+        if not mask.any():
+            continue
+
+        # Stage 1
+        s1_signal = _cand_to01(stage_signals.get("STAGE1"))
+        s1_reop = to_bool01(master.loc[mask, "Stage1_Reoperation"].iloc[0])
+        s1_rehosp = to_bool01(master.loc[mask, "Stage1_Rehospitalization"].iloc[0])
+        s1_failure = to_bool01(master.loc[mask, "Stage1_Failure"].iloc[0])
+
+        s1_minor = 1 if (s1_signal == 1 and s1_reop == 0 and s1_rehosp == 0 and s1_failure == 0) else 0
+        master.loc[mask, "Stage1_MinorComp"] = s1_minor
+
+        # Stage 2
+        s2_signal = _cand_to01(stage_signals.get("STAGE2"))
+        s2_reop = to_bool01(master.loc[mask, "Stage2_Reoperation"].iloc[0])
+        s2_rehosp = to_bool01(master.loc[mask, "Stage2_Rehospitalization"].iloc[0])
+        s2_failure = to_bool01(master.loc[mask, "Stage2_Failure"].iloc[0])
+
+        s2_minor = 1 if (s2_signal == 1 and s2_reop == 0 and s2_rehosp == 0 and s2_failure == 0) else 0
+        master.loc[mask, "Stage2_MinorComp"] = s2_minor
+
+    # for patients with no raw signal at all, force MinorComp to 0
+    known_signal_mrns = set(comp_signal_by_mrn.keys())
+    for idx in master.index:
+        mrn = clean_cell(master.at[idx, MERGE_KEY])
+        if mrn not in known_signal_mrns:
+            master.at[idx, "Stage1_MinorComp"] = 0
+            master.at[idx, "Stage2_MinorComp"] = 0
+
+    # final cleanup
     for col in TARGET_FIELDS:
         master[col] = (
             master[col]
@@ -582,6 +660,7 @@ def main():
     print("\nDONE.")
     print("Patched master:", OUTPUT_MASTER)
     print("Evidence file:", OUTPUT_EVID)
+    print("MinorComp now derived after aggregation.")
 
 
 if __name__ == "__main__":
