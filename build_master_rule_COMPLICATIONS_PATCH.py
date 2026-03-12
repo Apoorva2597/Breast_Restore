@@ -44,7 +44,7 @@ NOTE_GLOBS = [
 MERGE_KEY = "MRN"
 
 from models import SectionedNote  # noqa: E402
-from extractors.complications_outcomes import extract_complication_outcomes  # noqa: E402
+from extractors.complications import extract_complication_outcomes  # noqa: E402
 
 
 TARGET_FIELDS = [
