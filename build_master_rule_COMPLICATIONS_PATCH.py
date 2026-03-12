@@ -401,7 +401,7 @@ def field_for_stage(stage_label, base_field):
 def ensure_target_columns(master):
     for col in TARGET_FIELDS:
         if col not in master.columns:
-            master[col] = ""
+            master[col] = master[col].fillna(0)
     for col in BOOLEAN_FIELDS:
         if col not in master.columns:
             master[col] = 0
