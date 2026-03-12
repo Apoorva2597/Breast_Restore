@@ -15,7 +15,7 @@ Outputs:
 
 import pandas as pd
 
-FILE = "_outputs/validation_merged.csv"
+FILE = "_frozen_stage2/20260228_200052/validation_merged.csv"
 
 COMPLICATION_VARS = [
     "Stage1_MinorComp",
