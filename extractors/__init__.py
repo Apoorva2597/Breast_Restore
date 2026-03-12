@@ -11,7 +11,7 @@ from .pbs import extract_pbs
 from .mastectomy import extract_mastectomy
 from .age import extract_age
 from .cancer_treatment import extract_cancer_treatment
-from .complications import extract_stage1_outcomes
+from .complications import extract_complication_outcomes
 
 
 
