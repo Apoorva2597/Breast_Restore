@@ -116,7 +116,13 @@ BINARY_VARS = [
     "Stage2_Rehospitalization",
     "Stage2_MajorComp",
     "Stage2_Failure",
-    "Stage2_Revision"
+    "Stage2_Revision",
+    "Stage1_MinorComp",
+    "Stage1_Reoperation",
+    "Stage1_Rehospitalization",
+    "Stage1_MajorComp",
+    "Stage1_Failure",
+    "Stage1_Revision"
 ]
 
 ALL_VARIABLES = CATEGORICAL_VARS + NUMERIC_VARS + BINARY_VARS
