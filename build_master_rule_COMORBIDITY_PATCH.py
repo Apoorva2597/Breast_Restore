@@ -5,7 +5,6 @@
 update_comorbidity_only.py
 
 Comorbidity-only updater for:
-- Obesity
 - Diabetes
 - Hypertension
 - CardiacDisease
@@ -13,11 +12,11 @@ Comorbidity-only updater for:
 - Steroid
 
 Strategy:
-- Use the same BASE_DIR / NOTE_GLOBS / output style as update_pbs_only.py
-- Reconstruct notes from HPI11526 note files
-- Extract only the comorbidity fields above
-- Update only these columns in the existing master
-- Preserve all other master abstractions
+- Uses Breast_Restore paths and note reconstruction style
+- Updates only these comorbidity columns in the existing master
+- Preserves all other master abstractions
+- Adds stronger template/list/pertinent-negative/risk-form suppression
+- Excludes obesity entirely
 
 Outputs:
 1) /home/apokol/Breast_Restore/_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv
@@ -40,15 +39,6 @@ OUTPUT_EVID = "{0}/_outputs/comorbidity_only_evidence.csv".format(BASE_DIR)
 
 MERGE_KEY = "MRN"
 
-STRUCT_GLOBS = [
-    "{0}/**/HPI11526*Clinic Encounters.csv".format(BASE_DIR),
-    "{0}/**/HPI11526*Inpatient Encounters.csv".format(BASE_DIR),
-    "{0}/**/HPI11526*Operation Encounters.csv".format(BASE_DIR),
-    "{0}/**/HPI11526*clinic encounters.csv".format(BASE_DIR),
-    "{0}/**/HPI11526*inpatient encounters.csv".format(BASE_DIR),
-    "{0}/**/HPI11526*operation encounters.csv".format(BASE_DIR),
-]
-
 NOTE_GLOBS = [
     "{0}/**/HPI11526*Clinic Notes.csv".format(BASE_DIR),
     "{0}/**/HPI11526*Inpatient Notes.csv".format(BASE_DIR),
@@ -61,13 +51,14 @@ NOTE_GLOBS = [
 from models import Candidate, SectionedNote  # noqa: E402
 
 COMORBIDITY_FIELDS = [
-    "Obesity",
     "Diabetes",
     "Hypertension",
     "CardiacDisease",
     "VenousThromboembolism",
     "Steroid",
 ]
+
+BOOLEAN_FIELDS = set(COMORBIDITY_FIELDS)
 
 
 def read_csv_robust(path):
@@ -159,6 +150,7 @@ HEADER_RX = re.compile(r"^\s*([A-Z][A-Z0-9 /&\-\(\)]{2,80})\s*:\s*$")
 def sectionize(text):
     if not text:
         return {"FULL": ""}
+
     lines = text.splitlines()
     sections = {}
     current = "FULL"
@@ -306,10 +298,16 @@ def load_and_reconstruct_notes():
     return pd.DataFrame(reconstructed)
 
 
+# =========================================================
+# Revised extractor logic
+# =========================================================
+
 SUPPRESS_SECTIONS = {
     "FAMILY HISTORY",
     "ALLERGIES",
     "REVIEW OF SYSTEMS",
+    "ROS",
+    "PERTINENT NEGATIVES",
 }
 
 PREFERRED_SECTIONS = {
@@ -321,12 +319,13 @@ PREFERRED_SECTIONS = {
     "ASSESSMENT AND PLAN",
     "MEDICAL HISTORY",
     "PROBLEM LIST",
-    "ANESTHESIA",
-    "ANESTHESIA H&P",
-    "PREOPERATIVE DIAGNOSIS",
-    "POSTOPERATIVE DIAGNOSIS",
+    "PAST HISTORY",
     "DIAGNOSIS",
     "IMPRESSION",
+    "PREOPERATIVE DIAGNOSIS",
+    "POSTOPERATIVE DIAGNOSIS",
+    "ANESTHESIA",
+    "ANESTHESIA H&P",
 }
 
 LOW_VALUE_SECTIONS = {
@@ -348,7 +347,18 @@ FAMILY_RX = re.compile(
     re.I
 )
 
-HISTORICAL_ONLY_RX = re.compile(r"\b(history of|hx of|h/o|s/p|status post)\b", re.I)
+HISTORICAL_ONLY_RX = re.compile(
+    r"\b(history of|hx of|h/o|s/p|status post|prior|previous|remote)\b",
+    re.I
+)
+
+PERTINENT_NEGATIVES_RX = re.compile(r"\bpertinent negatives?\b", re.I)
+ROS_RX = re.compile(r"\breview of systems\b|\bros\b", re.I)
+PROBLEM_LIST_RX = re.compile(r"\b(patient active problem list|active problem list|problem list|diagnosis list)\b", re.I)
+RISK_FORM_RX = re.compile(
+    r"\b(vte risk assessment|risk assessment|risk score|caprini|risk factors score|thrombosis risk assessment)\b",
+    re.I
+)
 
 SYSTEMIC_STEROID_EXCLUDE_RX = re.compile(
     r"\b(inhaled|inhaler|intranasal|nasal|topical|cream|ointment|lotion|eye\s*drops?|otic|ear\s*drops?)\b",
@@ -365,31 +375,34 @@ VTE_PROPHYLAXIS_RX = re.compile(
     re.I
 )
 
+VTE_RISK_EXCLUDE_RX = re.compile(
+    r"\b(vte risk|risk of dvt|risk of pe|risk of pulmonary embolism|caprini|venous thromboembolism risk assessment)\b",
+    re.I
+)
+
+# Dense templated comorbidity list patterns seen in QA
+TEMPLATE_COMORB_LIST_RX = re.compile(
+    r"\b(asthma|cad|copd|dvt|diabetes mellitus|mi|pulmonary embolism|sleep apnea|stroke)\b",
+    re.I
+)
+
+DIABETES_DM_AMBIG_RX = re.compile(
+    r"\bdm\b",
+    re.I
+)
+
 CONCEPTS = {
-    "Obesity": {
-        "pos": [
-            r"\bobesity\b",
-            r"\bobese\b",
-            r"\bmorbid obesity\b",
-            r"\bbmi\s*(>|>=)?\s*30\b",
-            r"\bbmi\s*(>|>=)?\s*3\d(?:\.\d+)?\b",
-            r"\boverweight\b",
-        ],
-        "exclude": [],
-        "base_conf": 0.80,
-    },
     "Diabetes": {
         "pos": [
             r"\bdiabetes\b",
             r"\bdiabetes mellitus\b",
-            r"\bdm\b",
+            r"\btype\s*(i|ii|1|2)\s*diabetes\b",
+            r"\btype\s*(i|ii|1|2)\s*diabetes mellitus\b",
             r"\bt1dm\b",
             r"\bt2dm\b",
-            r"\btype\s*(i|ii|1|2)\s*diabetes\b",
-            r"\binsulin[- ]dependent diabetes\b",
-            r"\bnon[- ]insulin[- ]dependent diabetes\b",
             r"\biddm\b",
             r"\bniddm\b",
+            r"\bdiabetic\b",
         ],
         "exclude": [
             r"\bprediabet(es|ic)\b",
@@ -398,6 +411,9 @@ CONCEPTS = {
             r"\bigt\b",
             r"\bgestational diabetes\b",
             r"\bdiabetes insipidus\b",
+            r"\bearly diabetes\b",
+            r"\bpossible diabetes\b",
+            r"\blikely from the decadron\b",
         ],
         "base_conf": 0.84,
     },
@@ -414,6 +430,8 @@ CONCEPTS = {
             r"\bpreeclampsia\b",
             r"\beclampsia\b",
             r"\bwhite coat hypertension\b",
+            r"\bwhite coat\b",
+            r"\bin office hypertension\b",
         ],
         "base_conf": 0.84,
     },
@@ -436,6 +454,12 @@ CONCEPTS = {
             r"\bmitral valve prolapse\b",
             r"\bvalvular\b",
             r"\bheart murmur\b",
+            r"\brisk of cardiomyopathy\b",
+            r"\brisk of heart failure\b",
+            r"\brisk of cardiac dysfunction\b",
+            r"\bcardiac monitoring\b",
+            r"\bechocardiogram monitoring\b",
+            r"\bbaseline echo\b",
         ],
         "base_conf": 0.82,
     },
@@ -446,8 +470,18 @@ CONCEPTS = {
             r"\bpulmonary embol(ism)?\b",
             r"\bpe\b",
             r"\bvte\b",
+            r"\bhistory of dvt\b",
+            r"\bhistory of pe\b",
+            r"\bhistory of pulmonary embolism\b",
+            r"\bhistory of deep vein thrombosis\b",
         ],
-        "exclude": [],
+        "exclude": [
+            r"\brisk of dvt\b",
+            r"\brisk of pe\b",
+            r"\brisk of pulmonary embolism\b",
+            r"\brisk of thrombosis\b",
+            r"\bconcerned about the risk for dvt\b",
+        ],
         "base_conf": 0.82,
     },
     "Steroid": {
@@ -458,6 +492,7 @@ CONCEPTS = {
             r"\bsolu[- ]medrol\b",
             r"\bmedrol\b",
             r"\bhydrocortisone\b",
+            r"\bsolu[- ]cortef\b",
             r"\bchronic steroid(s)?\b",
             r"\blong[- ]term steroid(s)?\b",
             r"\bsystemic steroid(s)?\b",
@@ -475,6 +510,13 @@ DM_MED_STRONG = [
     r"\blevemir\b",
     r"\bmetformin\b",
 ]
+
+# Optional steroid tightening for chemo/premed contexts if desired later.
+# Keeping broad for now because your QA looked fairly good.
+STEROID_CONTEXT_WEAK_RX = re.compile(
+    r"\b(antiemetic|premed|premedication|chemotherapy premed|before chemo|start before chemo)\b",
+    re.I
+)
 
 
 def _emit(field, value, status, evid, section, note, conf):
@@ -555,6 +597,76 @@ def _concept_confidence(section, base):
     return base
 
 
+def _looks_like_template_list(low):
+    # Dense comorbidity template blocks from QA:
+    # "Asthma CAD COPD DVT Diabetes Mellitus MI Pulmonary Embolism ..."
+    hits = len(re.findall(
+        r"\b(asthma|cad|copd|dvt|diabetes mellitus|mi|pulmonary embolism|sleep apnea|stroke)\b",
+        low,
+        re.I
+    ))
+    return hits >= 3
+
+
+def _is_bad_template_context(field, section, evid):
+    low = clean_cell(evid).lower()
+    sec = clean_cell(section).lower()
+
+    if not low:
+        return True
+
+    if "pertinent negatives" in low or "pertinent negative" in low:
+        return True
+
+    if ROS_RX.search(low) or ROS_RX.search(sec):
+        return True
+
+    if PROBLEM_LIST_RX.search(low) and _looks_like_template_list(low):
+        return True
+
+    if _looks_like_template_list(low) and ("pertinent negatives" in low or "patient active problem list" in low):
+        return True
+
+    if field == "VenousThromboembolism":
+        if RISK_FORM_RX.search(low) or VTE_RISK_EXCLUDE_RX.search(low):
+            return True
+
+    return False
+
+
+def _field_specific_extra_reject(field, evid):
+    low = clean_cell(evid).lower()
+
+    if field == "CardiacDisease":
+        if "risk of cardiomyopathy" in low:
+            return True
+        if "risk of heart failure" in low:
+            return True
+        if "cardiac monitoring" in low or "echocardiogram monitoring" in low:
+            return True
+        if "baseline echocardiogram" in low or "baseline echo" in low:
+            return True
+
+    if field == "Diabetes":
+        # avoid isolated ambiguous "DM" unless stronger evidence exists nearby
+        if DIABETES_DM_AMBIG_RX.search(low):
+            stronger = re.search(
+                r"\b(diabetes|diabetes mellitus|type 1 diabetes|type 2 diabetes|t1dm|t2dm|metformin|insulin|a1c)\b",
+                low,
+                re.I
+            )
+            if not stronger:
+                return True
+
+    if field == "VenousThromboembolism":
+        if "risk for dvt" in low or "risk of dvt" in low or "risk of pe" in low:
+            return True
+        if "vte risk assessment" in low or "risk factors score" in low or "caprini" in low:
+            return True
+
+    return False
+
+
 def _extract_concept(field, note):
     cfg = CONCEPTS[field]
     cands = []
@@ -564,17 +676,24 @@ def _extract_concept(field, note):
         if not m:
             continue
 
-        evid = window_around(text, m.start(), m.end(), 220)
+        evid = window_around(text, m.start(), m.end(), 260)
         low = evid.lower()
 
         if _family_context(low):
             continue
 
+        if _is_bad_template_context(field, section, evid):
+            continue
+
         if cfg.get("exclude") and _has_any(cfg["exclude"], low):
             continue
 
-        if field == "VenousThromboembolism" and VTE_PROPHYLAXIS_RX.search(low):
+        if _field_specific_extra_reject(field, evid):
             continue
+
+        if field == "VenousThromboembolism":
+            if VTE_PROPHYLAXIS_RX.search(low):
+                continue
 
         if field == "Steroid":
             if SYSTEMIC_STEROID_EXCLUDE_RX.search(low):
@@ -610,15 +729,30 @@ def _extract_diabetes_med_inference(note):
         if not m:
             continue
 
-        evid = window_around(text, m.start(), m.end(), 220)
+        evid = window_around(text, m.start(), m.end(), 260)
         low = evid.lower()
 
         if _family_context(low):
             continue
+
+        if _is_bad_template_context("Diabetes", section, evid):
+            continue
+
         if _has_any(CONCEPTS["Diabetes"]["exclude"], low):
             continue
+
         if _is_negated(low):
             continue
+
+        # Metformin alone can be weak; require some diabetes-related context
+        if re.search(r"\bmetformin\b", low, re.I):
+            stronger = re.search(
+                r"\b(diabetes|diabetes mellitus|dm|t2dm|type 2 diabetes|a1c|glucose)\b",
+                low,
+                re.I
+            )
+            if not stronger:
+                continue
 
         conf = _concept_confidence(section, 0.76)
         cands.append(_emit(
@@ -639,7 +773,6 @@ def _extract_diabetes_med_inference(note):
 
 def extract_comorbidities(note):
     cands = []
-    cands.extend(_extract_concept("Obesity", note))
     cands.extend(_extract_concept("Diabetes", note))
     cands.extend(_extract_diabetes_med_inference(note))
     cands.extend(_extract_concept("Hypertension", note))
@@ -679,12 +812,11 @@ def choose_better_boolean(existing, new):
 
 COMORBIDITY_PREFILTER = re.compile(
     r"\b("
-    r"obesity|obese|overweight|bmi|"
-    r"diabetes|dm|t1dm|t2dm|insulin|metformin|"
+    r"diabetes|diabetes mellitus|diabetic|dm|t1dm|t2dm|insulin|metformin|a1c|glucose|"
     r"hypertension|htn|high blood pressure|"
-    r"cad|coronary artery disease|chf|heart failure|mi|afib|a-fib|cardiomyopathy|"
+    r"cad|coronary artery disease|chf|heart failure|mi|atrial fibrillation|afib|a-fib|cardiomyopathy|"
     r"dvt|deep vein thrombosis|pe|pulmonary embol|vte|"
-    r"prednisone|dexamethasone|methylprednisolone|medrol|hydrocortisone|steroid"
+    r"prednisone|dexamethasone|methylprednisolone|medrol|hydrocortisone|solu-cortef|steroid"
     r")\b",
     re.I
 )
@@ -705,6 +837,7 @@ def main():
     notes_df = load_and_reconstruct_notes()
     print("Reconstructed notes: {0}".format(len(notes_df)))
 
+    # keep only these fields controlled by this updater
     for c in COMORBIDITY_FIELDS:
         master[c] = 0
 
@@ -769,12 +902,18 @@ def main():
             accept = False
             reason = ""
 
-            if status == "denied":
-                accept = False
-                reason = "reject_denied"
-            elif not evid:
+            if not evid:
                 accept = False
                 reason = "reject_no_evidence"
+            elif status == "denied":
+                accept = False
+                reason = "reject_denied"
+            elif _is_bad_template_context(field, getattr(c, "section", ""), evid):
+                accept = False
+                reason = "reject_template_context"
+            elif _field_specific_extra_reject(field, evid):
+                accept = False
+                reason = "reject_field_specific_context"
             else:
                 accept = True
                 reason = "accept_positive"
@@ -786,7 +925,7 @@ def main():
                 "NOTE_TYPE": getattr(c, "note_type", row["NOTE_TYPE"]),
                 "FIELD": field,
                 "VALUE": getattr(c, "value", True),
-                "STATUS": status,
+                "STATUS": getattr(c, "status", ""),
                 "CONFIDENCE": getattr(c, "confidence", ""),
                 "SECTION": getattr(c, "section", ""),
                 "RULE_DECISION": reason,
