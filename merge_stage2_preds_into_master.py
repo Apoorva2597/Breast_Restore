@@ -4,29 +4,40 @@
 """
 merge_stage2_preds_into_master.py
 
+Run from:
+    /home/apokol/Breast_Restore
+
 Purpose:
-Safely merge Stage 2 staging prediction columns from:
-    /home/apokol/Breast_Restore/_frozen_stage2/20260628_200052/validation_merged.csv
-
-into:
-    /home/apokol/Breast_Restore/_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv
-
-Behavior:
-- Left merge on MRN
-- Adds only selected staging columns
-- Does NOT overwrite master in place
-- Writes a new merged file
+- Merge selected Stage 2 staging columns from validation_merged.csv
+- Into the master file
+- Left join on MRN
+- Write a new safe output file
 - Python 3.6.8 compatible
 """
 
 import os
 import pandas as pd
 
-BASE_DIR = "/home/apokol/Breast_Restore"
+BASE_DIR = os.getcwd()
 
-MASTER_FILE = "{0}/_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv".format(BASE_DIR)
-STAGE_FILE = "{0}/_frozen_stage2/20260628_200052/validation_merged.csv".format(BASE_DIR)
-OUTPUT_FILE = "{0}/_outputs/master_abstraction_rule_FINAL_NO_GOLD_with_stage2_preds.csv".format(BASE_DIR)
+MASTER_FILE = os.path.join(
+    BASE_DIR,
+    "_outputs",
+    "master_abstraction_rule_FINAL_NO_GOLD.csv"
+)
+
+STAGE_FILE = os.path.join(
+    BASE_DIR,
+    "_frozen_stage2",
+    "20260628_200052",
+    "validation_merged.csv"
+)
+
+OUTPUT_FILE = os.path.join(
+    BASE_DIR,
+    "_outputs",
+    "master_abstraction_rule_FINAL_NO_GOLD_with_stage2_preds.csv"
+)
 
 MERGE_KEY = "MRN"
 
@@ -113,7 +124,6 @@ def ensure_stage_cols(stage_df, needed_cols):
         raise RuntimeError("Missing required staging columns: {0}".format(missing))
 
 def dedupe_stage(stage_df):
-    # Prefer rows with any non-empty stage prediction/date/window content
     value_cols = [c for c in STAGE_COLS if c != MERGE_KEY]
 
     def score_row(row):
@@ -131,16 +141,19 @@ def dedupe_stage(stage_df):
     return tmp
 
 def main():
+    print("Working directory:", BASE_DIR)
+    print("Master file:", MASTER_FILE)
+    print("Stage file:", STAGE_FILE)
+    print("Output file:", OUTPUT_FILE)
+
     if not os.path.exists(MASTER_FILE):
         raise FileNotFoundError("Master file not found: {0}".format(MASTER_FILE))
     if not os.path.exists(STAGE_FILE):
         raise FileNotFoundError("Stage file not found: {0}".format(STAGE_FILE))
 
-    print("Loading master:", MASTER_FILE)
     master = clean_cols(read_csv_robust(MASTER_FILE))
     master = normalize_mrn(master)
 
-    print("Loading stage file:", STAGE_FILE)
     stage = clean_cols(read_csv_robust(STAGE_FILE))
     stage = normalize_mrn(stage)
 
@@ -148,42 +161,38 @@ def main():
 
     master_rows_before = len(master)
 
-    # Keep only requested columns from stage file
     stage_subset = stage[STAGE_COLS].copy()
     stage_subset = dedupe_stage(stage_subset)
 
-    # Do not duplicate columns already in master except MERGE_KEY
     merge_cols = [MERGE_KEY]
     added_cols = []
+
     for c in STAGE_COLS:
         if c == MERGE_KEY:
             continue
         if c in master.columns:
-            print("Column already exists in master, skipping:", c)
+            print("Column already in master, skipping:", c)
         else:
             merge_cols.append(c)
             added_cols.append(c)
 
     stage_subset = stage_subset[merge_cols]
 
-    print("Rows in master before merge:", master_rows_before)
-    print("Unique MRNs in stage subset:", stage_subset[MERGE_KEY].nunique())
-    print("Columns being added:", added_cols)
-
     merged = master.merge(stage_subset, on=MERGE_KEY, how="left")
 
-    master_rows_after = len(merged)
-    if master_rows_after != master_rows_before:
+    if len(merged) != master_rows_before:
         raise RuntimeError(
             "Row count changed after merge. Before={0}, After={1}".format(
-                master_rows_before, master_rows_after
+                master_rows_before, len(merged)
             )
         )
 
-    print("Rows in master after merge:", master_rows_after)
-
     merged.to_csv(OUTPUT_FILE, index=False)
-    print("Wrote merged file:", OUTPUT_FILE)
+
+    print("Done.")
+    print("Rows in master:", master_rows_before)
+    print("Columns added:", added_cols)
+    print("Wrote:", OUTPUT_FILE)
 
 if __name__ == "__main__":
     main()
