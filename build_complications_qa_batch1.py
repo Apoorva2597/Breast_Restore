@@ -2,27 +2,26 @@
 # -*- coding: utf-8 -*-
 
 """
-build_complications_qa_batch2.py
+build_complications_qa_batch3.py
 
 Purpose:
-- Build a single-file QA sample for the 4 complication outcome variables
-  that still need focused review
+- Build a single-file QA sample for the 3 complication variables
+  that still need final focused review
 - Use existing master + complications evidence
 - Output ONE CSV
 - Final QA file contains NO MRN column
 
 Sampling:
-- 10 predicted-positive rows per field
-- 10 predicted-negative rows per field
+- 15 predicted-positive rows per field
+- 15 predicted-negative rows per field
 
 Focused fields:
 - Stage1_MinorComp
-- Stage1_Revision
 - Stage2_MinorComp
 - Stage2_Revision
 
 Output:
-- /home/apokol/Breast_Restore/_outputs/complications_qa_batch2.csv
+- /home/apokol/Breast_Restore/_outputs/complications_qa_batch3.csv
 
 Python 3.6.8 compatible.
 """
@@ -35,19 +34,18 @@ BASE_DIR = "/home/apokol/Breast_Restore"
 
 MASTER_FILE = "{0}/_outputs/master_abstraction_rule_FINAL_NO_GOLD_with_stage2_preds_complications.csv".format(BASE_DIR)
 EVID_FILE = "{0}/_outputs/complications_patch_evidence.csv".format(BASE_DIR)
-OUTPUT_QA = "{0}/_outputs/complications_qa_batch2.csv".format(BASE_DIR)
+OUTPUT_QA = "{0}/_outputs/complications_qa_batch3.csv".format(BASE_DIR)
 
 MERGE_KEY = "MRN"
 
 FIELDS = [
     "Stage1_MinorComp",
-    "Stage1_Revision",
     "Stage2_MinorComp",
     "Stage2_Revision",
 ]
 
-POSITIVES_N = 10
-NEGATIVES_N = 10
+POSITIVES_N = 15
+NEGATIVES_N = 15
 RANDOM_SEED = 42
 
 
@@ -194,11 +192,11 @@ def build_rows_for_field(master_df, best_evidence, field_name, positives_n, nega
     if field_name not in master_df.columns:
         return out
 
-    master_df = master_df.copy()
-    master_df["_bin_"] = master_df[field_name].apply(to_binary_01)
+    tmp = master_df.copy()
+    tmp["_bin_"] = tmp[field_name].apply(to_binary_01)
 
-    pos_df = master_df[master_df["_bin_"] == 1].copy()
-    neg_df = master_df[master_df["_bin_"] == 0].copy()
+    pos_df = tmp[tmp["_bin_"] == 1].copy()
+    neg_df = tmp[tmp["_bin_"] == 0].copy()
 
     pos_idxs = list(pos_df.index)
     neg_idxs = list(neg_df.index)
