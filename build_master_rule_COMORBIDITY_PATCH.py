@@ -1,48 +1,74 @@
-# build_master_rule_COMORBIDITY_PATCH.py
-# Python 3.6.8 compatible
-#
-# Purpose:
-#   Separate build script for comorbidity abstraction only.
-#   It PATCHES the existing master file by adding/updating:
-#   Obesity, Diabetes, Hypertension, CardiacDisease,
-#   VenousThromboembolism, Steroid
-#
-# Important:
-#   - Does NOT overwrite your old extractor files
-#   - Does NOT create a master with only comorbidity columns
-#   - Reads your existing master and writes a new patched output file
-#
-# Update the paths/globs below before running.
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-from __future__ import print_function
+"""
+update_comorbidity_only.py
+
+Comorbidity-only updater for:
+- Obesity
+- Diabetes
+- Hypertension
+- CardiacDisease
+- VenousThromboembolism
+- Steroid
+
+Strategy:
+- Use the same BASE_DIR / NOTE_GLOBS / output style as update_pbs_only.py
+- Reconstruct notes from HPI11526 note files
+- Extract only the comorbidity fields above
+- Update only these columns in the existing master
+- Preserve all other master abstractions
+
+Outputs:
+1) /home/apokol/Breast_Restore/_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv
+2) /home/apokol/Breast_Restore/_outputs/comorbidity_only_evidence.csv
+
+Python 3.6.8 compatible.
+"""
 
 import os
 import re
-import sys
 from glob import glob
 
 import pandas as pd
 
-from models import Candidate, SectionedNote
+BASE_DIR = "/home/apokol/Breast_Restore"
 
-# =========================================================
-# USER PATHS - EDIT THESE
-# =========================================================
-
-MASTER_IN = r"master.csv"
-MASTER_OUT = r"master_with_comorbidity_patch.csv"
-
-# Note chunk files / note exports
-NOTE_GLOBS = [
-    r"notes\*.csv",
-    r"notes\**\*.csv",
-]
+MASTER_FILE = "{0}/_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv".format(BASE_DIR)
+OUTPUT_MASTER = "{0}/_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv".format(BASE_DIR)
+OUTPUT_EVID = "{0}/_outputs/comorbidity_only_evidence.csv".format(BASE_DIR)
 
 MERGE_KEY = "MRN"
 
-# =========================================================
-# BASIC IO HELPERS
-# =========================================================
+STRUCT_GLOBS = [
+    "{0}/**/HPI11526*Clinic Encounters.csv".format(BASE_DIR),
+    "{0}/**/HPI11526*Inpatient Encounters.csv".format(BASE_DIR),
+    "{0}/**/HPI11526*Operation Encounters.csv".format(BASE_DIR),
+    "{0}/**/HPI11526*clinic encounters.csv".format(BASE_DIR),
+    "{0}/**/HPI11526*inpatient encounters.csv".format(BASE_DIR),
+    "{0}/**/HPI11526*operation encounters.csv".format(BASE_DIR),
+]
+
+NOTE_GLOBS = [
+    "{0}/**/HPI11526*Clinic Notes.csv".format(BASE_DIR),
+    "{0}/**/HPI11526*Inpatient Notes.csv".format(BASE_DIR),
+    "{0}/**/HPI11526*Operation Notes.csv".format(BASE_DIR),
+    "{0}/**/HPI11526*clinic notes.csv".format(BASE_DIR),
+    "{0}/**/HPI11526*inpatient notes.csv".format(BASE_DIR),
+    "{0}/**/HPI11526*operation notes.csv".format(BASE_DIR),
+]
+
+from models import Candidate, SectionedNote  # noqa: E402
+
+COMORBIDITY_FIELDS = [
+    "Obesity",
+    "Diabetes",
+    "Hypertension",
+    "CardiacDisease",
+    "VenousThromboembolism",
+    "Steroid",
+]
+
 
 def read_csv_robust(path):
     common_kwargs = dict(dtype=str, engine="python")
@@ -50,81 +76,103 @@ def read_csv_robust(path):
         return pd.read_csv(path, **common_kwargs, on_bad_lines="skip")
     except TypeError:
         try:
-            return pd.read_csv(path, **common_kwargs, error_bad_lines=False, warn_bad_lines=True)
+            return pd.read_csv(
+                path,
+                **common_kwargs,
+                error_bad_lines=False,
+                warn_bad_lines=True
+            )
         except UnicodeDecodeError:
-            return pd.read_csv(path, **common_kwargs, encoding="latin-1", error_bad_lines=False, warn_bad_lines=True)
+            return pd.read_csv(
+                path,
+                **common_kwargs,
+                encoding="latin-1",
+                error_bad_lines=False,
+                warn_bad_lines=True
+            )
     except UnicodeDecodeError:
         try:
-            return pd.read_csv(path, **common_kwargs, encoding="latin-1", on_bad_lines="skip")
+            return pd.read_csv(
+                path,
+                **common_kwargs,
+                encoding="latin-1",
+                on_bad_lines="skip"
+            )
         except TypeError:
-            return pd.read_csv(path, **common_kwargs, encoding="latin-1", error_bad_lines=False, warn_bad_lines=True)
+            return pd.read_csv(
+                path,
+                **common_kwargs,
+                encoding="latin-1",
+                error_bad_lines=False,
+                warn_bad_lines=True
+            )
+
 
 def clean_cols(df):
     df.columns = [str(c).strip().replace("\ufeff", "") for c in df.columns]
     return df
 
+
+def normalize_mrn(df):
+    key_variants = ["MRN", "mrn", "Patient_MRN", "PAT_MRN", "PATIENT_MRN"]
+    for k in key_variants:
+        if k in df.columns:
+            if k != MERGE_KEY:
+                df = df.rename(columns={k: MERGE_KEY})
+            break
+    if MERGE_KEY not in df.columns:
+        raise RuntimeError("MRN column not found. Columns seen: {0}".format(list(df.columns)[:40]))
+    df[MERGE_KEY] = df[MERGE_KEY].astype(str).str.strip()
+    return df
+
+
+def pick_col(df, options, required=True):
+    for c in options:
+        if c in df.columns:
+            return c
+    if required:
+        raise RuntimeError("Required column missing. Tried={0}. Seen={1}".format(
+            options, list(df.columns)[:60]
+        ))
+    return None
+
+
+def to_int_safe(x):
+    try:
+        return int(float(str(x).strip()))
+    except Exception:
+        return None
+
+
 def clean_cell(x):
     if x is None:
         return ""
-    try:
-        if pd.isna(x):
-            return ""
-    except Exception:
-        pass
-    return str(x).strip()
+    s = str(x).strip()
+    if s.lower() in {"", "nan", "none", "null", "na"}:
+        return ""
+    return s
 
-def normalize_mrn(df):
-    key_variants = ["MRN", "mrn", "Patient_MRN", "PAT_MRN", "patient_mrn", "MedicalRecordNumber"]
-    found = None
-    for k in key_variants:
-        if k in df.columns:
-            found = k
-            break
-    if found is None:
-        return df
-    if found != MERGE_KEY:
-        df[MERGE_KEY] = df[found].astype(str).str.strip()
-    else:
-        df[MERGE_KEY] = df[MERGE_KEY].astype(str).str.strip()
-    return df
-
-def first_existing(row, names):
-    for n in names:
-        if n in row and clean_cell(row.get(n)):
-            return clean_cell(row.get(n))
-    return ""
-
-# =========================================================
-# SECTIONING
-# =========================================================
 
 HEADER_RX = re.compile(r"^\s*([A-Z][A-Z0-9 /&\-\(\)]{2,80})\s*:\s*$")
 
+
 def sectionize(text):
-    text = clean_cell(text)
     if not text:
         return {"FULL": ""}
-
     lines = text.splitlines()
     sections = {}
     current = "FULL"
-    bucket = []
+    sections[current] = []
 
     for line in lines:
-        raw = line.rstrip("\n")
-        m = HEADER_RX.match(raw.strip())
+        m = HEADER_RX.match(line)
         if m:
-            joined = "\n".join(bucket).strip()
-            if joined:
-                sections.setdefault(current, []).append(joined)
-            current = m.group(1).strip().upper()
-            bucket = []
-        else:
-            bucket.append(raw)
-
-    joined = "\n".join(bucket).strip()
-    if joined:
-        sections.setdefault(current, []).append(joined)
+            hdr = m.group(1).strip().upper()
+            current = hdr
+            if current not in sections:
+                sections[current] = []
+            continue
+        sections[current].append(line)
 
     out = {}
     for k, v in sections.items():
@@ -132,6 +180,7 @@ def sectionize(text):
         if joined:
             out[k] = joined
     return out if out else {"FULL": text}
+
 
 def build_sectioned_note(note_text, note_type, note_id, note_date):
     return SectionedNote(
@@ -141,79 +190,121 @@ def build_sectioned_note(note_text, note_type, note_id, note_date):
         note_date=note_date or ""
     )
 
+
 def window_around(text, start, end, width):
     left = max(0, start - width)
     right = min(len(text), end + width)
     return text[left:right].strip()
 
-# =========================================================
-# AGGREGATION
-# =========================================================
 
-def cand_score(c):
-    conf = float(getattr(c, "confidence", 0.0) or 0.0)
-    nt = str(getattr(c, "note_type", "") or "").lower()
-    op_bonus = 0.05 if ("op" in nt or "operative" in nt or "operation" in nt) else 0.0
-    date_bonus = 0.01 if clean_cell(getattr(c, "note_date", "")) else 0.0
-    return conf + op_bonus + date_bonus
+def load_and_reconstruct_notes():
+    note_files = []
+    for g in NOTE_GLOBS:
+        note_files.extend(glob(g, recursive=True))
+    note_files = sorted(set(note_files))
 
-def choose_best(existing, new):
-    if existing is None:
-        return new
-    return new if cand_score(new) > cand_score(existing) else existing
+    if not note_files:
+        raise FileNotFoundError("No HPI11526 * Notes.csv files found via NOTE_GLOBS.")
 
-def merge_boolean(existing, new):
-    if existing is None:
-        return new
-    try:
-        exv = bool(existing.value)
-        nwv = bool(new.value)
-    except Exception:
-        return choose_best(existing, new)
+    all_notes_rows = []
 
-    if nwv and not exv:
-        return new
-    if exv and not nwv:
-        return existing
-    return choose_best(existing, new)
+    for fp in note_files:
+        df = clean_cols(read_csv_robust(fp))
+        df = normalize_mrn(df)
 
-# =========================================================
-# FIELD MAP / TARGETS
-# =========================================================
+        note_text_col = pick_col(df, ["NOTE_TEXT", "NOTE TEXT", "NOTE_TEXT_FULL", "TEXT", "NOTE"])
+        note_id_col = pick_col(df, ["NOTE_ID", "NOTE ID"])
+        line_col = pick_col(df, ["LINE"], required=False)
+        note_type_col = pick_col(df, ["NOTE_TYPE", "NOTE TYPE"], required=False)
+        date_col = pick_col(
+            df,
+            ["NOTE_DATE_OF_SERVICE", "NOTE DATE OF SERVICE", "OPERATION_DATE", "ADMIT_DATE", "HOSP_ADMSN_TIME"],
+            required=False
+        )
 
-FIELD_MAP = {
-    "Obesity": "Obesity",
-    "Diabetes": "Diabetes",
-    "DiabetesMellitus": "Diabetes",
-    "Hypertension": "Hypertension",
-    "CardiacDisease": "CardiacDisease",
-    "VTE": "VenousThromboembolism",
-    "VenousThromboembolism": "VenousThromboembolism",
-    "SteroidUse": "Steroid",
-    "Steroid": "Steroid",
-}
+        df[note_text_col] = df[note_text_col].fillna("").astype(str)
+        df[note_id_col] = df[note_id_col].fillna("").astype(str)
+        if line_col:
+            df[line_col] = df[line_col].fillna("").astype(str)
+        if note_type_col:
+            df[note_type_col] = df[note_type_col].fillna("").astype(str)
+        if date_col:
+            df[date_col] = df[date_col].fillna("").astype(str)
 
-BOOLEAN_FIELDS = {
-    "Obesity",
-    "Diabetes",
-    "Hypertension",
-    "CardiacDisease",
-    "VenousThromboembolism",
-    "Steroid",
-}
+        df["_SOURCE_FILE_"] = os.path.basename(fp)
 
-TARGET_FIELDS = [
-    "Obesity",
-    "Diabetes",
-    "Hypertension",
-    "CardiacDisease",
-    "VenousThromboembolism",
-    "Steroid",
-]
+        keep_cols = [MERGE_KEY, note_id_col, note_text_col, "_SOURCE_FILE_"]
+        if line_col:
+            keep_cols.append(line_col)
+        if note_type_col:
+            keep_cols.append(note_type_col)
+        if date_col:
+            keep_cols.append(date_col)
 
-# =========================================================
-# COMORBIDITY EXTRACTOR
-# =========================================================
+        tmp = df[keep_cols].copy()
+        tmp = tmp.rename(columns={
+            note_id_col: "NOTE_ID",
+            note_text_col: "NOTE_TEXT",
+        })
+
+        if line_col and line_col != "LINE":
+            tmp = tmp.rename(columns={line_col: "LINE"})
+        if note_type_col and note_type_col != "NOTE_TYPE":
+            tmp = tmp.rename(columns={note_type_col: "NOTE_TYPE"})
+        if date_col and date_col != "NOTE_DATE_OF_SERVICE":
+            tmp = tmp.rename(columns={date_col: "NOTE_DATE_OF_SERVICE"})
+
+        if "LINE" not in tmp.columns:
+            tmp["LINE"] = ""
+        if "NOTE_TYPE" not in tmp.columns:
+            tmp["NOTE_TYPE"] = ""
+        if "NOTE_DATE_OF_SERVICE" not in tmp.columns:
+            tmp["NOTE_DATE_OF_SERVICE"] = ""
+
+        all_notes_rows.append(tmp)
+
+    notes_raw = pd.concat(all_notes_rows, ignore_index=True)
+
+    def join_note(group):
+        tmp = group.copy()
+        tmp["_LINE_NUM_"] = tmp["LINE"].apply(to_int_safe)
+        tmp = tmp.sort_values(by=["_LINE_NUM_"], na_position="last")
+        return "\n".join(tmp["NOTE_TEXT"].tolist()).strip()
+
+    reconstructed = []
+    grouped = notes_raw.groupby([MERGE_KEY, "NOTE_ID"], dropna=False)
+
+    for (mrn, nid), g in grouped:
+        mrn = str(mrn).strip()
+        nid = str(nid).strip()
+        if not nid:
+            continue
+
+        full_text = join_note(g)
+        if not full_text:
+            continue
+
+        if g["NOTE_TYPE"].astype(str).str.strip().any():
+            note_type = g["NOTE_TYPE"].astype(str).iloc[0]
+        else:
+            note_type = g["_SOURCE_FILE_"].astype(str).iloc[0]
+
+        if g["NOTE_DATE_OF_SERVICE"].astype(str).str.strip().any():
+            note_date = g["NOTE_DATE_OF_SERVICE"].astype(str).iloc[0]
+        else:
+            note_date = ""
+
+        reconstructed.append({
+            MERGE_KEY: mrn,
+            "NOTE_ID": nid,
+            "NOTE_TYPE": note_type,
+            "NOTE_DATE": note_date,
+            "SOURCE_FILE": g["_SOURCE_FILE_"].astype(str).iloc[0],
+            "NOTE_TEXT": full_text
+        })
+
+    return pd.DataFrame(reconstructed)
+
 
 SUPPRESS_SECTIONS = {
     "FAMILY HISTORY",
@@ -249,29 +340,29 @@ LOW_VALUE_SECTIONS = {
 
 NEGATION_RX = re.compile(
     r"\b(no|not|denies|denied|without|negative\s+for|free\s+of|absence\s+of)\b",
-    re.IGNORECASE
+    re.I
 )
 
 FAMILY_RX = re.compile(
     r"\b(family history|mother|father|sister|brother|aunt|uncle|grandmother|grandfather)\b",
-    re.IGNORECASE
+    re.I
 )
 
-HISTORICAL_ONLY_RX = re.compile(r"\b(history of|hx of|h/o)\b", re.IGNORECASE)
+HISTORICAL_ONLY_RX = re.compile(r"\b(history of|hx of|h/o|s/p|status post)\b", re.I)
 
 SYSTEMIC_STEROID_EXCLUDE_RX = re.compile(
     r"\b(inhaled|inhaler|intranasal|nasal|topical|cream|ointment|lotion|eye\s*drops?|otic|ear\s*drops?)\b",
-    re.IGNORECASE
+    re.I
 )
 
 STEROID_NEG_CONTEXT_RX = re.compile(
     r"\b(no|not|denies|without)\b.{0,40}\b(steroid|prednisone|dexamethasone|medrol|methylprednisolone|hydrocortisone)\b",
-    re.IGNORECASE
+    re.I
 )
 
 VTE_PROPHYLAXIS_RX = re.compile(
     r"\b(prophylaxis|ppx|dvt\s*ppx|vte\s*ppx|sequential\s+compression|compression\s+device|scd|scds|subcutaneous\s+heparin|heparin\s+prophylaxis|enoxaparin\s+prophylaxis)\b",
-    re.IGNORECASE
+    re.I
 )
 
 CONCEPTS = {
@@ -280,8 +371,9 @@ CONCEPTS = {
             r"\bobesity\b",
             r"\bobese\b",
             r"\bmorbid obesity\b",
-            r"\boverweight\b",
             r"\bbmi\s*(>|>=)?\s*30\b",
+            r"\bbmi\s*(>|>=)?\s*3\d(?:\.\d+)?\b",
+            r"\boverweight\b",
         ],
         "exclude": [],
         "base_conf": 0.80,
@@ -384,6 +476,7 @@ DM_MED_STRONG = [
     r"\bmetformin\b",
 ]
 
+
 def _emit(field, value, status, evid, section, note, conf):
     return Candidate(
         field=field,
@@ -397,6 +490,7 @@ def _emit(field, value, status, evid, section, note, conf):
         confidence=conf
     )
 
+
 def _section_rank(section):
     s = clean_cell(section).upper()
     if s in PREFERRED_SECTIONS:
@@ -404,6 +498,7 @@ def _section_rank(section):
     if s in LOW_VALUE_SECTIONS:
         return 2
     return 1
+
 
 def _iter_sections(note):
     keys = list(note.sections.keys())
@@ -416,26 +511,31 @@ def _iter_sections(note):
         if txt:
             yield ku, txt
 
+
 def _has_any(patterns, text):
     for p in patterns:
-        if re.search(p, text, re.IGNORECASE):
+        if re.search(p, text, re.I):
             return True
     return False
+
 
 def _find_first(patterns, text):
     best = None
     for p in patterns:
-        m = re.search(p, text, re.IGNORECASE)
+        m = re.search(p, text, re.I)
         if m:
             if best is None or m.start() < best.start():
                 best = m
     return best
 
+
 def _is_negated(evid):
     return bool(NEGATION_RX.search(evid))
 
+
 def _family_context(evid):
     return bool(FAMILY_RX.search(evid))
+
 
 def _status_from_context(evid):
     low = evid.lower()
@@ -445,6 +545,7 @@ def _status_from_context(evid):
         return "history"
     return "history"
 
+
 def _concept_confidence(section, base):
     rank = _section_rank(section)
     if rank == 0:
@@ -452,6 +553,7 @@ def _concept_confidence(section, base):
     if rank == 2:
         return max(0.55, base - 0.08)
     return base
+
 
 def _extract_concept(field, note):
     cfg = CONCEPTS[field]
@@ -499,6 +601,7 @@ def _extract_concept(field, note):
 
     return cands
 
+
 def _extract_diabetes_med_inference(note):
     cands = []
 
@@ -533,6 +636,7 @@ def _extract_diabetes_med_inference(note):
 
     return cands
 
+
 def extract_comorbidities(note):
     cands = []
     cands.extend(_extract_concept("Obesity", note))
@@ -544,108 +648,34 @@ def extract_comorbidities(note):
     cands.extend(_extract_concept("Steroid", note))
     return cands
 
-# =========================================================
-# NOTE LOADING
-# =========================================================
 
-def join_note(g):
-    pieces = []
-    if "NOTE_TEXT" in g.columns:
-        for x in g["NOTE_TEXT"].tolist():
-            val = clean_cell(x)
-            if val:
-                pieces.append(val)
-    else:
-        for col in ["LINE", "TEXT", "NOTE_LINE", "NOTE_TEXT_LINE"]:
-            if col in g.columns:
-                for x in g[col].tolist():
-                    val = clean_cell(x)
-                    if val:
-                        pieces.append(val)
+def candidate_score(c):
+    conf = float(getattr(c, "confidence", 0.0) or 0.0)
+    nt = str(getattr(c, "note_type", "") or "").lower()
+    op_bonus = 0.05 if ("op" in nt or "operative" in nt or "operation" in nt) else 0.0
+    date_bonus = 0.01 if clean_cell(getattr(c, "note_date", "")) else 0.0
+    return conf + op_bonus + date_bonus
 
-    return "\n".join(pieces).strip()
 
-def load_notes():
-    rows = []
-    files = []
-    for pat in NOTE_GLOBS:
-        files.extend(glob(pat, recursive=True))
+def choose_better(existing, new):
+    if existing is None:
+        return new
+    return new if candidate_score(new) > candidate_score(existing) else existing
 
-    for fp in sorted(set(files)):
-        try:
-            df = clean_cols(read_csv_robust(fp))
-        except Exception as e:
-            print("WARN: failed to read", fp, e)
-            continue
 
-        df = normalize_mrn(df)
-        if MERGE_KEY not in df.columns:
-            print("WARN: no MRN in", fp)
-            continue
+def choose_better_boolean(existing, new):
+    if existing is None:
+        return new
 
-        note_id_col = None
-        for c in ["NOTE_ID", "note_id", "NoteID", "DOCUMENT_ID", "DOC_ID"]:
-            if c in df.columns:
-                note_id_col = c
-                break
+    ex_val = bool(getattr(existing, "value", False))
+    nw_val = bool(getattr(new, "value", False))
 
-        if note_id_col is None:
-            df["NOTE_ID"] = [str(i + 1) for i in range(len(df))]
-            note_id_col = "NOTE_ID"
+    if nw_val and not ex_val:
+        return new
+    if ex_val and not nw_val:
+        return existing
+    return choose_better(existing, new)
 
-        if "NOTE_TYPE" not in df.columns:
-            if "NOTE_NAME" in df.columns:
-                df["NOTE_TYPE"] = df["NOTE_NAME"]
-            elif "DOCUMENT_TYPE" in df.columns:
-                df["NOTE_TYPE"] = df["DOCUMENT_TYPE"]
-            else:
-                df["NOTE_TYPE"] = os.path.basename(fp)
-
-        if "NOTE_DATE_OF_SERVICE" not in df.columns:
-            if "NOTE_DATE" in df.columns:
-                df["NOTE_DATE_OF_SERVICE"] = df["NOTE_DATE"]
-            elif "DATE_OF_SERVICE" in df.columns:
-                df["NOTE_DATE_OF_SERVICE"] = df["DATE_OF_SERVICE"]
-            else:
-                df["NOTE_DATE_OF_SERVICE"] = ""
-
-        df["_SOURCE_FILE_"] = os.path.basename(fp)
-        rows.append(df)
-
-    if not rows:
-        return pd.DataFrame(columns=[MERGE_KEY, "NOTE_ID", "NOTE_TYPE", "NOTE_DATE", "NOTE_TEXT"])
-
-    raw = pd.concat(rows, ignore_index=True, sort=False)
-
-    reconstructed = []
-    grouped = raw.groupby([MERGE_KEY, note_id_col], dropna=False)
-    for (mrn, nid), g in grouped:
-        mrn = clean_cell(mrn)
-        nid = clean_cell(nid)
-        if not mrn or not nid:
-            continue
-
-        full_text = join_note(g)
-        if not full_text:
-            continue
-
-        note_type = first_existing(g.iloc[0].to_dict(), ["NOTE_TYPE", "NOTE_NAME", "DOCUMENT_TYPE"])
-        note_date = first_existing(g.iloc[0].to_dict(), ["NOTE_DATE_OF_SERVICE", "NOTE_DATE", "DATE_OF_SERVICE"])
-
-        reconstructed.append({
-            MERGE_KEY: mrn,
-            "NOTE_ID": nid,
-            "NOTE_TYPE": note_type,
-            "NOTE_DATE": note_date,
-            "SOURCE_FILE": clean_cell(g["_SOURCE_FILE_"].iloc[0]),
-            "NOTE_TEXT": full_text,
-        })
-
-    return pd.DataFrame(reconstructed)
-
-# =========================================================
-# CANDIDATE COLLECTION
-# =========================================================
 
 COMORBIDITY_PREFILTER = re.compile(
     r"\b("
@@ -656,127 +686,142 @@ COMORBIDITY_PREFILTER = re.compile(
     r"dvt|deep vein thrombosis|pe|pulmonary embol|vte|"
     r"prednisone|dexamethasone|methylprednisolone|medrol|hydrocortisone|steroid"
     r")\b",
-    re.IGNORECASE,
+    re.I
 )
 
-def collect_candidates(notes_df):
-    by_mrn = {}
 
-    for mrn, g in notes_df.groupby(MERGE_KEY):
-        out = {}
-        for _, row in g.iterrows():
-            text = clean_cell(row.get("NOTE_TEXT"))
-            if not text:
-                continue
-            if not COMORBIDITY_PREFILTER.search(text):
-                continue
+def main():
+    print("Loading master...")
+    master = clean_cols(read_csv_robust(MASTER_FILE))
+    master = normalize_mrn(master)
 
-            note = build_sectioned_note(
-                text,
-                row.get("NOTE_TYPE", ""),
-                row.get("NOTE_ID", ""),
-                row.get("NOTE_DATE", "")
-            )
+    for c in COMORBIDITY_FIELDS:
+        if c not in master.columns:
+            master[c] = pd.NA
 
-            cands = extract_comorbidities(note)
+    print("Master rows: {0}".format(len(master)))
 
-            for c in cands:
-                field = FIELD_MAP.get(c.field)
-                if not field:
-                    continue
+    print("Loading notes...")
+    notes_df = load_and_reconstruct_notes()
+    print("Reconstructed notes: {0}".format(len(notes_df)))
 
-                existing = out.get(field)
-                if field in BOOLEAN_FIELDS:
-                    out[field] = merge_boolean(existing, c)
-                else:
-                    out[field] = choose_best(existing, c)
+    for c in COMORBIDITY_FIELDS:
+        master[c] = 0
 
-        by_mrn[clean_cell(mrn)] = out
-
-    return by_mrn
-
-# =========================================================
-# APPLY TO MASTER
-# =========================================================
-
-def ensure_target_columns(master):
-    for col in TARGET_FIELDS:
-        if col not in master.columns:
-            master[col] = ""
-
-def apply_to_master(master, cand_map):
     evidence_rows = []
+    best_by_mrn = {}
 
-    for idx in master.index:
-        mrn = clean_cell(master.at[idx, MERGE_KEY])
-        m = cand_map.get(mrn, {})
+    for _, row in notes_df.iterrows():
+        mrn = clean_cell(row.get(MERGE_KEY, ""))
+        if not mrn:
+            continue
 
-        for field in TARGET_FIELDS:
-            c = m.get(field)
-            if c is None:
+        note_text = clean_cell(row.get("NOTE_TEXT", ""))
+        if not note_text:
+            continue
+
+        if not COMORBIDITY_PREFILTER.search(note_text):
+            continue
+
+        mask = (master[MERGE_KEY].astype(str).str.strip() == mrn)
+        if not mask.any():
+            continue
+
+        snote = build_sectioned_note(
+            note_text=row["NOTE_TEXT"],
+            note_type=row["NOTE_TYPE"],
+            note_id=row["NOTE_ID"],
+            note_date=row["NOTE_DATE"]
+        )
+
+        try:
+            cands = extract_comorbidities(snote)
+        except Exception as e:
+            evidence_rows.append({
+                MERGE_KEY: mrn,
+                "NOTE_ID": row["NOTE_ID"],
+                "NOTE_DATE": row["NOTE_DATE"],
+                "NOTE_TYPE": row["NOTE_TYPE"],
+                "FIELD": "EXTRACTOR_ERROR",
+                "VALUE": "",
+                "STATUS": "",
+                "CONFIDENCE": "",
+                "SECTION": "",
+                "RULE_DECISION": "extractor_failed",
+                "EVIDENCE": repr(e)
+            })
+            continue
+
+        if not cands:
+            continue
+
+        if mrn not in best_by_mrn:
+            best_by_mrn[mrn] = {}
+
+        for c in cands:
+            field = clean_cell(getattr(c, "field", ""))
+            if field not in COMORBIDITY_FIELDS:
                 continue
 
-            val = c.value
-            if field in BOOLEAN_FIELDS:
-                val = 1 if bool(val) else 0
+            evid = clean_cell(getattr(c, "evidence", ""))
+            status = clean_cell(getattr(c, "status", ""))
 
-            master.at[idx, field] = val
+            accept = False
+            reason = ""
+
+            if status == "denied":
+                accept = False
+                reason = "reject_denied"
+            elif not evid:
+                accept = False
+                reason = "reject_no_evidence"
+            else:
+                accept = True
+                reason = "accept_positive"
 
             evidence_rows.append({
                 MERGE_KEY: mrn,
+                "NOTE_ID": getattr(c, "note_id", row["NOTE_ID"]),
+                "NOTE_DATE": getattr(c, "note_date", row["NOTE_DATE"]),
+                "NOTE_TYPE": getattr(c, "note_type", row["NOTE_TYPE"]),
                 "FIELD": field,
-                "VALUE": val,
-                "STATUS": clean_cell(getattr(c, "status", "")),
+                "VALUE": getattr(c, "value", True),
+                "STATUS": status,
                 "CONFIDENCE": getattr(c, "confidence", ""),
-                "SECTION": clean_cell(getattr(c, "section", "")),
-                "NOTE_ID": clean_cell(getattr(c, "note_id", "")),
-                "NOTE_TYPE": clean_cell(getattr(c, "note_type", "")),
-                "NOTE_DATE": clean_cell(getattr(c, "note_date", "")),
-                "EVIDENCE": clean_cell(getattr(c, "evidence", "")),
+                "SECTION": getattr(c, "section", ""),
+                "RULE_DECISION": reason,
+                "EVIDENCE": evid
             })
 
-    evidence_df = pd.DataFrame(evidence_rows)
-    return master, evidence_df
+            if not accept:
+                continue
 
-# =========================================================
-# MAIN
-# =========================================================
+            existing = best_by_mrn[mrn].get(field)
+            best_by_mrn[mrn][field] = choose_better_boolean(existing, c)
 
-def main():
-    if not os.path.exists(MASTER_IN):
-        print("ERROR: MASTER_IN not found:", MASTER_IN)
-        sys.exit(1)
+    print("Accepted comorbidity note-based predictions for MRNs: {0}".format(len(best_by_mrn)))
 
-    print("Loading master:", MASTER_IN)
-    master = clean_cols(read_csv_robust(MASTER_IN))
-    master = normalize_mrn(master)
+    for mrn, fields in best_by_mrn.items():
+        mask = (master[MERGE_KEY].astype(str).str.strip() == mrn)
+        if not mask.any():
+            continue
 
-    if MERGE_KEY not in master.columns:
-        print("ERROR: master file has no merge key:", MERGE_KEY)
-        sys.exit(1)
+        for field in COMORBIDITY_FIELDS:
+            cand = fields.get(field)
+            if cand is None:
+                continue
+            master.loc[mask, field] = 1 if bool(getattr(cand, "value", False)) else 0
 
-    ensure_target_columns(master)
+    os.makedirs(os.path.dirname(OUTPUT_MASTER), exist_ok=True)
+    master.to_csv(OUTPUT_MASTER, index=False)
+    pd.DataFrame(evidence_rows).to_csv(OUTPUT_EVID, index=False)
 
-    print("Loading notes...")
-    notes_df = load_notes()
-    print("Notes loaded:", len(notes_df))
+    print("\nDONE.")
+    print("- Updated master: {0}".format(OUTPUT_MASTER))
+    print("- Comorbidity evidence: {0}".format(OUTPUT_EVID))
+    print("\nRun:")
+    print(" python update_comorbidity_only.py")
 
-    print("Collecting comorbidity candidates...")
-    cand_map = collect_candidates(notes_df)
-    print("MRNs with candidates:", len(cand_map))
-
-    print("Applying patch to master...")
-    patched_master, evidence_df = apply_to_master(master, cand_map)
-
-    evidence_out = os.path.splitext(MASTER_OUT)[0] + "_evidence.csv"
-
-    print("Writing patched master:", MASTER_OUT)
-    patched_master.to_csv(MASTER_OUT, index=False)
-
-    print("Writing evidence file:", evidence_out)
-    evidence_df.to_csv(evidence_out, index=False)
-
-    print("Done.")
 
 if __name__ == "__main__":
     main()
