@@ -16,7 +16,12 @@ Strategy:
 - Updates only these comorbidity columns in the existing master
 - Preserves all other master abstractions
 - Adds stronger template/list/pertinent-negative/risk-form suppression
-- Excludes obesity entirely
+- Uses stricter steroid definition:
+    * include regular systemic steroid or immunosuppressant use
+      within 30 days pre-op or at surgical candidacy
+    * exclude topical/inhaled
+    * exclude one-time pulse / short course <=10 days
+    * exclude chemo premedication / antiemetic dexamethasone
 
 Outputs:
 1) /home/apokol/Breast_Restore/_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv
@@ -356,7 +361,12 @@ PERTINENT_NEGATIVES_RX = re.compile(r"\bpertinent negatives?\b", re.I)
 ROS_RX = re.compile(r"\breview of systems\b|\bros\b", re.I)
 PROBLEM_LIST_RX = re.compile(r"\b(patient active problem list|active problem list|problem list|diagnosis list)\b", re.I)
 RISK_FORM_RX = re.compile(
-    r"\b(vte risk assessment|risk assessment|risk score|caprini|risk factors score|thrombosis risk assessment)\b",
+    r"\b(vte risk assessment|risk assessment|risk score|caprini|risk factors score|thrombosis risk assessment|revised cardiac risk assessment|rcri score)\b",
+    re.I
+)
+
+NONE_TEMPLATE_RX = re.compile(
+    r"\b(diabetes|heart failure|cad|coronary artery disease|copd|asthma|renal failure|liver disease|pulmonary|neuro|endo)\s*:\s*\(none\)\b",
     re.I
 )
 
@@ -371,23 +381,91 @@ STEROID_NEG_CONTEXT_RX = re.compile(
 )
 
 VTE_PROPHYLAXIS_RX = re.compile(
-    r"\b(prophylaxis|ppx|dvt\s*ppx|vte\s*ppx|sequential\s+compression|compression\s+device|scd|scds|subcutaneous\s+heparin|heparin\s+prophylaxis|enoxaparin\s+prophylaxis)\b",
+    r"\b(prophylaxis|ppx|dvt\s*ppx|vte\s*ppx|sequential\s+compression|compression\s+device|scd|scds|subcutaneous\s+heparin|heparin\s+prophylaxis|enoxaparin\s+prophylaxis|lovenox\s+\d+\s*(hr|hours?)\s*postop|postop lovenox|bair hugger until pod|continue ambulation|monitor for dvt)\b",
     re.I
 )
 
 VTE_RISK_EXCLUDE_RX = re.compile(
-    r"\b(vte risk|risk of dvt|risk of pe|risk of pulmonary embolism|caprini|venous thromboembolism risk assessment)\b",
+    r"\b(vte risk|risk of dvt|risk of pe|risk of pulmonary embolism|chance of pulmonary embolism|chance of deep vein thrombosis|caprini|venous thromboembolism risk assessment|seek medical attention for symptoms of dvt|symptoms of dvt|symptoms of pe|warning signs.*dvt|warning signs.*pe)\b",
     re.I
 )
 
-# Dense templated comorbidity list patterns seen in QA
+VTE_RULEOUT_EXCLUDE_RX = re.compile(
+    r"\b(rule out dvt|r/o dvt|to rule out dvt|ruled out pe|ruled out dvt|duplex.*rule out dvt|to rule out pe|pe was ruled out)\b",
+    re.I
+)
+
+CARDIAC_RISK_COUNSELING_RX = re.compile(
+    r"\b(risk of cardiomyopathy|risk of cardiac dysfunction|risk of heart failure|risk of congestive heart failure|cardiac monitoring|cardiac function monitoring|echo every 3 months|echocardiogram.*every 3 months|baseline echo|baseline echocardiogram|echo obtained|echo will be followed|echocardiograms? will be followed|side effects include.*heart failure|toxicit(y|ies)|anthracycline|trastuzumab|herceptin|doxorubicin|cardiotoxicity|risk of chf)\b",
+    re.I
+)
+
+CARDIAC_UNCERTAIN_RX = re.compile(
+    r"\b(possible\s+(hypertrophic\s+)?cardiomyopathy|possible cardiomyopathy|concern for cardiomyopathy|at risk for cardiac dysfunction|at risk for cardiomyopathy|at risk for heart failure)\b",
+    re.I
+)
+
+DM_GENERAL_INFO_RX = re.compile(
+    r"\b(may include diabetes|features of this disease may include diabetes|risk of developing diabetes|can include diabetes|diabetes\s*:\s*\(none\)|endo\s*/\s*neuro.*diabetes\s*:\s*\(none\))\b",
+    re.I
+)
+
 TEMPLATE_COMORB_LIST_RX = re.compile(
     r"\b(asthma|cad|copd|dvt|diabetes mellitus|mi|pulmonary embolism|sleep apnea|stroke)\b",
     re.I
 )
 
-DIABETES_DM_AMBIG_RX = re.compile(
-    r"\bdm\b",
+DIABETES_DM_AMBIG_RX = re.compile(r"\bdm\b", re.I)
+
+# Steroid-specific patterns based on the final definition
+STEROID_SYSTEMIC_POS_RX = [
+    r"\bprednisone\b",
+    r"\bdexamethasone\b",
+    r"\bmethylprednisolone\b",
+    r"\bsolu[- ]medrol\b",
+    r"\bmedrol\b",
+    r"\bhydrocortisone\b",
+    r"\bsolu[- ]cortef\b",
+    r"\bprednisolone\b",
+    r"\bcorticosteroid\b",
+    r"\bsteroid\b",
+]
+
+STEROID_IMMUNOSUPPRESSANT_RX = [
+    r"\bimmunosuppress(ant|ive)\b",
+    r"\bmethotrexate\b",
+    r"\bazathioprine\b",
+    r"\bimuran\b",
+    r"\bmycophenolate\b",
+    r"\bcellcept\b",
+    r"\btacrolimus\b",
+    r"\bcyclosporine\b",
+    r"\bleflunomide\b",
+    r"\barava\b",
+]
+
+STEROID_CHRONIC_CONTEXT_RX = re.compile(
+    r"\b(chronic|long[- ]term|maintenance|daily|regular|currently taking|current medications?|medication list|home medication|on prednisone|on dexamethasone|takes prednisone|takes dexamethasone|taking prednisone|taking dexamethasone|chronic steroid therapy|steroid dependent)\b",
+    re.I
+)
+
+STEROID_CHRONIC_DISEASE_RX = re.compile(
+    r"\b(copd|asthma|rheumatologic|rheumatoid arthritis|lupus|sle|inflammatory bowel disease|crohn'?s|ulcerative colitis|autoimmune|adrenal insufficiency)\b",
+    re.I
+)
+
+STEROID_SHORTCOURSE_RX = re.compile(
+    r"\b(x\s*[1-9]\d?\s*days?|for\s*[1-9]\d?\s*days?|for\s*3\s*days|for\s*5\s*days|for\s*7\s*days|for\s*10\s*days|one[- ]time|one time|single dose|one dose|pulse|short course|burst)\b",
+    re.I
+)
+
+STEROID_CHEMO_RX = re.compile(
+    r"\b(chemo|chemotherapy|infusion|premed|pre[- ]medication|premedication|antiemetic|for nausea|before chemo|after chemo|cycle of chemotherapy|day before chemo|following chemotherapy|start before chemotherapy|compazine|emend|zofran|adriamycin|taxotere|cytoxan|ac chemotherapy|tch|neulasta)\b",
+    re.I
+)
+
+STEROID_PERIOP_RX = re.compile(
+    r"\b(pre[- ]op|preop|post[- ]op|postop|during surgery|at surgery|intraop|perioperative|peri-op)\b",
     re.I
 )
 
@@ -403,6 +481,8 @@ CONCEPTS = {
             r"\biddm\b",
             r"\bniddm\b",
             r"\bdiabetic\b",
+            r"\bdm2\b",
+            r"\btype 2 dm\b",
         ],
         "exclude": [
             r"\bprediabet(es|ic)\b",
@@ -422,6 +502,7 @@ CONCEPTS = {
             r"\bhypertension\b",
             r"\bhtn\b",
             r"\bhigh blood pressure\b",
+            r"\bessential hypertension\b",
         ],
         "exclude": [
             r"\bpulmonary hypertension\b",
@@ -432,6 +513,7 @@ CONCEPTS = {
             r"\bwhite coat hypertension\b",
             r"\bwhite coat\b",
             r"\bin office hypertension\b",
+            r"\bafter starting the ai/os\b",
         ],
         "base_conf": 0.84,
     },
@@ -452,14 +534,7 @@ CONCEPTS = {
         ],
         "exclude": [
             r"\bmitral valve prolapse\b",
-            r"\bvalvular\b",
             r"\bheart murmur\b",
-            r"\brisk of cardiomyopathy\b",
-            r"\brisk of heart failure\b",
-            r"\brisk of cardiac dysfunction\b",
-            r"\bcardiac monitoring\b",
-            r"\bechocardiogram monitoring\b",
-            r"\bbaseline echo\b",
         ],
         "base_conf": 0.82,
     },
@@ -484,39 +559,7 @@ CONCEPTS = {
         ],
         "base_conf": 0.82,
     },
-    "Steroid": {
-        "pos": [
-            r"\bprednisone\b",
-            r"\bdexamethasone\b",
-            r"\bmethylprednisolone\b",
-            r"\bsolu[- ]medrol\b",
-            r"\bmedrol\b",
-            r"\bhydrocortisone\b",
-            r"\bsolu[- ]cortef\b",
-            r"\bchronic steroid(s)?\b",
-            r"\blong[- ]term steroid(s)?\b",
-            r"\bsystemic steroid(s)?\b",
-        ],
-        "exclude": [],
-        "base_conf": 0.78,
-    },
 }
-
-DM_MED_STRONG = [
-    r"\binsulin\b",
-    r"\blantus\b",
-    r"\bhumalog\b",
-    r"\bnovolog\b",
-    r"\blevemir\b",
-    r"\bmetformin\b",
-]
-
-# Optional steroid tightening for chemo/premed contexts if desired later.
-# Keeping broad for now because your QA looked fairly good.
-STEROID_CONTEXT_WEAK_RX = re.compile(
-    r"\b(antiemetic|premed|premedication|chemotherapy premed|before chemo|start before chemo)\b",
-    re.I
-)
 
 
 def _emit(field, value, status, evid, section, note, conf):
@@ -598,8 +641,6 @@ def _concept_confidence(section, base):
 
 
 def _looks_like_template_list(low):
-    # Dense comorbidity template blocks from QA:
-    # "Asthma CAD COPD DVT Diabetes Mellitus MI Pulmonary Embolism ..."
     hits = len(re.findall(
         r"\b(asthma|cad|copd|dvt|diabetes mellitus|mi|pulmonary embolism|sleep apnea|stroke)\b",
         low,
@@ -618,6 +659,9 @@ def _is_bad_template_context(field, section, evid):
     if "pertinent negatives" in low or "pertinent negative" in low:
         return True
 
+    if NONE_TEMPLATE_RX.search(low):
+        return True
+
     if ROS_RX.search(low) or ROS_RX.search(sec):
         return True
 
@@ -628,7 +672,11 @@ def _is_bad_template_context(field, section, evid):
         return True
 
     if field == "VenousThromboembolism":
-        if RISK_FORM_RX.search(low) or VTE_RISK_EXCLUDE_RX.search(low):
+        if RISK_FORM_RX.search(low) or VTE_RISK_EXCLUDE_RX.search(low) or VTE_RULEOUT_EXCLUDE_RX.search(low):
+            return True
+
+    if field == "CardiacDisease":
+        if RISK_FORM_RX.search(low):
             return True
 
     return False
@@ -638,30 +686,45 @@ def _field_specific_extra_reject(field, evid):
     low = clean_cell(evid).lower()
 
     if field == "CardiacDisease":
-        if "risk of cardiomyopathy" in low:
+        if CARDIAC_RISK_COUNSELING_RX.search(low):
             return True
-        if "risk of heart failure" in low:
+        if CARDIAC_UNCERTAIN_RX.search(low):
             return True
-        if "cardiac monitoring" in low or "echocardiogram monitoring" in low:
+        if "side effects include" in low and ("heart failure" in low or "cardiomyopathy" in low):
             return True
-        if "baseline echocardiogram" in low or "baseline echo" in low:
+        if "risk of secondary leukemia" in low and ("heart failure" in low or "cardiomyopathy" in low):
             return True
 
     if field == "Diabetes":
-        # avoid isolated ambiguous "DM" unless stronger evidence exists nearby
+        if DM_GENERAL_INFO_RX.search(low):
+            return True
         if DIABETES_DM_AMBIG_RX.search(low):
             stronger = re.search(
-                r"\b(diabetes|diabetes mellitus|type 1 diabetes|type 2 diabetes|t1dm|t2dm|metformin|insulin|a1c)\b",
+                r"\b(diabetes|diabetes mellitus|type 1 diabetes|type 2 diabetes|t1dm|t2dm|metformin|insulin|a1c|glucose|dm2)\b",
                 low,
                 re.I
             )
             if not stronger:
                 return True
+        if "may include diabetes" in low:
+            return True
 
     if field == "VenousThromboembolism":
-        if "risk for dvt" in low or "risk of dvt" in low or "risk of pe" in low:
+        if VTE_RULEOUT_EXCLUDE_RX.search(low):
             return True
-        if "vte risk assessment" in low or "risk factors score" in low or "caprini" in low:
+        if "tamoxifen has been shown" in low:
+            return True
+        if "raloxifene did increase" in low:
+            return True
+        if "chance of pulmonary embolism" in low:
+            return True
+        if "risk of dvt" in low or "risk of pe" in low:
+            return True
+        if "symptoms of dvt" in low or "symptoms of pe" in low:
+            return True
+        if "seek medical attention" in low and ("dvt" in low or "pe" in low):
+            return True
+        if "to rule out dvt" in low or "rule out dvt" in low or "ruled out pe" in low:
             return True
 
     return False
@@ -695,12 +758,6 @@ def _extract_concept(field, note):
             if VTE_PROPHYLAXIS_RX.search(low):
                 continue
 
-        if field == "Steroid":
-            if SYSTEMIC_STEROID_EXCLUDE_RX.search(low):
-                continue
-            if STEROID_NEG_CONTEXT_RX.search(low):
-                continue
-
         status = _status_from_context(evid)
         value = False if status == "denied" else True
         conf = _concept_confidence(section, cfg.get("base_conf", 0.80))
@@ -725,7 +782,7 @@ def _extract_diabetes_med_inference(note):
     cands = []
 
     for section, text in _iter_sections(note):
-        m = _find_first(DM_MED_STRONG, text)
+        m = _find_first([r"\binsulin\b", r"\blantus\b", r"\bhumalog\b", r"\bnovolog\b", r"\blevemir\b", r"\bmetformin\b"], text)
         if not m:
             continue
 
@@ -744,7 +801,9 @@ def _extract_diabetes_med_inference(note):
         if _is_negated(low):
             continue
 
-        # Metformin alone can be weak; require some diabetes-related context
+        if DM_GENERAL_INFO_RX.search(low):
+            continue
+
         if re.search(r"\bmetformin\b", low, re.I):
             stronger = re.search(
                 r"\b(diabetes|diabetes mellitus|dm|t2dm|type 2 diabetes|a1c|glucose)\b",
@@ -771,6 +830,90 @@ def _extract_diabetes_med_inference(note):
     return cands
 
 
+def _steroid_is_regular_systemic_use(low):
+    has_drug = False
+    for p in STEROID_SYSTEMIC_POS_RX:
+        if re.search(p, low, re.I):
+            has_drug = True
+            break
+    if not has_drug:
+        for p in STEROID_IMMUNOSUPPRESSANT_RX:
+            if re.search(p, low, re.I):
+                has_drug = True
+                break
+    if not has_drug:
+        return False
+
+    if SYSTEMIC_STEROID_EXCLUDE_RX.search(low):
+        return False
+
+    if STEROID_NEG_CONTEXT_RX.search(low):
+        return False
+
+    if STEROID_SHORTCOURSE_RX.search(low):
+        return False
+
+    if STEROID_CHEMO_RX.search(low):
+        return False
+
+    if STEROID_PERIOP_RX.search(low):
+        return False
+
+    # Must look like regular/chronic/systemic use
+    if STEROID_CHRONIC_CONTEXT_RX.search(low):
+        return True
+
+    # Or explicit chronic-disease context plus medication mention
+    if STEROID_CHRONIC_DISEASE_RX.search(low):
+        return True
+
+    return False
+
+
+def _extract_steroid(note):
+    cands = []
+
+    combined_patterns = STEROID_SYSTEMIC_POS_RX + STEROID_IMMUNOSUPPRESSANT_RX
+
+    for section, text in _iter_sections(note):
+        m = _find_first(combined_patterns, text)
+        if not m:
+            continue
+
+        evid = window_around(text, m.start(), m.end(), 320)
+        low = evid.lower()
+
+        if _family_context(low):
+            continue
+
+        if _is_bad_template_context("Steroid", section, evid):
+            continue
+
+        if not _steroid_is_regular_systemic_use(low):
+            continue
+
+        status = _status_from_context(evid)
+        if status == "denied":
+            continue
+
+        conf = _concept_confidence(section, 0.84)
+
+        cands.append(_emit(
+            field="Steroid",
+            value=True,
+            status="history",
+            evid=evid,
+            section=section,
+            note=note,
+            conf=conf
+        ))
+
+        if _section_rank(section) == 0:
+            break
+
+    return cands
+
+
 def extract_comorbidities(note):
     cands = []
     cands.extend(_extract_concept("Diabetes", note))
@@ -778,7 +921,7 @@ def extract_comorbidities(note):
     cands.extend(_extract_concept("Hypertension", note))
     cands.extend(_extract_concept("CardiacDisease", note))
     cands.extend(_extract_concept("VenousThromboembolism", note))
-    cands.extend(_extract_concept("Steroid", note))
+    cands.extend(_extract_steroid(note))
     return cands
 
 
@@ -815,8 +958,8 @@ COMORBIDITY_PREFILTER = re.compile(
     r"diabetes|diabetes mellitus|diabetic|dm|t1dm|t2dm|insulin|metformin|a1c|glucose|"
     r"hypertension|htn|high blood pressure|"
     r"cad|coronary artery disease|chf|heart failure|mi|atrial fibrillation|afib|a-fib|cardiomyopathy|"
-    r"dvt|deep vein thrombosis|pe|pulmonary embol|vte|"
-    r"prednisone|dexamethasone|methylprednisolone|medrol|hydrocortisone|solu-cortef|steroid"
+    r"dvt|deep vein thrombosis|pe|pulmonary embol|vte|lovenox|venous duplex|"
+    r"prednisone|dexamethasone|methylprednisolone|medrol|hydrocortisone|solu-cortef|steroid|immunosuppress"
     r")\b",
     re.I
 )
@@ -837,7 +980,7 @@ def main():
     notes_df = load_and_reconstruct_notes()
     print("Reconstructed notes: {0}".format(len(notes_df)))
 
-    # keep only these fields controlled by this updater
+    # rebuild only these fields
     for c in COMORBIDITY_FIELDS:
         master[c] = 0
 
