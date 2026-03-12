@@ -2,49 +2,48 @@
 # -*- coding: utf-8 -*-
 
 """
-build_complications_confusion_matrix.py
+build_complications_qa_revision_final.py
 
 Purpose:
-- Print confusion matrix counts for focused complication variables
-- Use validation/QA CSV with gold + predicted columns
-- No sklearn required
+- Build a single-file QA sample for final focused review of revision variables
+- Use existing master + complications evidence
+- Output ONE CSV
+- Final QA file contains NO MRN column
+
+Sampling:
+- 20 predicted-positive rows per field
+- 20 predicted-negative rows per field
 
 Focused fields:
-- Stage1_MinorComp
 - Stage1_Revision
-- Stage2_MinorComp
 - Stage2_Revision
+
+Output:
+- /home/apokol/Breast_Restore/_outputs/complications_qa_revision_final.csv
 
 Python 3.6.8 compatible.
 """
 
 import os
+import random
 import pandas as pd
 
-INPUT_FILE = input("Enter path to validation CSV: ").strip()
+BASE_DIR = "/home/apokol/Breast_Restore"
 
-FIELD_MAP = [
-    {
-        "label": "Stage1_MinorComp",
-        "gold_col": "Stage1_MinorComp",
-        "pred_col": "Stage1_MinorComp_pred",
-    },
-    {
-        "label": "Stage1_Revision",
-        "gold_col": "Stage1_Revision",
-        "pred_col": "Stage1_Revision_pred",
-    },
-    {
-        "label": "Stage2_MinorComp",
-        "gold_col": "GOLD_Stage2_MinorComp",
-        "pred_col": "Stage2_MinorComp_pred",
-    },
-    {
-        "label": "Stage2_Revision",
-        "gold_col": "GOLD_Stage2_Revision",
-        "pred_col": "Stage2_Revision_pred",
-    },
+MASTER_FILE = "{0}/_outputs/master_abstraction_rule_FINAL_NO_GOLD_with_stage2_preds_complications.csv".format(BASE_DIR)
+EVID_FILE = "{0}/_outputs/complications_patch_evidence.csv".format(BASE_DIR)
+OUTPUT_QA = "{0}/_outputs/complications_qa_revision_final.csv".format(BASE_DIR)
+
+MERGE_KEY = "MRN"
+
+FIELDS = [
+    "Stage1_Revision",
+    "Stage2_Revision",
 ]
+
+POSITIVES_N = 20
+NEGATIVES_N = 20
+RANDOM_SEED = 42
 
 
 def read_csv_robust(path):
@@ -99,6 +98,21 @@ def clean_cell(x):
     return s
 
 
+def normalize_mrn(df):
+    key_variants = ["MRN", "mrn", "Patient_MRN", "PAT_MRN", "PATIENT_MRN"]
+    found = None
+    for k in key_variants:
+        if k in df.columns:
+            found = k
+            break
+    if found is None:
+        raise RuntimeError("MRN column not found. Columns seen: {0}".format(list(df.columns)[:50]))
+    if found != MERGE_KEY:
+        df = df.rename(columns={found: MERGE_KEY})
+    df[MERGE_KEY] = df[MERGE_KEY].astype(str).str.strip()
+    return df
+
+
 def to_binary_01(x):
     s = clean_cell(x).lower()
     if s in {"1", "1.0", "true", "t", "yes", "y"}:
@@ -106,87 +120,202 @@ def to_binary_01(x):
     return 0
 
 
-def compute_confusion(gold_series, pred_series):
-    g = gold_series.apply(to_binary_01)
-    p = pred_series.apply(to_binary_01)
-
-    tn = int(((g == 0) & (p == 0)).sum())
-    fp = int(((g == 0) & (p == 1)).sum())
-    fn = int(((g == 1) & (p == 0)).sum())
-    tp = int(((g == 1) & (p == 1)).sum())
-
-    total = tn + fp + fn + tp
-    acc = float(tn + tp) / total if total > 0 else 0.0
-    precision = float(tp) / (tp + fp) if (tp + fp) > 0 else 0.0
-    recall = float(tp) / (tp + fn) if (tp + fn) > 0 else 0.0
-    f1 = float(2 * precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
-
-    return {
-        "tn": tn,
-        "fp": fp,
-        "fn": fn,
-        "tp": tp,
-        "total": total,
-        "accuracy": acc,
-        "precision": precision,
-        "recall": recall,
-        "f1": f1,
-    }
+def truncate_text(x, limit=350):
+    s = clean_cell(x)
+    if len(s) <= limit:
+        return s
+    return s[:limit] + " ...[TRUNCATED]"
 
 
-def print_matrix(label, gold_col, pred_col, stats):
-    print("\n==================================================")
-    print("Field      : {0}".format(label))
-    print("Gold col   : {0}".format(gold_col))
-    print("Pred col   : {0}".format(pred_col))
-    print("==================================================")
-    print("                 Predicted")
-    print("               0        1")
-    print("Actual 0     {:<8} {:<8}".format(stats["tn"], stats["fp"]))
-    print("Actual 1     {:<8} {:<8}".format(stats["fn"], stats["tp"]))
-    print("")
-    print("TN: {0}".format(stats["tn"]))
-    print("FP: {0}".format(stats["fp"]))
-    print("FN: {0}".format(stats["fn"]))
-    print("TP: {0}".format(stats["tp"]))
-    print("Total: {0}".format(stats["total"]))
-    print("Accuracy : {:.4f}".format(stats["accuracy"]))
-    print("Precision: {:.4f}".format(stats["precision"]))
-    print("Recall   : {:.4f}".format(stats["recall"]))
-    print("F1       : {:.4f}".format(stats["f1"]))
+def make_deid_case_id(field, bucket, idx):
+    return "{0}_{1}_{2:03d}".format(field, bucket, idx)
+
+
+def confidence_to_float(x):
+    s = clean_cell(x)
+    try:
+        return float(s)
+    except Exception:
+        return 0.0
+
+
+def status_rank(x):
+    s = clean_cell(x).lower()
+    if s == "history":
+        return 3
+    if s == "performed":
+        return 3
+    if s == "denied":
+        return 2
+    if s == "planned":
+        return 1
+    return 0
+
+
+def get_best_evidence_map(evid_df, field_name):
+    """
+    Keep best evidence row per MRN for one field.
+    Preference:
+    1) higher status rank
+    2) higher confidence
+    3) non-empty evidence
+    """
+    best = {}
+
+    subset = evid_df[evid_df["FIELD"].astype(str).str.strip() == field_name].copy()
+
+    for _, row in subset.iterrows():
+        mrn = clean_cell(row.get(MERGE_KEY, ""))
+        if not mrn:
+            continue
+
+        conf = confidence_to_float(row.get("CONFIDENCE", "0"))
+        s_rank = status_rank(row.get("STATUS", ""))
+        evidence = clean_cell(row.get("EVIDENCE", ""))
+        score = (s_rank, conf, 1 if evidence else 0)
+
+        existing = best.get(mrn)
+        if existing is None or score > existing["_score"]:
+            saved = dict(row)
+            saved["_score"] = score
+            best[mrn] = saved
+
+    return best
+
+
+def build_rows_for_field(master_df, best_evidence, field_name, positives_n, negatives_n, rng):
+    out = []
+
+    if field_name not in master_df.columns:
+        return out
+
+    tmp = master_df.copy()
+    tmp["_bin_"] = tmp[field_name].apply(to_binary_01)
+
+    pos_df = tmp[tmp["_bin_"] == 1].copy()
+    neg_df = tmp[tmp["_bin_"] == 0].copy()
+
+    pos_idxs = list(pos_df.index)
+    neg_idxs = list(neg_df.index)
+
+    rng.shuffle(pos_idxs)
+    rng.shuffle(neg_idxs)
+
+    pos_idxs = pos_idxs[:min(positives_n, len(pos_idxs))]
+    neg_idxs = neg_idxs[:min(negatives_n, len(neg_idxs))]
+
+    for i, idx in enumerate(pos_idxs, 1):
+        row = pos_df.loc[idx]
+        mrn = clean_cell(row.get(MERGE_KEY, ""))
+        ev = best_evidence.get(mrn, {})
+
+        out.append({
+            "qa_case_id": make_deid_case_id(field_name, "POS", i),
+            "field": field_name,
+            "sample_bucket": "predicted_positive",
+            "predicted_value": 1,
+            "review_label": "",
+            "error_type": "",
+            "review_notes": "",
+            "confidence": clean_cell(ev.get("CONFIDENCE", "")),
+            "status": clean_cell(ev.get("STATUS", "")),
+            "section": clean_cell(ev.get("SECTION", "")),
+            "note_type": clean_cell(ev.get("NOTE_TYPE", "")),
+            "note_date": clean_cell(ev.get("NOTE_DATE", "")),
+            "stage_assigned": clean_cell(ev.get("STAGE_ASSIGNED", "")),
+            "evidence_snippet": truncate_text(ev.get("EVIDENCE", ""), 350),
+        })
+
+    for i, idx in enumerate(neg_idxs, 1):
+        row = neg_df.loc[idx]
+        mrn = clean_cell(row.get(MERGE_KEY, ""))
+        ev = best_evidence.get(mrn, {})
+
+        out.append({
+            "qa_case_id": make_deid_case_id(field_name, "NEG", i),
+            "field": field_name,
+            "sample_bucket": "predicted_negative",
+            "predicted_value": 0,
+            "review_label": "",
+            "error_type": "",
+            "review_notes": "",
+            "confidence": clean_cell(ev.get("CONFIDENCE", "")),
+            "status": clean_cell(ev.get("STATUS", "")),
+            "section": clean_cell(ev.get("SECTION", "")),
+            "note_type": clean_cell(ev.get("NOTE_TYPE", "")),
+            "note_date": clean_cell(ev.get("NOTE_DATE", "")),
+            "stage_assigned": clean_cell(ev.get("STAGE_ASSIGNED", "")),
+            "evidence_snippet": truncate_text(ev.get("EVIDENCE", ""), 350),
+        })
+
+    return out
 
 
 def main():
-    if not INPUT_FILE:
-        raise RuntimeError("No input file provided.")
+    random.seed(RANDOM_SEED)
+    rng = random.Random(RANDOM_SEED)
 
-    if not os.path.exists(INPUT_FILE):
-        raise FileNotFoundError("Input file not found: {0}".format(INPUT_FILE))
+    if not os.path.exists(MASTER_FILE):
+        raise FileNotFoundError("Master file not found: {0}".format(MASTER_FILE))
+    if not os.path.exists(EVID_FILE):
+        raise FileNotFoundError("Evidence file not found: {0}".format(EVID_FILE))
 
-    print("Loading file...")
-    df = clean_cols(read_csv_robust(INPUT_FILE))
+    print("Loading master...")
+    master = clean_cols(read_csv_robust(MASTER_FILE))
+    master = normalize_mrn(master)
 
-    print("\nColumns found:")
-    for c in df.columns:
-        print(c)
+    print("Loading evidence...")
+    evid = clean_cols(read_csv_robust(EVID_FILE))
+    evid = normalize_mrn(evid)
 
-    for item in FIELD_MAP:
-        label = item["label"]
-        gold_col = item["gold_col"]
-        pred_col = item["pred_col"]
+    qa_rows = []
 
-        if gold_col not in df.columns:
-            print("\nWARNING: missing gold column for {0}: {1}".format(label, gold_col))
-            continue
+    for field_name in FIELDS:
+        if field_name not in master.columns:
+            print("WARNING: field missing in master: {0}".format(field_name))
+            master[field_name] = 0
 
-        if pred_col not in df.columns:
-            print("\nWARNING: missing pred column for {0}: {1}".format(label, pred_col))
-            continue
+        best_evidence = get_best_evidence_map(evid, field_name)
+        rows = build_rows_for_field(master, best_evidence, field_name, POSITIVES_N, NEGATIVES_N, rng)
+        qa_rows.extend(rows)
+        print("{0}: {1} rows".format(field_name, len(rows)))
 
-        stats = compute_confusion(df[gold_col], df[pred_col])
-        print_matrix(label, gold_col, pred_col, stats)
+    qa_df = pd.DataFrame(qa_rows)
+
+    desired_cols = [
+        "qa_case_id",
+        "field",
+        "sample_bucket",
+        "predicted_value",
+        "review_label",
+        "error_type",
+        "review_notes",
+        "confidence",
+        "status",
+        "section",
+        "note_type",
+        "note_date",
+        "stage_assigned",
+        "evidence_snippet",
+    ]
+
+    for c in desired_cols:
+        if c not in qa_df.columns:
+            qa_df[c] = ""
+
+    qa_df = qa_df[desired_cols].copy()
+
+    leak_cols = [c for c in qa_df.columns if c.strip().upper() in {"MRN", "PAT_MRN", "PATIENT_MRN"}]
+    if leak_cols:
+        qa_df = qa_df.drop(columns=leak_cols)
+
+    os.makedirs(os.path.dirname(OUTPUT_QA), exist_ok=True)
+    qa_df.to_csv(OUTPUT_QA, index=False)
 
     print("\nDONE.")
+    print("- QA file: {0}".format(OUTPUT_QA))
+    print("- Total rows: {0}".format(len(qa_df)))
+    print("- MRN removed from final output.")
 
 
 if __name__ == "__main__":
