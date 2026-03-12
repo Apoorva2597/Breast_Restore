@@ -5,7 +5,7 @@ from models import SectionedNote, Candidate
 
 from .bmi import extract_bmi
 from .smoking import extract_smoking
-from .comorbidities import extract_comorbidities
+from .comorbidity_module import extract_comorbidities
 from .procedures import extract_reconstruction, extract_lymph_node_mgmt
 from .pbs import extract_pbs
 from .mastectomy import extract_mastectomy
