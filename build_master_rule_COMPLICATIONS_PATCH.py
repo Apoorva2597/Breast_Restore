@@ -21,6 +21,7 @@ Python 3.6.8 compatible
 """
 
 import os
+import re
 from glob import glob
 from datetime import datetime
 
@@ -177,7 +178,7 @@ def parse_date_safe(x):
         return None
 
 
-HEADER_RX = __import__("re").compile(r"^\s*([A-Z][A-Z0-9 /&\-]{2,60})\s*:\s*$")
+HEADER_RX = re.compile(r"^\s*([A-Z][A-Z0-9 /&\-]{2,60})\s*:\s*$")
 
 
 def sectionize(text):
@@ -401,10 +402,28 @@ def field_for_stage(stage_label, base_field):
 def ensure_target_columns(master):
     for col in TARGET_FIELDS:
         if col not in master.columns:
-            master[col] = master[col].fillna(0)
-    for col in BOOLEAN_FIELDS:
-        if col not in master.columns:
             master[col] = 0
+        master[col] = master[col].fillna(0)
+
+        try:
+            master[col] = (
+                master[col]
+                .astype(str)
+                .str.strip()
+                .replace({
+                    "": "0",
+                    "nan": "0",
+                    "None": "0",
+                    "none": "0",
+                    "null": "0",
+                    "NA": "0",
+                    "na": "0"
+                })
+            )
+        except Exception:
+            pass
+
+    return master
 
 
 def main():
@@ -415,7 +434,7 @@ def main():
     master = clean_cols(read_csv_robust(MASTER_FILE))
     master = normalize_mrn(master)
 
-    ensure_target_columns(master)
+    master = ensure_target_columns(master)
 
     master_lookup = {}
     for _, row in master.iterrows():
@@ -537,6 +556,24 @@ def main():
             except Exception:
                 val = 0
             master.loc[mask, logical] = val
+
+    # final cleanup so blanks never remain in outcome columns
+    for col in TARGET_FIELDS:
+        master[col] = (
+            master[col]
+            .fillna(0)
+            .astype(str)
+            .str.strip()
+            .replace({
+                "": "0",
+                "nan": "0",
+                "None": "0",
+                "none": "0",
+                "null": "0",
+                "NA": "0",
+                "na": "0"
+            })
+        )
 
     os.makedirs(os.path.dirname(OUTPUT_MASTER), exist_ok=True)
     master.to_csv(OUTPUT_MASTER, index=False)
