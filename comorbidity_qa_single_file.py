@@ -11,7 +11,6 @@ Purpose:
 - Final QA file contains NO MRN column
 
 Focus fields:
-- Obesity
 - Diabetes
 - Hypertension
 - CardiacDisease
@@ -41,7 +40,6 @@ OUTPUT_QA = "{0}/_outputs/comorbidity_qa_single_file.csv".format(BASE_DIR)
 MERGE_KEY = "MRN"
 
 COMORBIDITY_FIELDS = [
-    "Obesity",
     "Diabetes",
     "Hypertension",
     "CardiacDisease",
@@ -129,7 +127,7 @@ def to_binary_01(x):
     return 0
 
 
-def truncate_text(x, limit=500):
+def truncate_text(x, limit=700):
     s = clean_cell(x)
     if len(s) <= limit:
         return s
@@ -142,12 +140,32 @@ def make_deid_case_id(field, bucket, idx):
     return "{0}_{1}_{2:03d}".format(field_short, bucket, idx)
 
 
+def rule_decision_rank(x):
+    s = clean_cell(x).lower()
+    if s == "accept_positive":
+        return 3
+    if s.startswith("accept"):
+        return 2
+    if s.startswith("reject"):
+        return 1
+    return 0
+
+
+def confidence_to_float(x):
+    s = clean_cell(x)
+    try:
+        return float(s)
+    except Exception:
+        return 0.0
+
+
 def get_best_evidence_map(evid_df):
     """
-    Keep best accepted evidence row per MRN+FIELD.
+    Keep best evidence row per MRN+FIELD.
     Preference:
-    1) higher confidence
-    2) non-empty evidence
+    1) accepted rule_decision
+    2) higher confidence
+    3) non-empty evidence
     """
     best = {}
 
@@ -161,14 +179,10 @@ def get_best_evidence_map(evid_df):
 
         key = (mrn, field)
 
-        conf_raw = clean_cell(row.get("CONFIDENCE", "0"))
-        try:
-            conf = float(conf_raw)
-        except Exception:
-            conf = 0.0
-
+        conf = confidence_to_float(row.get("CONFIDENCE", "0"))
+        rule_rank = rule_decision_rank(row.get("RULE_DECISION", ""))
         evidence = clean_cell(row.get("EVIDENCE", ""))
-        score = (conf, 1 if evidence else 0)
+        score = (rule_rank, conf, 1 if evidence else 0)
 
         existing = best.get(key)
         if existing is None or score > existing["_score"]:
@@ -230,7 +244,6 @@ def build_negative_rows(master_df, best_evidence, field, n, rng):
         row = eligible.loc[idx]
         mrn = clean_cell(row.get(MERGE_KEY, ""))
 
-        # most negatives will not have evidence, which is okay
         ev = best_evidence.get((mrn, field), {})
 
         out.append({
@@ -313,7 +326,6 @@ def main():
 
     qa_df = qa_df[desired_cols].copy()
 
-    # explicitly ensure no MRN leaks into output
     leak_cols = [c for c in qa_df.columns if c.strip().upper() in {"MRN", "PAT_MRN", "PATIENT_MRN"}]
     if leak_cols:
         qa_df = qa_df.drop(columns=leak_cols)
