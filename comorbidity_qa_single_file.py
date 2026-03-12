@@ -2,27 +2,23 @@
 # -*- coding: utf-8 -*-
 
 """
-build_comorbidity_qa_single_file.py
+build_vte_qa_single_file.py
 
 Purpose:
-- Build a single-file QA sample for comorbidity review
+- Build a single-file QA sample for VTE review only
 - Use existing master + comorbidity evidence
 - Output ONE CSV
 - Final QA file contains NO MRN column
 
-Focus fields:
-- Diabetes
-- Hypertension
-- CardiacDisease
+Focus field:
 - VenousThromboembolism
-- Steroid
 
 Sampling:
-- positives_per_field: number of predicted-positive rows per field
-- negatives_per_field: number of predicted-negative rows per field
+- positives_n: number of predicted-positive rows
+- negatives_n: number of predicted-negative rows
 
 Output:
-- /home/apokol/Breast_Restore/_outputs/comorbidity_qa_single_file.csv
+- /home/apokol/Breast_Restore/_outputs/vte_qa_single_file.csv
 
 Python 3.6.8 compatible.
 """
@@ -35,21 +31,13 @@ BASE_DIR = "/home/apokol/Breast_Restore"
 
 MASTER_FILE = "{0}/_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv".format(BASE_DIR)
 EVID_FILE = "{0}/_outputs/comorbidity_only_evidence.csv".format(BASE_DIR)
-OUTPUT_QA = "{0}/_outputs/comorbidity_qa_single_file.csv".format(BASE_DIR)
+OUTPUT_QA = "{0}/_outputs/vte_qa_single_file.csv".format(BASE_DIR)
 
 MERGE_KEY = "MRN"
+FIELD = "VenousThromboembolism"
 
-COMORBIDITY_FIELDS = [
-    "Diabetes",
-    "Hypertension",
-    "CardiacDisease",
-    "VenousThromboembolism",
-    "Steroid",
-]
-
-# adjust if needed
-POSITIVES_PER_FIELD = 25
-NEGATIVES_PER_FIELD = 25
+POSITIVES_N = 25
+NEGATIVES_N = 10
 RANDOM_SEED = 42
 
 
@@ -127,24 +115,24 @@ def to_binary_01(x):
     return 0
 
 
-def truncate_text(x, limit=700):
+def truncate_text(x, limit=900):
     s = clean_cell(x)
     if len(s) <= limit:
         return s
     return s[:limit] + " ...[TRUNCATED]"
 
 
-def make_deid_case_id(field, bucket, idx):
-    field_short = field.replace("VenousThromboembolism", "VTE")
-    field_short = field_short.replace("CardiacDisease", "Cardiac")
-    return "{0}_{1}_{2:03d}".format(field_short, bucket, idx)
+def make_deid_case_id(bucket, idx):
+    return "VTE_{0}_{1:03d}".format(bucket, idx)
 
 
 def rule_decision_rank(x):
     s = clean_cell(x).lower()
     if s == "accept_positive":
-        return 3
+        return 4
     if s.startswith("accept"):
+        return 3
+    if s == "reject_template_context":
         return 2
     if s.startswith("reject"):
         return 1
@@ -161,9 +149,9 @@ def confidence_to_float(x):
 
 def get_best_evidence_map(evid_df):
     """
-    Keep best evidence row per MRN+FIELD.
+    Keep best evidence row per MRN for VTE.
     Preference:
-    1) accepted rule_decision
+    1) stronger rule_decision rank
     2) higher confidence
     3) non-empty evidence
     """
@@ -172,12 +160,10 @@ def get_best_evidence_map(evid_df):
     for _, row in evid_df.iterrows():
         mrn = clean_cell(row.get(MERGE_KEY, ""))
         field = clean_cell(row.get("FIELD", ""))
-        if not mrn or not field:
-            continue
-        if field not in COMORBIDITY_FIELDS:
+        if not mrn or field != FIELD:
             continue
 
-        key = (mrn, field)
+        key = mrn
 
         conf = confidence_to_float(row.get("CONFIDENCE", "0"))
         rule_rank = rule_decision_rank(row.get("RULE_DECISION", ""))
@@ -193,10 +179,10 @@ def get_best_evidence_map(evid_df):
     return best
 
 
-def build_positive_rows(master_df, best_evidence, field, n, rng):
+def build_positive_rows(master_df, best_evidence, n, rng):
     out = []
 
-    eligible = master_df[master_df[field].apply(to_binary_01) == 1].copy()
+    eligible = master_df[master_df[FIELD].apply(to_binary_01) == 1].copy()
     if len(eligible) == 0:
         return out
 
@@ -207,11 +193,11 @@ def build_positive_rows(master_df, best_evidence, field, n, rng):
     for i, idx in enumerate(idxs, 1):
         row = eligible.loc[idx]
         mrn = clean_cell(row.get(MERGE_KEY, ""))
-        ev = best_evidence.get((mrn, field), {})
+        ev = best_evidence.get(mrn, {})
 
         out.append({
-            "qa_case_id": make_deid_case_id(field, "POS", i),
-            "field": field,
+            "qa_case_id": make_deid_case_id("POS", i),
+            "field": FIELD,
             "sample_bucket": "predicted_positive",
             "predicted_value": 1,
             "review_label": "",
@@ -223,16 +209,16 @@ def build_positive_rows(master_df, best_evidence, field, n, rng):
             "section": clean_cell(ev.get("SECTION", "")),
             "note_type": clean_cell(ev.get("NOTE_TYPE", "")),
             "note_date": clean_cell(ev.get("NOTE_DATE", "")),
-            "evidence_snippet": truncate_text(ev.get("EVIDENCE", ""), 700),
+            "evidence_snippet": truncate_text(ev.get("EVIDENCE", ""), 900),
         })
 
     return out
 
 
-def build_negative_rows(master_df, best_evidence, field, n, rng):
+def build_negative_rows(master_df, best_evidence, n, rng):
     out = []
 
-    eligible = master_df[master_df[field].apply(to_binary_01) == 0].copy()
+    eligible = master_df[master_df[FIELD].apply(to_binary_01) == 0].copy()
     if len(eligible) == 0:
         return out
 
@@ -243,12 +229,11 @@ def build_negative_rows(master_df, best_evidence, field, n, rng):
     for i, idx in enumerate(idxs, 1):
         row = eligible.loc[idx]
         mrn = clean_cell(row.get(MERGE_KEY, ""))
-
-        ev = best_evidence.get((mrn, field), {})
+        ev = best_evidence.get(mrn, {})
 
         out.append({
-            "qa_case_id": make_deid_case_id(field, "NEG", i),
-            "field": field,
+            "qa_case_id": make_deid_case_id("NEG", i),
+            "field": FIELD,
             "sample_bucket": "predicted_negative",
             "predicted_value": 0,
             "review_label": "",
@@ -260,7 +245,7 @@ def build_negative_rows(master_df, best_evidence, field, n, rng):
             "section": clean_cell(ev.get("SECTION", "")),
             "note_type": clean_cell(ev.get("NOTE_TYPE", "")),
             "note_date": clean_cell(ev.get("NOTE_DATE", "")),
-            "evidence_snippet": truncate_text(ev.get("EVIDENCE", ""), 700),
+            "evidence_snippet": truncate_text(ev.get("EVIDENCE", ""), 900),
         })
 
     return out
@@ -283,23 +268,20 @@ def main():
     evid = clean_cols(read_csv_robust(EVID_FILE))
     evid = normalize_mrn(evid)
 
-    for field in COMORBIDITY_FIELDS:
-        if field not in master.columns:
-            print("WARNING: field missing in master: {0}".format(field))
-            master[field] = 0
+    if FIELD not in master.columns:
+        print("WARNING: field missing in master: {0}".format(FIELD))
+        master[FIELD] = 0
 
     best_evidence = get_best_evidence_map(evid)
 
     qa_rows = []
+    pos_rows = build_positive_rows(master, best_evidence, POSITIVES_N, rng)
+    neg_rows = build_negative_rows(master, best_evidence, NEGATIVES_N, rng)
 
-    for field in COMORBIDITY_FIELDS:
-        pos_rows = build_positive_rows(master, best_evidence, field, POSITIVES_PER_FIELD, rng)
-        neg_rows = build_negative_rows(master, best_evidence, field, NEGATIVES_PER_FIELD, rng)
+    qa_rows.extend(pos_rows)
+    qa_rows.extend(neg_rows)
 
-        qa_rows.extend(pos_rows)
-        qa_rows.extend(neg_rows)
-
-        print("{0}: +{1} / -{2}".format(field, len(pos_rows), len(neg_rows)))
+    print("{0}: +{1} / -{2}".format(FIELD, len(pos_rows), len(neg_rows)))
 
     qa_df = pd.DataFrame(qa_rows)
 
