@@ -93,7 +93,8 @@ ACUTE_EVENT_RX = re.compile(
     r"postop|post-op|post operative|postoperative|complicated by|developed|presented with|"
     r"required|underwent|warranting|necessitating|was treated for|returned to the or|"
     r"readmitted|rehospitalized|taken back|takeback|washout|debridement|i\s*&\s*d|"
-    r"incision and drainage|evacuation|explantation|explant|removed because of"
+    r"incision and drainage|evacuation|explantation|explant|removed because of|"
+    r"procedure performed|operations performed|underwent revision|surgery date"
     r")\b",
     re.IGNORECASE
 )
@@ -113,12 +114,11 @@ REVISION_COMPLICATION_REASON_RX = re.compile(
     r"\b("
     r"capsular contracture|contracture|malposition|exposure|extrusion|rupture|"
     r"implant malposition|painful scar|hypertrophic scar|open wound|dehiscence|"
-    r"fat necrosis|flap deformity due to necrosis"
+    r"fat necrosis|flap deformity due to necrosis|animation deformity|rippling"
     r")\b",
     re.IGNORECASE
 )
 
-# new: explicit risk / counseling / education language
 RISK_DISCUSSION_RX = re.compile(
     r"\b("
     r"risk of|risks of|risks include|risk includes|possible complications|potential complications|"
@@ -128,7 +128,6 @@ RISK_DISCUSSION_RX = re.compile(
     re.IGNORECASE
 )
 
-# new: elective / cosmetic revision language
 COSMETIC_REVISION_ONLY_RX = re.compile(
     r"\b("
     r"symmetry|asymmetry|contour deformit(y|ies)|cosmetic|balancing|contralateral mastopexy|"
@@ -138,13 +137,29 @@ COSMETIC_REVISION_ONLY_RX = re.compile(
     re.IGNORECASE
 )
 
-# new: routine stage-2 exchange language
 ROUTINE_STAGE2_EXCHANGE_RX = re.compile(
     r"\b("
     r"implant exchange|exchange of (the )?(tissue )?expanders? for (silicone|saline )?implants?|"
     r"tissue expander exchange|expander[- ]implant exchange|second stage reconstruction|"
     r"stage 2 reconstruction|stage ii reconstruction|delayed exchange|exchange for permanent implant"
     r")\b",
+    re.IGNORECASE
+)
+
+# performed revision language that should count even if cosmetic
+REVISION_PERFORMED_RX = re.compile(
+    r"\b("
+    r"revision of (the )?(reconstructed )?breast|revision of reconstructed breast|"
+    r"underwent revision|status post revision|s/p revision|"
+    r"procedure performed|operations performed|operation performed|"
+    r"capsulectomy|capsulotomy|capsulorrhaphy|fat grafting|fat transfer|lipofilling|"
+    r"scar revision|mastopexy|reduction|dog[- ]ear revision|standing cutaneous deformity"
+    r")\b",
+    re.IGNORECASE
+)
+
+NOT_REVISION_ONLY_RX = re.compile(
+    r"\bnipple reconstruction\b",
     re.IGNORECASE
 )
 
@@ -248,13 +263,9 @@ REVISION_POS = [
     r"\bcontralateral\s+reduction\b",
     r"\bsymmetry\s+procedure\b",
     r"\bbalancing\s+procedure\b",
+    r"\bmastopexy\b",
+    r"\breduction\b",
 ]
-
-NOT_REVISION_ONLY_RX = re.compile(
-    r"\bnipple reconstruction\b",
-    re.IGNORECASE
-)
-
 
 # --------------------------------------------------
 # Helpers
@@ -350,14 +361,10 @@ def _emit(field, value, status, evid, section, note, conf):
 
 
 def _current_complication_ok(low):
-    # reject pure risk discussion
     if _is_risk_discussion(low):
         return False
-
-    # reject historical/resolved-only mentions unless there is acute event language
     if (_is_historical_only(low) or _is_resolved_only(low)) and not _has_acute_event(low):
         return False
-
     return True
 
 
@@ -386,7 +393,6 @@ def _extract_minor_comp(note):
         if _is_planned(low):
             cands.append(_emit("ComplicationSignal", False, "planned", evid, section, note, 0.55))
             continue
-
         if not _current_complication_ok(low):
             continue
 
@@ -537,16 +543,15 @@ def _extract_revision(note):
             continue
         if NOT_REVISION_ONLY_RX.search(low):
             continue
-
-        # new rule:
-        # reject pure cosmetic/elective revision language unless there is complication reason
-        if COSMETIC_REVISION_ONLY_RX.search(low) and not REVISION_COMPLICATION_REASON_RX.search(low):
-            continue
-
-        # reject pure risk/history context unless acute/performed
         if _is_risk_discussion(low):
             continue
         if (_is_historical_only(low) or _is_resolved_only(low)) and not _has_acute_event(low):
+            continue
+
+        # Relaxed revision logic:
+        # Count performed revision procedures, even if cosmetic/elective,
+        # as long as this is not just future planning or abstract discussion.
+        if not REVISION_PERFORMED_RX.search(low):
             continue
 
         conf = _base_conf(section, note.note_type) + 0.02
