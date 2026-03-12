@@ -1,4 +1,4 @@
-# extractors/complications_outcomes.py
+# extractors/complications.py
 # Python 3.6.8 compatible
 
 import re
@@ -8,6 +8,9 @@ from models import Candidate, SectionedNote
 from .utils import window_around
 
 
+# ----------------------------
+# Section controls
+# ----------------------------
 SUPPRESS_SECTIONS = {
     "FAMILY HISTORY",
     "ALLERGIES",
@@ -18,13 +21,17 @@ PREFERRED_SECTIONS = {
     "ASSESSMENT",
     "ASSESSMENT AND PLAN",
     "HOSPITAL COURSE",
+    "BRIEF HOSPITAL COURSE",
     "IMPRESSION",
     "POSTOPERATIVE DIAGNOSIS",
     "POST-OPERATIVE DIAGNOSIS",
     "DIAGNOSIS",
     "PROBLEM LIST",
     "PLAN",
-    "BRIEF HOSPITAL COURSE",
+    "OPERATIVE REPORT",
+    "PROCEDURES",
+    "OP NOTE",
+    "BRIEF OP NOTE",
 }
 
 LOW_VALUE_SECTIONS = {
@@ -36,18 +43,16 @@ LOW_VALUE_SECTIONS = {
     "SOCIAL HISTORY",
 }
 
+# ----------------------------
+# Shared context
+# ----------------------------
 NEGATION_RX = re.compile(
     r"\b(no|not|denies|denied|without|negative\s+for|free\s+of|absence\s+of)\b",
     re.IGNORECASE
 )
 
 PLAN_RX = re.compile(
-    r"\b(plan|planned|planning|scheduled|schedule|will|would|to be|consider|considered|candidate for)\b",
-    re.IGNORECASE
-)
-
-HISTORICAL_RX = re.compile(
-    r"\b(history of|hx of|h/o|prior|previously|previous)\b",
+    r"\b(plan|planned|planning|scheduled|schedule|will|would|to be|consider|considered|candidate for|upcoming)\b",
     re.IGNORECASE
 )
 
@@ -56,32 +61,32 @@ FAMILY_RX = re.compile(
     re.IGNORECASE
 )
 
-RECON_CONTEXT_RX = re.compile(
+BREAST_RECON_CONTEXT_RX = re.compile(
     r"\b("
-    r"breast reconstruction|reconstruction|recon|expander|implant|te\b|tissue expander|"
-    r"diep|tram|latissimus|flap|mastectomy site|breast wound|breast incision"
+    r"breast|reconstruction|recon|mastectomy|implant|implants|expander|expanders|"
+    r"tissue expander|breast pocket|capsule|capsular|flap|diep|tram|latissimus|"
+    r"chest wall|breast incision|mastectomy site|alloderm|adm"
     r")\b",
     re.IGNORECASE
 )
 
-DONOR_CONTEXT_RX = re.compile(
+COMPLICATION_REASON_RX = re.compile(
     r"\b("
-    r"donor site|abdomen|abdominal|abdominal wall|hernia|bulge|laxity|fat necrosis at donor"
+    r"hematoma|seroma|infection|infected|cellulitis|abscess|dehiscence|wound breakdown|"
+    r"necrosis|skin flap necrosis|mastectomy skin flap necrosis|exposure|exposed|"
+    r"extrusion|rupture|leakage|deflation|malposition|contracture|capsular contracture|"
+    r"flap compromise|venous congestion|arterial insufficiency|flap loss|flap failure|"
+    r"painful scar|pain|open wound|drainage|erythema|purulence|purulent"
     r")\b",
     re.IGNORECASE
 )
 
-COMPLICATION_CONTEXT_RX = re.compile(
-    r"\b("
-    r"hematoma|dehiscence|infection|infected|necrosis|seroma|extrusion|rupture|deflation|"
-    r"malposition|contracture|flap loss|flap failure|implant loss|expander loss|"
-    r"cellulitis|abscess|wound breakdown|wound complication|complication"
-    r")\b",
-    re.IGNORECASE
-)
-
+# ----------------------------
+# Minor complication concept
+# ----------------------------
 MINOR_COMP_POS = [
     r"\bhematoma\b",
+    r"\bseroma\b",
     r"\bwound dehiscence\b",
     r"\bdehiscence\b",
     r"\bwound infection\b",
@@ -91,7 +96,6 @@ MINOR_COMP_POS = [
     r"\bmastectomy skin flap necrosis\b",
     r"\bskin flap necrosis\b",
     r"\bnecrosis\b",
-    r"\bseroma\b",
     r"\bcapsular contracture\b",
     r"\bimplant malposition\b",
     r"\bimplant rupture\b",
@@ -99,13 +103,17 @@ MINOR_COMP_POS = [
     r"\bimplant deflation\b",
     r"\bexpander extrusion\b",
     r"\bimplant extrusion\b",
-    r"\bflap congestion\b",
-    r"\bpartial flap necrosis\b",
+    r"\bexposed implant\b",
+    r"\bexposed expander\b",
     r"\bwound breakdown\b",
-    r"\bdrainage from\b.{0,20}\bwound\b",
+    r"\bopen wound\b",
 ]
 
-REOP_POS = [
+# ----------------------------
+# Reoperation
+# Need procedure + complication
+# ----------------------------
+REOP_PROCEDURE_POS = [
     r"\breturn(ed)?\s+to\s+(the\s+)?or\b",
     r"\bback\s+to\s+(the\s+)?or\b",
     r"\btake\s*back\b",
@@ -116,50 +124,115 @@ REOP_POS = [
     r"\bincision\s+and\s+drainage\b",
     r"\bi\s*&\s*d\b",
     r"\bdebridement\b",
-    r"\boperative debridement\b",
-    r"\bclosure in the or\b",
-    r"\bsurgical intervention\b",
+    r"\bhematoma evacuation\b",
+    r"\bseroma drainage\b",
+    r"\bdrain placement\b",
+    r"\bdrainage procedure\b",
+    r"\bexplantation\b",
+    r"\bexplant(ed)?\b",
+    r"\bremoval of (the )?(implant|expander|flap)\b",
+    r"\bimplant removal\b",
+    r"\bexpander removal\b",
 ]
 
+REVISION_ONLY_RX = re.compile(
+    r"\b("
+    r"fat grafting|fat transfer|lipofilling|scar revision|symmetry procedure|"
+    r"contour revision|contour deformit(y|ies)|dog ear|dog-ear|standing cutaneous deformit(y|ies)|"
+    r"contralateral mastopexy|contralateral reduction|balancing procedure|nipple reconstruction|"
+    r"capsulectomy|capsulorrhaphy|capsulotomy"
+    r")\b",
+    re.IGNORECASE
+)
+
+PLANNED_STAGE2_EXCHANGE_ONLY_RX = re.compile(
+    r"\b("
+    r"implant exchange|exchange of (the )?(tissue )?expanders? for (silicone|saline )?implants?|"
+    r"tissue expander exchange|expander[- ]implant exchange|second stage reconstruction|"
+    r"stage 2 reconstruction|planned exchange|scheduled exchange"
+    r")\b",
+    re.IGNORECASE
+)
+
+# ----------------------------
+# Rehospitalization
+# ----------------------------
 REHOSP_POS = [
     r"\breadmit(ted|sion)?\b",
     r"\bre-?admit(ted|sion)?\b",
     r"\brehospitali[sz](ed|ation)?\b",
     r"\breturn(ed)?\s+to\s+hospital\b",
-    r"\badmitted\s+for\b.{0,40}\b(cellulitis|infection|seroma|hematoma|necrosis|wound)\b",
 ]
 
-FAILURE_POS = [
-    r"\bflap\s+(loss|failed|failure)\b",
+# ----------------------------
+# Failure
+# Need removal/loss + reason
+# ----------------------------
+FAILURE_REMOVAL_POS = [
+    r"\bflap\s+loss\b",
+    r"\bflap\s+failure\b",
     r"\btotal\s+flap\s+loss\b",
     r"\bcomplete\s+flap\s+necrosis\b",
-    r"\bimplant\s+(loss|removed|removal)\b",
-    r"\bexpander\s+(loss|removed|removal)\b",
+    r"\bimplant\s+removed\b",
+    r"\bimplant\s+removal\b",
+    r"\bexpander\s+removed\b",
+    r"\bexpander\s+removal\b",
     r"\bprosthesis\s+removed\b",
     r"\bexplant(ed|ation)?\b",
-    r"\bremoved\s+the\s+(implant|expander|flap)\b",
+    r"\bremoval of (the )?(implant|expander|flap)\b",
 ]
 
+FAILURE_REASON_RX = re.compile(
+    r"\b("
+    r"infection|infected|cellulitis|exposure|exposed|extrusion|rupture|leakage|deflation|"
+    r"necrosis|flap loss|flap failure|venous congestion|arterial insufficiency|"
+    r"implant malposition|capsular contracture|hematoma|seroma|dehiscence|open wound"
+    r")\b",
+    re.IGNORECASE
+)
+
+ROUTINE_STAGE2_EXCHANGE_RX = re.compile(
+    r"\b("
+    r"exchange of (the )?(tissue )?expanders? for implants?|"
+    r"implant exchange|second stage reconstruction|stage 2 exchange|"
+    r"expander to implant exchange"
+    r")\b",
+    re.IGNORECASE
+)
+
+# ----------------------------
+# Revision
+# Broader elective correction bucket
+# ----------------------------
 REVISION_POS = [
     r"\brevision\s+surgery\b",
     r"\brevision\s+procedure\b",
     r"\bscar\s+revision\b",
     r"\bfat\s+grafting\b",
+    r"\bfat\s+transfer\b",
     r"\blipofill(ing)?\b",
     r"\bcapsulectomy\b",
+    r"\bcapsulotomy\b",
+    r"\bcapsulorrhaphy\b",
     r"\bcontour\s+revision\b",
+    r"\bcontour\s+deformit(y|ies)\b",
     r"\bdog[- ]ear\s+revision\b",
     r"\bstanding\s+cutaneous\s+deformit(y|ies)\b",
     r"\bcontralateral\s+mastopexy\b",
+    r"\bcontralateral\s+reduction\b",
     r"\bsymmetry\s+procedure\b",
+    r"\bbalancing\s+procedure\b",
 ]
 
-NOT_REVISION_RX = re.compile(
+NOT_REVISION_ONLY_RX = re.compile(
     r"\bnipple reconstruction\b",
     re.IGNORECASE
 )
 
 
+# ----------------------------
+# Helpers
+# ----------------------------
 def _section_rank(section):
     s = (section or "").strip().upper()
     if s in PREFERRED_SECTIONS:
@@ -210,6 +283,10 @@ def _is_planned(evid):
     return bool(PLAN_RX.search(evid))
 
 
+def _has_breast_recon_context(evid):
+    return bool(BREAST_RECON_CONTEXT_RX.search(evid))
+
+
 def _emit(field, value, status, evid, section, note, conf):
     return Candidate(
         field=field,
@@ -227,21 +304,24 @@ def _emit(field, value, status, evid, section, note, conf):
 def _base_conf(section, note_type):
     rank = _section_rank(section)
     nt = (note_type or "").lower()
-    conf = 0.72
+    conf = 0.70
     if rank == 0:
         conf += 0.08
     elif rank == 2:
         conf -= 0.08
     if "op" in nt or "operative" in nt or "operation" in nt:
-        conf += 0.06
+        conf += 0.08
     return max(0.55, min(0.95, conf))
 
 
-def _extract_flag(field, pos_patterns, note, require_comp_context=False, require_recon_context=False):
-    cands = []
+# ----------------------------
+# Core extractors
+# ----------------------------
+def _extract_minor_comp(note):
+    cands = []  # type: List[Candidate]
 
     for section, text in _iter_sections(note):
-        m = _find_first(pos_patterns, text)
+        m = _find_first(MINOR_COMP_POS, text)
         if not m:
             continue
 
@@ -250,34 +330,169 @@ def _extract_flag(field, pos_patterns, note, require_comp_context=False, require
 
         if _is_family(low):
             continue
+        if not _has_breast_recon_context(low):
+            continue
         if _is_negated(low):
-            status = "denied"
-            value = False
-        elif _is_planned(low):
-            status = "planned"
-            value = False
-        else:
-            status = "performed"
-            value = True
-
-        if require_comp_context and not COMPLICATION_CONTEXT_RX.search(low):
+            cands.append(_emit("ComplicationSignal", False, "denied", evid, section, note, 0.60))
+            continue
+        if _is_planned(low):
+            cands.append(_emit("ComplicationSignal", False, "planned", evid, section, note, 0.55))
             continue
 
-        if require_recon_context:
-            if not RECON_CONTEXT_RX.search(low) and not DONOR_CONTEXT_RX.search(low):
-                if not COMPLICATION_CONTEXT_RX.search(low):
-                    continue
-
         conf = _base_conf(section, note.note_type)
+        cands.append(_emit("ComplicationSignal", True, "history", evid, section, note, conf))
 
-        if status == "performed":
-            cands.append(_emit(field, value, "history", evid, section, note, conf))
-        elif status == "denied":
-            cands.append(_emit(field, value, "denied", evid, section, note, max(0.55, conf - 0.10)))
-        else:
-            cands.append(_emit(field, value, "planned", evid, section, note, max(0.50, conf - 0.15)))
+        if _section_rank(section) == 0:
+            break
 
-        if value is True and _section_rank(section) == 0:
+    return cands
+
+
+def _extract_reoperation(note):
+    cands = []  # type: List[Candidate]
+
+    for section, text in _iter_sections(note):
+        m = _find_first(REOP_PROCEDURE_POS, text)
+        if not m:
+            continue
+
+        evid = window_around(text, m.start(), m.end(), 260)
+        low = evid.lower()
+
+        if _is_family(low):
+            continue
+        if not _has_breast_recon_context(low):
+            continue
+
+        # planned/negative first
+        if _is_negated(low):
+            cands.append(_emit("StageOutcome_Reoperation", False, "denied", evid, section, note, 0.60))
+            continue
+        if _is_planned(low):
+            cands.append(_emit("StageOutcome_Reoperation", False, "planned", evid, section, note, 0.55))
+            continue
+
+        # exclude elective stage2 exchange unless complication reason also present
+        if PLANNED_STAGE2_EXCHANGE_ONLY_RX.search(low) and not COMPLICATION_REASON_RX.search(low):
+            continue
+
+        # exclude pure revision language unless complication reason also present
+        if REVISION_ONLY_RX.search(low) and not COMPLICATION_REASON_RX.search(low):
+            continue
+
+        # must have complication reason nearby
+        if not COMPLICATION_REASON_RX.search(low):
+            continue
+
+        conf = _base_conf(section, note.note_type) + 0.03
+        cands.append(_emit("StageOutcome_Reoperation", True, "history", evid, section, note, min(conf, 0.95)))
+
+        if _section_rank(section) == 0:
+            break
+
+    return cands
+
+
+def _extract_rehospitalization(note):
+    cands = []  # type: List[Candidate]
+
+    for section, text in _iter_sections(note):
+        m = _find_first(REHOSP_POS, text)
+        if not m:
+            continue
+
+        evid = window_around(text, m.start(), m.end(), 240)
+        low = evid.lower()
+
+        if _is_family(low):
+            continue
+        if _is_negated(low):
+            cands.append(_emit("StageOutcome_Rehospitalization", False, "denied", evid, section, note, 0.60))
+            continue
+        if _is_planned(low):
+            cands.append(_emit("StageOutcome_Rehospitalization", False, "planned", evid, section, note, 0.55))
+            continue
+
+        # require either breast/recon context or complication reason
+        if not _has_breast_recon_context(low) and not COMPLICATION_REASON_RX.search(low):
+            continue
+
+        conf = _base_conf(section, note.note_type) + 0.05
+        cands.append(_emit("StageOutcome_Rehospitalization", True, "history", evid, section, note, min(conf, 0.95)))
+
+        if _section_rank(section) == 0:
+            break
+
+    return cands
+
+
+def _extract_failure(note):
+    cands = []  # type: List[Candidate]
+
+    for section, text in _iter_sections(note):
+        m = _find_first(FAILURE_REMOVAL_POS, text)
+        if not m:
+            continue
+
+        evid = window_around(text, m.start(), m.end(), 260)
+        low = evid.lower()
+
+        if _is_family(low):
+            continue
+        if not _has_breast_recon_context(low):
+            continue
+        if _is_negated(low):
+            cands.append(_emit("StageOutcome_Failure", False, "denied", evid, section, note, 0.60))
+            continue
+        if _is_planned(low):
+            cands.append(_emit("StageOutcome_Failure", False, "planned", evid, section, note, 0.55))
+            continue
+
+        # exclude routine expander->implant exchange / routine stage2 removal
+        if ROUTINE_STAGE2_EXCHANGE_RX.search(low) and not FAILURE_REASON_RX.search(low):
+            continue
+
+        # require cause of failure
+        if not FAILURE_REASON_RX.search(low):
+            continue
+
+        conf = _base_conf(section, note.note_type) + 0.05
+        cands.append(_emit("StageOutcome_Failure", True, "history", evid, section, note, min(conf, 0.95)))
+
+        if _section_rank(section) == 0:
+            break
+
+    return cands
+
+
+def _extract_revision(note):
+    cands = []  # type: List[Candidate]
+
+    for section, text in _iter_sections(note):
+        m = _find_first(REVISION_POS, text)
+        if not m:
+            continue
+
+        evid = window_around(text, m.start(), m.end(), 240)
+        low = evid.lower()
+
+        if _is_family(low):
+            continue
+        if not _has_breast_recon_context(low):
+            continue
+        if _is_negated(low):
+            cands.append(_emit("StageOutcome_Revision", False, "denied", evid, section, note, 0.60))
+            continue
+        if _is_planned(low):
+            cands.append(_emit("StageOutcome_Revision", False, "planned", evid, section, note, 0.55))
+            continue
+        if NOT_REVISION_ONLY_RX.search(low):
+            continue
+
+        conf = _base_conf(section, note.note_type) + 0.02
+        cands.append(_emit("StageOutcome_Revision", True, "history", evid, section, note, min(conf, 0.95)))
+
+        if _section_rank(section) == 0:
             break
 
     return cands
@@ -285,51 +500,14 @@ def _extract_flag(field, pos_patterns, note, require_comp_context=False, require
 
 def extract_complication_outcomes(note):
     cands = []  # type: List[Candidate]
-
-    cands.extend(_extract_flag(
-        "ComplicationSignal",
-        MINOR_COMP_POS,
-        note,
-        require_comp_context=False,
-        require_recon_context=True
-    ))
-
-    cands.extend(_extract_flag(
-        "StageOutcome_Reoperation",
-        REOP_POS,
-        note,
-        require_comp_context=False,
-        require_recon_context=True
-    ))
-
-    cands.extend(_extract_flag(
-        "StageOutcome_Rehospitalization",
-        REHOSP_POS,
-        note,
-        require_comp_context=False,
-        require_recon_context=True
-    ))
-
-    cands.extend(_extract_flag(
-        "StageOutcome_Failure",
-        FAILURE_POS,
-        note,
-        require_comp_context=False,
-        require_recon_context=True
-    ))
-
-    rev = _extract_flag(
-        "StageOutcome_Revision",
-        REVISION_POS,
-        note,
-        require_comp_context=False,
-        require_recon_context=False
-    )
-    rev_clean = []
-    for c in rev:
-        if NOT_REVISION_RX.search((c.evidence or "").lower()):
-            continue
-        rev_clean.append(c)
-    cands.extend(rev_clean)
-
+    cands.extend(_extract_minor_comp(note))
+    cands.extend(_extract_reoperation(note))
+    cands.extend(_extract_rehospitalization(note))
+    cands.extend(_extract_failure(note))
+    cands.extend(_extract_revision(note))
     return cands
+
+
+# Backward-compatible alias if older code still imports this name
+def extract_stage1_outcomes(note):
+    return extract_complication_outcomes(note)
