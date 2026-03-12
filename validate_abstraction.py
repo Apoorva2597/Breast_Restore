@@ -138,6 +138,9 @@ def safe_read_csv(path):
 # ---------------------------------------------------
 
 def clean_string_series(series):
+    if isinstance(series, pd.DataFrame):
+        series = series.iloc[:, 0]
+
     series = series.copy()
     series = series.astype(str)
     series = series.str.strip()
@@ -611,4 +614,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
