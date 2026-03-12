@@ -1,8 +1,10 @@
 # extractors/breast_cancer_recon.py
 # Python 3.6.8 compatible
+
 import re
 from models import Candidate, SectionedNote
 from .utils import window_around
+
 
 SUPPRESS_SECTIONS = {
     "FAMILY HISTORY",
@@ -22,9 +24,21 @@ LOW_VALUE_SECTIONS = {
     "FAMILY HISTORY",
 }
 
+OPERATIVE_SECTION_HINTS = {
+    "PROCEDURE",
+    "PROCEDURES",
+    "OPERATIVE FINDINGS",
+    "OPERATIVE NOTE",
+    "OPERATION",
+    "BRIEF OP NOTE",
+    "SURGICAL PROCEDURE",
+    "HOSPITAL COURSE",
+}
+
 LEFT_RX = re.compile(r"\b(left|lt)\b", re.IGNORECASE)
 RIGHT_RX = re.compile(r"\b(right|rt)\b", re.IGNORECASE)
 BILAT_RX = re.compile(r"\b(bilateral|bilat)\b", re.IGNORECASE)
+
 MASTECTOMY_RX = re.compile(
     r"\b("
     r"mastectomy|"
@@ -37,6 +51,7 @@ MASTECTOMY_RX = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+
 RECON_RX = re.compile(
     r"\b("
     r"breast\s+reconstruction|"
@@ -45,33 +60,42 @@ RECON_RX = re.compile(
     r"tissue\s+expander|expander|"
     r"implant|alloderm|acellular\s+dermal\s+matrix|"
     r"direct[- ]to[- ]implant|"
-    r"sgap|igap|gap\s+flap|gluteal\s+artery\s+perforator"
+    r"sgap|igap|gap\s+flap|gluteal\s+artery\s+perforator|"
+    r"implant\s+exchange|expander\s+exchange|exchange\s+of\s+tissue\s+expander|"
+    r"placement\s+of\s+tissue\s+expander|placement\s+of\s+implant"
     r")\b",
     re.IGNORECASE,
 )
+
 SLNB_RX = re.compile(
     r"\b("
     r"sentinel\s+lymph\s+node\s+biopsy|"
     r"sentinel\s+node\s+biopsy|"
     r"\bSLNB\b|"
-    r"lymphatic\s+mapping"
+    r"lymphatic\s+mapping|"
+    r"sentinel\s+lymphadenectomy|"
+    r"sentinel\s+node\s+excision"
     r")\b",
     re.IGNORECASE,
 )
+
 ALND_RX = re.compile(
     r"\b("
     r"axillary\s+lymph\s+node\s+dissection|"
     r"axillary\s+dissection|"
-    r"\bALND\b"
+    r"\bALND\b|"
+    r"level\s+[i1l]+(?:\s*/\s*[i1l]+)?\s+axillary\s+dissection"
     r")\b",
     re.IGNORECASE,
 )
+
 RADIATION_RX = re.compile(
     r"\b("
     r"radiation|radiation\s+therapy|radiotherapy|xrt|pmrt"
     r")\b",
     re.IGNORECASE,
 )
+
 CHEMO_RX = re.compile(
     r"\b("
     r"chemotherapy|chemo|"
@@ -84,6 +108,7 @@ CHEMO_RX = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+
 ENDOCRINE_ONLY_RX = re.compile(
     r"\b("
     r"tamoxifen|letrozole|anastrozole|exemestane|"
@@ -91,45 +116,103 @@ ENDOCRINE_ONLY_RX = re.compile(
     r")\b",
     re.IGNORECASE,
 )
-NEGATION_RX = re.compile(r"\b(no|denies|denied|without|not|never)\b", re.IGNORECASE)
+
+NEGATION_RX = re.compile(
+    r"\b(no|denies|denied|without|not|never|none|negative\s+for|declined|deferred)\b",
+    re.IGNORECASE,
+)
+
 PLANNED_RX = re.compile(
-    r"\b(plan|planned|planning|will|scheduled|schedule|candidate|consider|recommend|discuss)\b",
+    r"\b(plan|planned|planning|will|scheduled|schedule|candidate|consider|recommend|discuss|discussion|possible|may\s+need|may\s+require)\b",
     re.IGNORECASE,
 )
+
 PROPHYLAXIS_RX = re.compile(
-    r"\b(prophylactic|risk[- ]reducing|risk\s+reducing|preventive|contralateral\s+prophylactic)\b",
+    r"\b(prophylactic|risk[- ]reducing|risk\s+reducing|preventive|contralateral\s+prophylactic|cpm)\b",
     re.IGNORECASE,
 )
+
 CANCER_RX = re.compile(
-    r"\b(breast\s+cancer|carcinoma|malignancy|malignant|invasive\s+ductal|invasive\s+lobular|dcis|lcis|recurrent\s+cancer|cancer)\b",
+    r"\b("
+    r"breast\s+cancer|carcinoma|malignancy|malignant|"
+    r"invasive\s+ductal|invasive\s+lobular|"
+    r"dcis|lcis|idc|ilc|recurrent\s+cancer|cancer"
+    r")\b",
     re.IGNORECASE,
 )
+
 TREATMENT_RECEIVED_RX = re.compile(
-    r"\b(s/p|status\s+post|history\s+of|hx\s+of|prior|previous|completed|received|underwent|treated\s+with|adjuvant|neoadjuvant|postmastectomy)\b",
+    r"\b("
+    r"s/p|status\s+post|history\s+of|hx\s+of|prior|previous|"
+    r"completed|received|underwent|treated\s+with|"
+    r"adjuvant|neoadjuvant|postmastectomy"
+    r")\b",
     re.IGNORECASE,
 )
+
 STRONG_RADIATION_HISTORY_RX = re.compile(
-    r"\b(s/p\s+radiation|status\s+post\s+radiation|history\s+of\s+radiation|prior\s+radiation|previous\s+radiation|completed\s+radiation|received\s+radiation|adjuvant\s+radiation|neoadjuvant\s+radiation|radiation\s+therapy\s+completed|postmastectomy\s+radiation)\b",
+    r"\b("
+    r"s/p\s+radiation|status\s+post\s+radiation|"
+    r"history\s+of\s+radiation|prior\s+radiation|previous\s+radiation|"
+    r"completed\s+radiation|received\s+radiation|"
+    r"adjuvant\s+radiation|neoadjuvant\s+radiation|"
+    r"radiation\s+therapy\s+completed|postmastectomy\s+radiation"
+    r")\b",
     re.IGNORECASE,
 )
+
 STRONG_CHEMO_HISTORY_RX = re.compile(
-    r"\b(s/p\s+chemo|status\s+post\s+chemo|history\s+of\s+chemo|prior\s+chemo|previous\s+chemo|completed\s+chemo|completed\s+chemotherapy|received\s+chemo|received\s+chemotherapy|adjuvant\s+chemo|neoadjuvant\s+chemo|treated\s+with\s+chemotherapy|treated\s+with\s+chemo)\b",
+    r"\b("
+    r"s/p\s+chemo|status\s+post\s+chemo|"
+    r"history\s+of\s+chemo|prior\s+chemo|previous\s+chemo|"
+    r"completed\s+chemo|completed\s+chemotherapy|"
+    r"received\s+chemo|received\s+chemotherapy|"
+    r"adjuvant\s+chemo|neoadjuvant\s+chemo|"
+    r"treated\s+with\s+chemotherapy|treated\s+with\s+chemo"
+    r")\b",
     re.IGNORECASE,
 )
+
 WEAK_TREATMENT_EXCLUDE_RX = re.compile(
-    r"\b(consider|candidate|discussion|discussed|recommend|recommended|plan|planned|planning|will\s+start|may\s+need|may\s+require|referred\s+to\s+radiation\s+oncology|radiation\s+oncology\s+consult)\b",
+    r"\b("
+    r"consider|candidate|discussion|discussed|recommend|recommended|"
+    r"plan|planned|planning|will\s+start|may\s+need|may\s+require|"
+    r"referred\s+to\s+radiation\s+oncology|radiation\s+oncology\s+consult"
+    r")\b",
     re.IGNORECASE,
 )
+
+HISTORY_ONLY_RX = re.compile(
+    r"\b(history\s+of|hx\s+of|prior|previous|remote|past\s+history|past\s+surgical\s+history)\b",
+    re.IGNORECASE,
+)
+
+PERFORMED_RX = re.compile(
+    r"\b(performed|underwent|completed|done|was\s+done|was\s+performed|status\s+post|s/p)\b",
+    re.IGNORECASE,
+)
+
+SENT_SPLIT_RX = re.compile(r"(?<=[\.\?\!\;])\s+|\n+")
 
 
 def _is_operation_note(note_type):
     s = (note_type or "").lower()
-    return (("brief op" in s) or ("op note" in s) or ("operative" in s) or ("operation" in s) or ("oper report" in s))
+    return (
+        ("brief op" in s) or
+        ("op note" in s) or
+        ("operative" in s) or
+        ("operation" in s) or
+        ("oper report" in s)
+    )
 
 
 def _is_clinic_like(note_type):
     s = (note_type or "").lower()
-    pats = ["clinic", "progress", "office", "follow up", "follow-up", "consult", "pre-op", "preop", "history and physical", "h&p", "oncology"]
+    pats = [
+        "clinic", "progress", "office", "follow up", "follow-up",
+        "consult", "pre-op", "preop", "history and physical", "h&p",
+        "oncology"
+    ]
     for p in pats:
         if p in s:
             return True
@@ -160,6 +243,13 @@ def _window(text, start, end, width=160):
     return text[lo:hi]
 
 
+def _split_sentences(text):
+    if not text:
+        return []
+    parts = SENT_SPLIT_RX.split(text)
+    return [p.strip() for p in parts if p and p.strip()]
+
+
 def _infer_laterality(text):
     low = (text or "").lower()
     if BILAT_RX.search(low):
@@ -175,6 +265,88 @@ def _infer_laterality(text):
     return None
 
 
+def _chunk_sentence(text):
+    parts = re.split(r"[,:;]|\band\b|\bwith\b", text, flags=re.IGNORECASE)
+    out = []
+    for p in parts:
+        s = p.strip()
+        if s:
+            out.append(s)
+    return out if out else [text]
+
+
+def _contains_side(text, side):
+    if side == "LEFT":
+        return bool(LEFT_RX.search(text)) or bool(BILAT_RX.search(text))
+    if side == "RIGHT":
+        return bool(RIGHT_RX.search(text)) or bool(BILAT_RX.search(text))
+    return False
+
+
+def _same_side_chunk(chunk, side):
+    if side == "LEFT":
+        if LEFT_RX.search(chunk):
+            return True
+        if BILAT_RX.search(chunk) and not RIGHT_RX.search(chunk):
+            return True
+    elif side == "RIGHT":
+        if RIGHT_RX.search(chunk):
+            return True
+        if BILAT_RX.search(chunk) and not LEFT_RX.search(chunk):
+            return True
+    return False
+
+
+def _is_low_value_section(section):
+    return section in LOW_VALUE_SECTIONS
+
+
+def _is_operative_section(section):
+    s = (section or "").upper()
+    if s in OPERATIVE_SECTION_HINTS:
+        return True
+    for hint in OPERATIVE_SECTION_HINTS:
+        if hint in s:
+            return True
+    return False
+
+
+def _local_negated(text, start=None, end=None, width=80):
+    if text is None:
+        return False
+    low = text.lower()
+    if start is None or end is None:
+        return bool(NEGATION_RX.search(low))
+    lo = max(0, start - width)
+    hi = min(len(low), end + 20)
+    ctx = low[lo:hi]
+    return bool(NEGATION_RX.search(ctx))
+
+
+def _local_planned(text, start=None, end=None, width=80):
+    if text is None:
+        return False
+    low = text.lower()
+    if start is None or end is None:
+        return bool(PLANNED_RX.search(low))
+    lo = max(0, start - width)
+    hi = min(len(low), end + 40)
+    ctx = low[lo:hi]
+    return bool(PLANNED_RX.search(ctx))
+
+
+def _history_only_context(text, start=None, end=None, width=80):
+    if text is None:
+        return False
+    low = text.lower()
+    if start is None or end is None:
+        return bool(HISTORY_ONLY_RX.search(low))
+    lo = max(0, start - width)
+    hi = min(len(low), end + 40)
+    ctx = low[lo:hi]
+    return bool(HISTORY_ONLY_RX.search(ctx))
+
+
 def _looks_negated_or_planned(ctx, op_note):
     low = (ctx or "").lower()
     if NEGATION_RX.search(low):
@@ -184,8 +356,89 @@ def _looks_negated_or_planned(ctx, op_note):
     return False
 
 
+def _indication_vote(sentence, chunk, side):
+    low = chunk.lower()
+    if not _contains_side(chunk, side):
+        return None
+
+    cancer_here = bool(CANCER_RX.search(low))
+    prophy_here = bool(PROPHYLAXIS_RX.search(low))
+    mast_here = bool(MASTECTOMY_RX.search(low))
+
+    if prophy_here and mast_here:
+        return "Prophylactic"
+    if prophy_here and _contains_side(chunk, side):
+        return "Prophylactic"
+    if cancer_here:
+        return "Therapeutic"
+    return None
+
+
+def _infer_indications_local(text, lat):
+    low = (text or "").lower()
+    left_votes = []
+    right_votes = []
+
+    sentences = _split_sentences(text)
+    if not sentences:
+        sentences = [text]
+
+    for sent in sentences:
+        sent_low = sent.lower()
+        if not MASTECTOMY_RX.search(sent_low) and not CANCER_RX.search(sent_low) and not PROPHYLAXIS_RX.search(sent_low):
+            continue
+        chunks = _chunk_sentence(sent)
+
+        for chunk in chunks:
+            chunk_low = chunk.lower()
+
+            left_vote = _indication_vote(sent, chunk, "LEFT")
+            right_vote = _indication_vote(sent, chunk, "RIGHT")
+
+            if left_vote is not None:
+                left_votes.append(left_vote)
+            if right_vote is not None:
+                right_votes.append(right_vote)
+
+            if "contralateral prophylactic" in chunk_low:
+                left_cancer = bool(re.search(r"(left|lt).{0,120}(cancer|carcinoma|dcis|lcis|idc|ilc|malignan|invasive|recurrent)", sent_low))
+                right_cancer = bool(re.search(r"(right|rt).{0,120}(cancer|carcinoma|dcis|lcis|idc|ilc|malignan|invasive|recurrent)", sent_low))
+
+                if left_cancer and not right_cancer:
+                    left_votes.append("Therapeutic")
+                    right_votes.append("Prophylactic")
+                elif right_cancer and not left_cancer:
+                    right_votes.append("Therapeutic")
+                    left_votes.append("Prophylactic")
+
+    # fallback only when one clear side is implied
+    if lat == "LEFT" and not left_votes:
+        if CANCER_RX.search(low) and not PROPHYLAXIS_RX.search(low):
+            left_votes.append("Therapeutic")
+        elif PROPHYLAXIS_RX.search(low):
+            left_votes.append("Prophylactic")
+
+    if lat == "RIGHT" and not right_votes:
+        if CANCER_RX.search(low) and not PROPHYLAXIS_RX.search(low):
+            right_votes.append("Therapeutic")
+        elif PROPHYLAXIS_RX.search(low):
+            right_votes.append("Prophylactic")
+
+    def _resolve(votes):
+        if not votes:
+            return None
+        if "Therapeutic" in votes:
+            return "Therapeutic"
+        if "Prophylactic" in votes:
+            return "Prophylactic"
+        return None
+
+    return _resolve(left_votes), _resolve(right_votes)
+
+
 def _infer_recon_type_and_class(text):
     low = (text or "").lower()
+
     flap_types_found = []
     if "diep" in low:
         flap_types_found.append("DIEP")
@@ -197,11 +450,30 @@ def _infer_recon_type_and_class(text):
         flap_types_found.append("gluteal artery perforator flap")
     if "latissimus" in low:
         flap_types_found.append("latissimus dorsi")
-    has_any_flap = (len(flap_types_found) > 0 or (" flap" in low) or low.startswith("flap") or ("mixed flaps" in low))
+
+    has_any_flap = (
+        len(flap_types_found) > 0 or
+        (" flap" in low) or
+        low.startswith("flap") or
+        ("mixed flaps" in low)
+    )
+
     has_direct_to_implant = bool(re.search(r"\bdirect[- ]to[- ]implant\b", low))
-    has_expander = ("tissue expander" in low) or ("expander" in low)
-    has_implant = ("implant" in low)
+    has_expander = (
+        ("tissue expander" in low) or
+        ("expander" in low) or
+        ("expander exchange" in low) or
+        ("placement of tissue expander" in low) or
+        ("exchange of tissue expander" in low)
+    )
+    has_implant = (
+        ("implant" in low) or
+        ("implant exchange" in low) or
+        ("placement of implant" in low)
+    )
+
     rtype = None
+
     if "mixed flaps" in low:
         rtype = "mixed flaps"
     elif len(set(flap_types_found)) >= 2:
@@ -224,6 +496,7 @@ def _infer_recon_type_and_class(text):
         rtype = "other"
     elif has_implant:
         rtype = "expander/implant"
+
     rclass = None
     if has_any_flap:
         rclass = "autologous"
@@ -231,50 +504,49 @@ def _infer_recon_type_and_class(text):
         rclass = "implant"
     elif rtype == "other":
         rclass = "other"
+
     return rtype, rclass
 
 
-def _infer_indications(text, lat):
-    low = (text or "").lower()
-    left_val = None
-    right_val = None
+def _best_local_recon_type_and_class(text):
+    sentences = _split_sentences(text)
+    if not sentences:
+        sentences = [text]
 
-    paired_patterns = [
-        (r"left.{0,100}(cancer|carcinoma|dcis|lcis|malignan|invasive|recurrent).{0,100}right.{0,100}(prophylactic|risk[- ]reducing|preventive)", ("Therapeutic", "Prophylactic")),
-        (r"right.{0,100}(cancer|carcinoma|dcis|lcis|malignan|invasive|recurrent).{0,100}left.{0,100}(prophylactic|risk[- ]reducing|preventive)", ("Prophylactic", "Therapeutic")),
-    ]
-    for pat, vals in paired_patterns:
-        if re.search(pat, low):
-            return vals
+    ranked_hits = []
 
-    left_pro = bool(re.search(r"(left|lt).{0,80}(prophylactic|risk[- ]reducing|preventive)", low)) or bool(re.search(r"(prophylactic|risk[- ]reducing|preventive).{0,80}(left|lt)", low))
-    right_pro = bool(re.search(r"(right|rt).{0,80}(prophylactic|risk[- ]reducing|preventive)", low)) or bool(re.search(r"(prophylactic|risk[- ]reducing|preventive).{0,80}(right|rt)", low))
-    left_cancer = bool(re.search(r"(left|lt).{0,120}(cancer|carcinoma|dcis|lcis|malignan|invasive|recurrent)", low)) or bool(re.search(r"(cancer|carcinoma|dcis|lcis|malignan|invasive|recurrent).{0,120}(left|lt)", low))
-    right_cancer = bool(re.search(r"(right|rt).{0,120}(cancer|carcinoma|dcis|lcis|malignan|invasive|recurrent)", low)) or bool(re.search(r"(cancer|carcinoma|dcis|lcis|malignan|invasive|recurrent).{0,120}(right|rt)", low))
+    for sent in sentences:
+        sent_low = sent.lower()
+        if not RECON_RX.search(sent_low):
+            continue
 
-    if "contralateral prophylactic" in low:
-        if left_cancer and not right_cancer:
-            right_pro = True
-        elif right_cancer and not left_cancer:
-            left_pro = True
+        if _local_negated(sent_low):
+            continue
+        if _local_planned(sent_low) and not MASTECTOMY_RX.search(sent_low):
+            continue
 
-    if left_pro:
-        left_val = "Prophylactic"
-    elif left_cancer:
-        left_val = "Therapeutic"
+        rtype, rclass = _infer_recon_type_and_class(sent)
+        if rtype is None and rclass is None:
+            continue
 
-    if right_pro:
-        right_val = "Prophylactic"
-    elif right_cancer:
-        right_val = "Therapeutic"
+        rank = 5
+        if re.search(r"\bdirect[- ]to[- ]implant\b", sent_low):
+            rank = 1
+        elif re.search(r"\b(diep|tram|siea|latissimus|sgap|igap|gap\s+flap|gluteal artery perforator)\b", sent_low):
+            rank = 1
+        elif re.search(r"\b(expander|implant exchange|expander exchange|tissue expander)\b", sent_low):
+            rank = 2
+        elif "reconstruction" in sent_low:
+            rank = 3
 
-    if lat == "BILATERAL":
-        if left_val is None and left_cancer:
-            left_val = "Therapeutic"
-        if right_val is None and right_cancer:
-            right_val = "Therapeutic"
+        ranked_hits.append((rank, sent, rtype, rclass))
 
-    return left_val, right_val
+    if not ranked_hits:
+        return _infer_recon_type_and_class(text)
+
+    ranked_hits = sorted(ranked_hits, key=lambda x: x[0])
+    _, _, rtype, rclass = ranked_hits[0]
+    return rtype, rclass
 
 
 def _strong_radiation_history(ctx):
@@ -312,82 +584,135 @@ def extract_breast_cancer_recon(note):
         if not text:
             continue
 
-        section_low_value = section in LOW_VALUE_SECTIONS
+        section_low_value = _is_low_value_section(section)
+        operative_section = _is_operative_section(section)
 
+        # -----------------------------
+        # Mastectomy / indications / lymph node
+        # -----------------------------
         m = MASTECTOMY_RX.search(text)
         if m:
             ctx = _window(text, m.start(), m.end(), 220)
-            if not _looks_negated_or_planned(ctx, op_note):
+            local_bad = _looks_negated_or_planned(ctx, op_note)
+
+            if not local_bad:
                 lat = _infer_laterality(ctx) or _infer_laterality(text)
+
                 if lat:
-                    conf = 0.90 if op_note else 0.74
+                    conf = 0.90 if (op_note or operative_section) else 0.74
                     if section_low_value and not op_note:
                         conf -= 0.10
                     cands.append(_emit("Mastectomy_Laterality", lat, text, m, section, note, conf))
+
                 if _clean(note.note_date):
-                    conf = 0.88 if op_note else 0.68
+                    conf = 0.88 if (op_note or operative_section) else 0.68
                     if section_low_value and not op_note:
                         conf -= 0.10
                     cands.append(_emit("Mastectomy_Date", _clean(note.note_date), text, m, section, note, conf))
-                left_ind, right_ind = _infer_indications(text, lat)
+
+                # use local context, not full section-only logic
+                local_text = ctx
+                left_ind, right_ind = _infer_indications_local(local_text, lat)
+
                 if left_ind is not None:
-                    conf = 0.80 if op_note else 0.66
+                    conf = 0.84 if (op_note or operative_section) else 0.68
                     if section_low_value and not op_note:
                         conf -= 0.10
                     cands.append(_emit("Indication_Left", left_ind, text, m, section, note, conf))
+
                 if right_ind is not None:
-                    conf = 0.80 if op_note else 0.66
+                    conf = 0.84 if (op_note or operative_section) else 0.68
                     if section_low_value and not op_note:
                         conf -= 0.10
                     cands.append(_emit("Indication_Right", right_ind, text, m, section, note, conf))
 
-            if ALND_RX.search(text):
-                mm = ALND_RX.search(text)
-                conf = 0.86 if op_note else 0.72
-                if section_low_value and not op_note:
-                    conf -= 0.10
-                cands.append(_emit("LymphNode", "ALND", text, mm, section, note, conf))
-            elif SLNB_RX.search(text):
-                mm = SLNB_RX.search(text)
-                conf = 0.82 if op_note else 0.70
-                if section_low_value and not op_note:
-                    conf -= 0.10
-                cands.append(_emit("LymphNode", "SLNB", text, mm, section, note, conf))
-            else:
-                conf = 0.60 if op_note else 0.50
-                if section_low_value and not op_note:
-                    conf -= 0.10
-                cands.append(_emit("LymphNode", "none", text, m, section, note, conf))
+        # lymph node should not depend on mastectomy match only
+        best_ln_match = None
+        best_ln_label = None
+        best_ln_conf = None
 
+        for rx, label, base_conf in [
+            (ALND_RX, "ALND", 0.88),
+            (SLNB_RX, "SLNB", 0.84),
+        ]:
+            for mm in rx.finditer(text):
+                ln_ctx = _window(text, mm.start(), mm.end(), 120)
+                ln_ctx_low = ln_ctx.lower()
+
+                if _local_negated(text, mm.start(), mm.end()):
+                    continue
+                if _local_planned(text, mm.start(), mm.end()) and not (op_note or operative_section):
+                    continue
+                if _history_only_context(text, mm.start(), mm.end()) and not (op_note or operative_section):
+                    continue
+
+                conf = base_conf if (op_note or operative_section) else (base_conf - 0.12)
+                if section_low_value and not op_note:
+                    conf -= 0.10
+                if PERFORMED_RX.search(ln_ctx_low):
+                    conf += 0.02
+
+                if best_ln_match is None:
+                    best_ln_match = mm
+                    best_ln_label = label
+                    best_ln_conf = conf
+                else:
+                    # ALND outranks SLNB
+                    if label == "ALND" and best_ln_label != "ALND":
+                        best_ln_match = mm
+                        best_ln_label = label
+                        best_ln_conf = conf
+                    elif label == best_ln_label and conf > best_ln_conf:
+                        best_ln_match = mm
+                        best_ln_label = label
+                        best_ln_conf = conf
+
+        if best_ln_match is not None:
+            cands.append(_emit("LymphNode", best_ln_label, text, best_ln_match, section, note, best_ln_conf))
+
+        # -----------------------------
+        # Reconstruction
+        # -----------------------------
         r = RECON_RX.search(text)
         if r:
             ctx = _window(text, r.start(), r.end(), 220)
+
             if not _looks_negated_or_planned(ctx, op_note):
                 lat = _infer_laterality(ctx) or _infer_laterality(text)
+
                 if lat:
-                    conf = 0.90 if op_note else 0.76
+                    conf = 0.90 if (op_note or operative_section) else 0.76
                     if section_low_value and not op_note:
                         conf -= 0.10
                     cands.append(_emit("Recon_Laterality", lat, text, r, section, note, conf))
-                rtype, rclass = _infer_recon_type_and_class(text)
+
+                local_recon_text = ctx if (op_note or operative_section) else text
+                rtype, rclass = _best_local_recon_type_and_class(local_recon_text)
+
                 if rtype:
-                    conf = 0.88 if op_note else 0.74
+                    conf = 0.90 if (op_note or operative_section) else 0.74
                     if section_low_value and not op_note:
                         conf -= 0.10
                     cands.append(_emit("Recon_Type", rtype, text, r, section, note, conf))
+
                 if rclass:
-                    conf = 0.88 if op_note else 0.74
+                    conf = 0.90 if (op_note or operative_section) else 0.74
                     if section_low_value and not op_note:
                         conf -= 0.10
                     cands.append(_emit("Recon_Classification", rclass, text, r, section, note, conf))
-                if op_note and MASTECTOMY_RX.search(text):
+
+                if (op_note or operative_section) and MASTECTOMY_RX.search(text):
                     cands.append(_emit("Recon_Timing", "Immediate", text, r, section, note, 0.92))
 
+        # -----------------------------
+        # Radiation
+        # -----------------------------
         rr = RADIATION_RX.search(text)
         if rr:
             ctx = _window(text, rr.start(), rr.end(), 260)
             should_emit = False
             conf = 0.74
+
             if _strong_radiation_history(ctx):
                 should_emit = True
                 conf = 0.86 if clinic_like else 0.80
@@ -395,15 +720,20 @@ def extract_breast_cancer_recon(note):
                     conf -= 0.10
             elif op_note:
                 should_emit = False
+
             if should_emit:
                 cands.append(_emit("Radiation", True, text, rr, section, note, conf))
 
+        # -----------------------------
+        # Chemo
+        # -----------------------------
         cc = CHEMO_RX.search(text)
         if cc:
             ctx = _window(text, cc.start(), cc.end(), 260)
             low_ctx = ctx.lower()
             should_emit = False
             conf = 0.74
+
             if ENDOCRINE_ONLY_RX.search(low_ctx) and not CHEMO_RX.search(low_ctx):
                 should_emit = False
             elif _strong_chemo_history(ctx):
@@ -413,6 +743,8 @@ def extract_breast_cancer_recon(note):
                     conf -= 0.10
             elif op_note:
                 should_emit = False
+
             if should_emit:
                 cands.append(_emit("Chemo", True, text, cc, section, note, conf))
+
     return cands
