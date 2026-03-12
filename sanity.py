@@ -12,7 +12,7 @@ Python 3.6.8 compatible
 
 import pandas as pd
 
-FILE = "validation_results.csv"   # change if needed
+FILE = "/_outputs/validation_summary.csv"  
 
 variables = [
     "Stage1_MinorComp",
