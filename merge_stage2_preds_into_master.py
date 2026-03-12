@@ -29,7 +29,7 @@ MASTER_FILE = os.path.join(
 STAGE_FILE = os.path.join(
     BASE_DIR,
     "_frozen_stage2",
-    "20260628_200052",
+    "20260228_200052",
     "validation_merged.csv"
 )
 
