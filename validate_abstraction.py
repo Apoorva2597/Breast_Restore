@@ -359,15 +359,39 @@ def compute_binary_metrics(pred, gold):
     pred = pred[mask]
     gold = gold[mask]
 
+    valid_mask = pred.notna() & gold.notna()
+
+    pred = pred[valid_mask]
+    gold = gold[valid_mask]
+
     total = len(gold)
 
     if total == 0:
-        return 0.0, 0, 0
+        return 0.0, 0, 0, 0.0, 0.0, 0.0
 
     matches = (pred == gold).sum()
     accuracy = float(matches) / float(total)
 
-    return accuracy, int(matches), int(total)
+    tp = ((pred == 1) & (gold == 1)).sum()
+    fp = ((pred == 1) & (gold == 0)).sum()
+    fn = ((pred == 0) & (gold == 1)).sum()
+
+    if (tp + fp) > 0:
+        precision = float(tp) / float(tp + fp)
+    else:
+        precision = 0.0
+
+    if (tp + fn) > 0:
+        recall = float(tp) / float(tp + fn)
+    else:
+        recall = 0.0
+
+    if (precision + recall) > 0:
+        f1_score = 2.0 * precision * recall / float(precision + recall)
+    else:
+        f1_score = 0.0
+
+    return accuracy, int(matches), int(total), precision, recall, f1_score
 
 
 def compute_numeric_metrics(pred, gold, tolerance=None):
@@ -530,6 +554,10 @@ def main():
         pred = merged[pred_col]
         goldv = merged[gold_col]
 
+        precision = ""
+        recall = ""
+        f1_score = ""
+
         if v == "Race":
             acc, matches, total = compute_race_metrics(pred, goldv)
 
@@ -537,7 +565,7 @@ def main():
             acc, matches, total = compute_categorical_metrics(pred, goldv)
 
         elif v in BINARY_VARS:
-            acc, matches, total = compute_binary_metrics(pred, goldv)
+            acc, matches, total, precision, recall, f1_score = compute_binary_metrics(pred, goldv)
 
         elif v == "Age":
             acc, matches, total = compute_age_floor_round_metrics(pred, goldv)
@@ -551,6 +579,9 @@ def main():
         results.append({
             "variable": v,
             "accuracy": acc,
+            "precision": precision,
+            "recall": recall,
+            "f1_score": f1_score,
             "matches": matches,
             "total_compared": total
         })
@@ -567,6 +598,9 @@ def main():
         results.append({
             "variable": "BMI_close_0_5",
             "accuracy": acc,
+            "precision": "",
+            "recall": "",
+            "f1_score": "",
             "matches": matches,
             "total_compared": total
         })
@@ -575,6 +609,9 @@ def main():
         results.append({
             "variable": "BMI_close_1_0",
             "accuracy": acc,
+            "precision": "",
+            "recall": "",
+            "f1_score": "",
             "matches": matches,
             "total_compared": total
         })
@@ -583,6 +620,9 @@ def main():
         results.append({
             "variable": "BMI_round_integer",
             "accuracy": acc,
+            "precision": "",
+            "recall": "",
+            "f1_score": "",
             "matches": matches,
             "total_compared": total
         })
@@ -591,6 +631,9 @@ def main():
         results.append({
             "variable": "Obesity_from_BMI",
             "accuracy": acc,
+            "precision": "",
+            "recall": "",
+            "f1_score": "",
             "matches": matches,
             "total_compared": total
         })
@@ -599,6 +642,9 @@ def main():
         results.append({
             "variable": "Obesity_from_BMI_tol_0_5",
             "accuracy": acc,
+            "precision": "",
+            "recall": "",
+            "f1_score": "",
             "matches": matches,
             "total_compared": total
         })
