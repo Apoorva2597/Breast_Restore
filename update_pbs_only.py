@@ -12,13 +12,12 @@ PBS-only updater for:
 - PBS_Augmentation
 - PBS_Other
 
-Strategy:
-- Restore the better-performing lumpectomy updater behavior
-- Keep reduction/mastopexy/other strict
-- Keep augmentation strict
-- Preserve laterality inference mainly for lumpectomy
-- Derive PastBreastSurgery from accepted subtype hits
-- Add only a narrow lumpectomy FP filter for obvious treatment-planning language
+FIX (Apr 2026):
+- PBS_Breast Reduction, PBS_Mastopexy, PBS_Augmentation, PBS_Other no longer
+  gated by reconstruction laterality. These are PAST COSMETIC/SURGICAL HISTORY
+  and laterality of the current reconstruction is irrelevant.
+- Only history_ok is required for these fields.
+- PBS_Lumpectomy retains its existing laterality-aware logic unchanged.
 
 Outputs:
 1) /home/apokol/Breast_Restore/_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv
@@ -892,82 +891,73 @@ def main():
                 accept = False
                 reason = "reject_lumpectomy_planning_context"
 
+            elif field != "PBS_Lumpectomy":
+                # ---------------------------------------------------------
+                # FIX: PBS_Breast Reduction, PBS_Mastopexy, PBS_Augmentation,
+                # PBS_Other are PAST COSMETIC/SURGICAL HISTORY.
+                # Laterality of the current reconstruction is irrelevant.
+                # Only require history_ok — no laterality gating.
+                # ---------------------------------------------------------
+                if not history_ok:
+                    accept = False
+                    reason = "reject_no_history_context"
+                else:
+                    accept = True
+                    reason = "accept_non_lumpectomy_history"
+
             elif day_diff < 0:
+                # PBS_Lumpectomy, pre-recon note — keep original logic
                 if lat_decision == "accept":
                     if history_ok:
                         accept = True
                         reason = "accept_pre_recon_historical"
                     else:
-                        if field == "PBS_Lumpectomy":
-                            accept = True
-                            reason = "accept_pre_recon_lumpectomy"
-                        else:
-                            accept = False
-                            reason = "reject_pre_recon_no_history"
+                        accept = True
+                        reason = "accept_pre_recon_lumpectomy"
                 elif lat_decision == "reject_contralateral":
                     accept = False
                     reason = "reject_contralateral"
                 elif lat_decision == "unknown_unilateral":
-                    if field == "PBS_Lumpectomy":
-                        inferred = infer_laterality_from_field_context(field, combined_context)
-                        if inferred and laterality_relation(recon_lat, inferred, combined_context) == "accept":
-                            accept = True
-                            reason = "accept_inferred_laterality"
-                        else:
-                            accept = False
-                            reason = "reject_unknown_laterality_unilateral"
+                    inferred = infer_laterality_from_field_context(field, combined_context)
+                    if inferred and laterality_relation(recon_lat, inferred, combined_context) == "accept":
+                        accept = True
+                        reason = "accept_inferred_laterality"
                     else:
                         accept = False
                         reason = "reject_unknown_laterality_unilateral"
                 else:
-                    accept = False
-                    reason = "reject_unknown_recon_laterality"
+                    # unknown_recon (recon_lat blank) — accept if history present
+                    if history_ok:
+                        accept = True
+                        reason = "accept_pre_recon_unknown_lat_history"
+                    else:
+                        accept = False
+                        reason = "reject_unknown_recon_laterality"
 
             else:
-                if field == "PBS_Lumpectomy":
-                    # restore the broader, better-performing post-recon lumpectomy behavior
-                    if not history_ok:
-                        accept = False
-                        reason = "reject_post_recon_not_historical"
-                    else:
-                        if lat_decision == "accept":
-                            accept = True
-                            reason = "accept_post_recon_historical"
-                        elif lat_decision == "reject_contralateral":
-                            accept = False
-                            reason = "reject_contralateral"
-                        elif lat_decision == "unknown_unilateral":
-                            inferred = infer_laterality_from_field_context(field, combined_context)
-                            if inferred and laterality_relation(recon_lat, inferred, combined_context) == "accept":
-                                accept = True
-                                reason = "accept_post_recon_inferred_laterality"
-                            else:
-                                accept = False
-                                reason = "reject_unknown_laterality_unilateral"
-                        else:
-                            if history_ok:
-                                accept = True
-                                reason = "accept_post_recon_history_no_recon_lat"
-                            else:
-                                accept = False
-                                reason = "reject_unknown_recon_laterality"
+                # PBS_Lumpectomy, post-recon note — keep original logic
+                if not history_ok:
+                    accept = False
+                    reason = "reject_post_recon_not_historical"
                 else:
-                    if not history_ok:
+                    if lat_decision == "accept":
+                        accept = True
+                        reason = "accept_post_recon_historical"
+                    elif lat_decision == "reject_contralateral":
                         accept = False
-                        reason = "reject_post_recon_not_historical"
-                    else:
-                        if lat_decision == "accept":
+                        reason = "reject_contralateral"
+                    elif lat_decision == "unknown_unilateral":
+                        inferred = infer_laterality_from_field_context(field, combined_context)
+                        if inferred and laterality_relation(recon_lat, inferred, combined_context) == "accept":
                             accept = True
-                            reason = "accept_post_recon_historical"
-                        elif lat_decision == "reject_contralateral":
-                            accept = False
-                            reason = "reject_contralateral"
-                        elif lat_decision == "unknown_unilateral":
+                            reason = "accept_post_recon_inferred_laterality"
+                        else:
                             accept = False
                             reason = "reject_unknown_laterality_unilateral"
-                        else:
-                            accept = False
-                            reason = "reject_unknown_recon_laterality"
+                    else:
+                        # unknown_recon (recon_lat blank) — accept if history present
+                        accept = True
+                        reason = "accept_post_recon_history_no_recon_lat"
 
             evidence_rows.append({
                 MERGE_KEY: mrn,
@@ -1032,8 +1022,6 @@ def main():
     print("\nDONE.")
     print("- Updated master: {0}".format(OUTPUT_MASTER))
     print("- PBS evidence: {0}".format(OUTPUT_EVID))
-    print("\nRun:")
-    print(" python update_pbs_only.py")
 
 
 if __name__ == "__main__":
