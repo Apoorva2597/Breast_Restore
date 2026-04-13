@@ -1,9 +1,5 @@
 import pandas as pd
-df = pd.read_csv('_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv', dtype=str)
-cols = ['PBS_Breast Reduction','PBS_Mastopexy','PBS_Other']
-for c in cols:
-    if c in df.columns:
-        vc = df[c].value_counts(dropna=False)
-        print(c, dict(vc))
-    else:
-        print(c, 'COLUMN MISSING')
+df = pd.read_csv('_outputs/pbs_only_evidence.csv', dtype=str, engine='python', encoding='latin-1')
+print('Evidence rows:', len(df))
+print('Fields:', df['FIELD'].value_counts().to_dict() if 'FIELD' in df.columns else 'no FIELD col')
+print('Rule decisions:', df['RULE_DECISION'].value_counts().to_dict() if 'RULE_DECISION' in df.columns else 'no RULE_DECISION col')
