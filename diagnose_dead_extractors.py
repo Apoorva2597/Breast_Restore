@@ -243,7 +243,7 @@ def read_notes(paths):
         for enc in ["utf-8", "latin-1", "cp1252"]:
             try:
                 df = pd.read_csv(
-                    p, dtype=str, low_memory=False,
+                    p, dtype=str,
                     encoding=enc, engine="python"
                 )
                 df.columns = [c.strip().upper() for c in df.columns]
