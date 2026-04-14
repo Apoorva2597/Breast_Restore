@@ -64,7 +64,7 @@ from models import SectionedNote, Candidate  # noqa: E402
 from extractors.age import extract_age  # noqa: E402
 from extractors.bmi import extract_bmi  # noqa: E402
 from extractors.smoking import extract_smoking  # noqa: E402
-from extractors.comorbidities import extract_comorbidities  # noqa: E402
+from extractors.comorbidities_module import extract_comorbidities  # noqa: E402
 from extractors.pbs import extract_pbs  # noqa: E402
 from extractors.mastectomy import extract_mastectomy  # noqa: E402
 from extractors.cancer_treatment import extract_cancer_treatment  # noqa: E402
