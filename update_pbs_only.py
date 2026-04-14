@@ -12,12 +12,12 @@ PBS-only updater for:
 - PBS_Augmentation
 - PBS_Other
 
-FIX (Apr 2026):
-- PBS_Breast Reduction, PBS_Mastopexy, PBS_Augmentation, PBS_Other no longer
-  gated by reconstruction laterality. These are PAST COSMETIC/SURGICAL HISTORY
-  and laterality of the current reconstruction is irrelevant.
-- Only history_ok is required for these fields.
-- PBS_Lumpectomy retains its existing laterality-aware logic unchanged.
+FIX (this version):
+- PBS_Breast Reduction, PBS_Mastopexy, PBS_Augmentation, PBS_Other:
+  laterality check skipped entirely on BOTH pre- and post-recon paths.
+  These are past cosmetic/surgical history — laterality is irrelevant.
+  Only gate: history_ok (and explicit contralateral rejection still applies).
+- PBS_Lumpectomy: laterality logic preserved completely unchanged.
 
 Outputs:
 1) /home/apokol/Breast_Restore/_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv
@@ -35,9 +35,9 @@ import pandas as pd
 
 BASE_DIR = "/home/apokol/Breast_Restore"
 
-MASTER_FILE = "{0}/_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv".format(BASE_DIR)
+MASTER_FILE   = "{0}/_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv".format(BASE_DIR)
 OUTPUT_MASTER = "{0}/_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv".format(BASE_DIR)
-OUTPUT_EVID = "{0}/_outputs/pbs_only_evidence.csv".format(BASE_DIR)
+OUTPUT_EVID   = "{0}/_outputs/pbs_only_evidence.csv".format(BASE_DIR)
 
 MERGE_KEY = "MRN"
 
@@ -59,7 +59,7 @@ NOTE_GLOBS = [
     "{0}/**/HPI11526*operation notes.csv".format(BASE_DIR),
 ]
 
-from models import SectionedNote  # noqa: E402
+from models import SectionedNote   # noqa: E402
 from extractors.pbs import extract_pbs  # noqa: E402
 
 PBS_FIELDS = [
@@ -71,6 +71,9 @@ PBS_FIELDS = [
     "PBS_Other",
 ]
 
+# ============================================================
+# Utilities
+# ============================================================
 
 def read_csv_robust(path):
     common_kwargs = dict(dtype=str, engine="python")
@@ -78,36 +81,16 @@ def read_csv_robust(path):
         return pd.read_csv(path, **common_kwargs, on_bad_lines="skip")
     except TypeError:
         try:
-            return pd.read_csv(
-                path,
-                **common_kwargs,
-                error_bad_lines=False,
-                warn_bad_lines=True
-            )
+            return pd.read_csv(path, **common_kwargs, error_bad_lines=False, warn_bad_lines=True)
         except UnicodeDecodeError:
-            return pd.read_csv(
-                path,
-                **common_kwargs,
-                encoding="latin-1",
-                error_bad_lines=False,
-                warn_bad_lines=True
-            )
+            return pd.read_csv(path, **common_kwargs, encoding="latin-1",
+                               error_bad_lines=False, warn_bad_lines=True)
     except UnicodeDecodeError:
         try:
-            return pd.read_csv(
-                path,
-                **common_kwargs,
-                encoding="latin-1",
-                on_bad_lines="skip"
-            )
+            return pd.read_csv(path, **common_kwargs, encoding="latin-1", on_bad_lines="skip")
         except TypeError:
-            return pd.read_csv(
-                path,
-                **common_kwargs,
-                encoding="latin-1",
-                error_bad_lines=False,
-                warn_bad_lines=True
-            )
+            return pd.read_csv(path, **common_kwargs, encoding="latin-1",
+                               error_bad_lines=False, warn_bad_lines=True)
 
 
 def clean_cols(df):
@@ -116,14 +99,13 @@ def clean_cols(df):
 
 
 def normalize_mrn(df):
-    key_variants = ["MRN", "mrn", "Patient_MRN", "PAT_MRN", "PATIENT_MRN"]
-    for k in key_variants:
+    for k in ["MRN", "mrn", "Patient_MRN", "PAT_MRN", "PATIENT_MRN"]:
         if k in df.columns:
             if k != MERGE_KEY:
                 df = df.rename(columns={k: MERGE_KEY})
             break
     if MERGE_KEY not in df.columns:
-        raise RuntimeError("MRN column not found. Columns seen: {0}".format(list(df.columns)[:40]))
+        raise RuntimeError("MRN column not found. Columns: {0}".format(list(df.columns)[:40]))
     df[MERGE_KEY] = df[MERGE_KEY].astype(str).str.strip()
     return df
 
@@ -134,8 +116,7 @@ def pick_col(df, options, required=True):
             return c
     if required:
         raise RuntimeError("Required column missing. Tried={0}. Seen={1}".format(
-            options, list(df.columns)[:60]
-        ))
+            options, list(df.columns)[:60]))
     return None
 
 
@@ -160,14 +141,9 @@ def parse_date_safe(x):
     if not s:
         return None
     fmts = [
-        "%Y-%m-%d",
-        "%Y-%m-%d %H:%M:%S",
-        "%m/%d/%Y",
-        "%m/%d/%Y %H:%M",
-        "%m/%d/%Y %H:%M:%S",
-        "%Y/%m/%d",
-        "%d-%b-%Y",
-        "%d-%b-%Y %H:%M:%S",
+        "%Y-%m-%d", "%Y-%m-%d %H:%M:%S",
+        "%m/%d/%Y", "%m/%d/%Y %H:%M", "%m/%d/%Y %H:%M:%S",
+        "%Y/%m/%d", "%d-%b-%Y", "%d-%b-%Y %H:%M:%S",
     ]
     for fmt in fmts:
         try:
@@ -189,344 +165,47 @@ def days_between(dt1, dt2):
     return (dt1.date() - dt2.date()).days
 
 
-HEADER_RX = re.compile(r"^\s*([A-Z][A-Z0-9 /&\-]{2,60})\s*:\s*$")
+# ============================================================
+# Regex
+# ============================================================
 
-
-def sectionize(text):
-    if not text:
-        return {"FULL": ""}
-    lines = text.splitlines()
-    sections = {}
-    current = "FULL"
-    sections[current] = []
-    for line in lines:
-        m = HEADER_RX.match(line)
-        if m:
-            hdr = m.group(1).strip().upper()
-            current = hdr
-            if current not in sections:
-                sections[current] = []
-            continue
-        sections[current].append(line)
-    out = {}
-    for k, v in sections.items():
-        joined = "\n".join(v).strip()
-        if joined:
-            out[k] = joined
-    return out if out else {"FULL": text}
-
-
-def build_sectioned_note(note_text, note_type, note_id, note_date):
-    return SectionedNote(
-        sections=sectionize(note_text),
-        note_type=note_type or "",
-        note_id=note_id or "",
-        note_date=note_date or ""
-    )
-
-
-def load_and_reconstruct_notes():
-    note_files = []
-    for g in NOTE_GLOBS:
-        note_files.extend(glob(g, recursive=True))
-    note_files = sorted(set(note_files))
-
-    if not note_files:
-        raise FileNotFoundError("No HPI11526 * Notes.csv files found via NOTE_GLOBS.")
-
-    all_notes_rows = []
-
-    for fp in note_files:
-        df = clean_cols(read_csv_robust(fp))
-        df = normalize_mrn(df)
-
-        note_text_col = pick_col(df, ["NOTE_TEXT", "NOTE TEXT", "NOTE_TEXT_FULL", "TEXT", "NOTE"])
-        note_id_col = pick_col(df, ["NOTE_ID", "NOTE ID"])
-        line_col = pick_col(df, ["LINE"], required=False)
-        note_type_col = pick_col(df, ["NOTE_TYPE", "NOTE TYPE"], required=False)
-        date_col = pick_col(
-            df,
-            ["NOTE_DATE_OF_SERVICE", "NOTE DATE OF SERVICE", "OPERATION_DATE", "ADMIT_DATE", "HOSP_ADMSN_TIME"],
-            required=False
-        )
-
-        df[note_text_col] = df[note_text_col].fillna("").astype(str)
-        df[note_id_col] = df[note_id_col].fillna("").astype(str)
-        if line_col:
-            df[line_col] = df[line_col].fillna("").astype(str)
-        if note_type_col:
-            df[note_type_col] = df[note_type_col].fillna("").astype(str)
-        if date_col:
-            df[date_col] = df[date_col].fillna("").astype(str)
-
-        df["_SOURCE_FILE_"] = os.path.basename(fp)
-
-        keep_cols = [MERGE_KEY, note_id_col, note_text_col, "_SOURCE_FILE_"]
-        if line_col:
-            keep_cols.append(line_col)
-        if note_type_col:
-            keep_cols.append(note_type_col)
-        if date_col:
-            keep_cols.append(date_col)
-
-        tmp = df[keep_cols].copy()
-        tmp = tmp.rename(columns={
-            note_id_col: "NOTE_ID",
-            note_text_col: "NOTE_TEXT",
-        })
-
-        if line_col and line_col != "LINE":
-            tmp = tmp.rename(columns={line_col: "LINE"})
-        if note_type_col and note_type_col != "NOTE_TYPE":
-            tmp = tmp.rename(columns={note_type_col: "NOTE_TYPE"})
-        if date_col and date_col != "NOTE_DATE_OF_SERVICE":
-            tmp = tmp.rename(columns={date_col: "NOTE_DATE_OF_SERVICE"})
-
-        if "LINE" not in tmp.columns:
-            tmp["LINE"] = ""
-        if "NOTE_TYPE" not in tmp.columns:
-            tmp["NOTE_TYPE"] = ""
-        if "NOTE_DATE_OF_SERVICE" not in tmp.columns:
-            tmp["NOTE_DATE_OF_SERVICE"] = ""
-
-        all_notes_rows.append(tmp)
-
-    notes_raw = pd.concat(all_notes_rows, ignore_index=True)
-
-    def join_note(group):
-        tmp = group.copy()
-        tmp["_LINE_NUM_"] = tmp["LINE"].apply(to_int_safe)
-        tmp = tmp.sort_values(by=["_LINE_NUM_"], na_position="last")
-        return "\n".join(tmp["NOTE_TEXT"].tolist()).strip()
-
-    reconstructed = []
-    grouped = notes_raw.groupby([MERGE_KEY, "NOTE_ID"], dropna=False)
-
-    for (mrn, nid), g in grouped:
-        mrn = str(mrn).strip()
-        nid = str(nid).strip()
-        if not nid:
-            continue
-
-        full_text = join_note(g)
-        if not full_text:
-            continue
-
-        if g["NOTE_TYPE"].astype(str).str.strip().any():
-            note_type = g["NOTE_TYPE"].astype(str).iloc[0]
-        else:
-            note_type = g["_SOURCE_FILE_"].astype(str).iloc[0]
-
-        if g["NOTE_DATE_OF_SERVICE"].astype(str).str.strip().any():
-            note_date = g["NOTE_DATE_OF_SERVICE"].astype(str).iloc[0]
-        else:
-            note_date = ""
-
-        reconstructed.append({
-            MERGE_KEY: mrn,
-            "NOTE_ID": nid,
-            "NOTE_TYPE": note_type,
-            "NOTE_DATE": note_date,
-            "SOURCE_FILE": g["_SOURCE_FILE_"].astype(str).iloc[0],
-            "NOTE_TEXT": full_text
-        })
-
-    return pd.DataFrame(reconstructed)
-
-
-def load_structured_encounters():
-    rows = []
-    struct_files = []
-    for g in STRUCT_GLOBS:
-        struct_files.extend(glob(g, recursive=True))
-
-    for fp in sorted(set(struct_files)):
-        df = clean_cols(read_csv_robust(fp))
-        df = normalize_mrn(df)
-        source_name = os.path.basename(fp).lower()
-
-        if "operation encounters" in source_name:
-            encounter_source = "operation"
-            priority = 1
-        elif "clinic encounters" in source_name:
-            encounter_source = "clinic"
-            priority = 2
-        elif "inpatient encounters" in source_name:
-            encounter_source = "inpatient"
-            priority = 3
-        else:
-            encounter_source = "other"
-            priority = 9
-
-        admit_col = pick_col(df, ["ADMIT_DATE", "Admit_Date"], required=False)
-        recon_col = pick_col(df, ["RECONSTRUCTION_DATE", "RECONSTRUCTION DATE"], required=False)
-        cpt_col = pick_col(df, ["CPT_CODE", "CPT CODE", "CPT"], required=False)
-        proc_col = pick_col(df, ["PROCEDURE", "Procedure"], required=False)
-        reason_col = pick_col(df, ["REASON_FOR_VISIT", "REASON FOR VISIT"], required=False)
-        date_col = pick_col(df, ["OPERATION_DATE", "CHECKOUT_TIME", "DISCHARGE_DATE_DT"], required=False)
-
-        out = pd.DataFrame()
-        out[MERGE_KEY] = df[MERGE_KEY].astype(str).str.strip()
-        out["STRUCT_SOURCE"] = encounter_source
-        out["STRUCT_PRIORITY"] = priority
-        out["STRUCT_DATE_RAW"] = df[date_col].astype(str) if date_col else ""
-        out["ADMIT_DATE_STRUCT"] = df[admit_col].astype(str) if admit_col else ""
-        out["RECONSTRUCTION_DATE_STRUCT"] = df[recon_col].astype(str) if recon_col else ""
-        out["CPT_CODE_STRUCT"] = df[cpt_col].astype(str) if cpt_col else ""
-        out["PROCEDURE_STRUCT"] = df[proc_col].astype(str) if proc_col else ""
-        out["REASON_FOR_VISIT_STRUCT"] = df[reason_col].astype(str) if reason_col else ""
-        rows.append(out)
-
-    if not rows:
-        return pd.DataFrame(columns=[
-            MERGE_KEY, "STRUCT_SOURCE", "STRUCT_PRIORITY", "STRUCT_DATE_RAW",
-            "ADMIT_DATE_STRUCT", "RECONSTRUCTION_DATE_STRUCT",
-            "CPT_CODE_STRUCT", "PROCEDURE_STRUCT", "REASON_FOR_VISIT_STRUCT"
-        ])
-
-    return pd.concat(rows, ignore_index=True)
-
-
-def _is_recon_like_row(row, has_preferred_cpt):
-    preferred_cpts = set([
-        "19357", "19340", "19342", "19361", "19364", "19367", "S2068"
-    ])
-    primary_exclude_cpts = set(["19325", "19330"])
-    fallback_allowed_cpts = set(["19350", "19380"])
-
-    cpt_code = clean_cell(row.get("CPT_CODE_STRUCT", "")).upper()
-    procedure = clean_cell(row.get("PROCEDURE_STRUCT", "")).lower()
-    reason_for_visit = clean_cell(row.get("REASON_FOR_VISIT_STRUCT", "")).lower()
-
-    if cpt_code in primary_exclude_cpts:
-        return False
-    if cpt_code in preferred_cpts:
-        return True
-    if (not has_preferred_cpt) and (cpt_code in fallback_allowed_cpts):
-        return True
-
-    text = "{0} {1}".format(procedure, reason_for_visit)
-    keywords = [
-        "tissue expander",
-        "breast recon",
-        "implant on same day of mastectomy",
-        "insert or replcmnt breast implnt on sep day from mastectomy",
-        "latissimus",
-        "diep",
-        "tram",
-        "flap",
-        "free flap",
-        "expander placmnt",
-        "reconstruct",
-        "reconstruction",
-    ]
-    for kw in keywords:
-        if kw in text:
-            return True
-    return False
-
-
-def choose_best_anchor_rows(struct_df):
-    best = {}
-    if len(struct_df) == 0:
-        return best
-
-    source_priority = {
-        "clinic": 1,
-        "operation": 2,
-        "inpatient": 3
-    }
-
-    eligible_sources = struct_df[struct_df["STRUCT_SOURCE"].isin(["clinic", "operation", "inpatient"])].copy()
-    if len(eligible_sources) == 0:
-        return best
-
-    has_preferred_cpt = {}
-    preferred_cpts = set(["19357", "19340", "19342", "19361", "19364", "19367", "S2068"])
-
-    for mrn, g in eligible_sources.groupby(MERGE_KEY):
-        found = False
-        for val in g["CPT_CODE_STRUCT"].fillna("").astype(str).tolist():
-            if clean_cell(val).upper() in preferred_cpts:
-                found = True
-                break
-        has_preferred_cpt[mrn] = found
-
-    for _, row in eligible_sources.iterrows():
-        mrn = clean_cell(row.get(MERGE_KEY, ""))
-        if not mrn:
-            continue
-
-        source = clean_cell(row.get("STRUCT_SOURCE", "")).lower()
-        if source not in source_priority:
-            continue
-
-        admit_date = parse_date_safe(row.get("ADMIT_DATE_STRUCT", ""))
-        recon_date = parse_date_safe(row.get("RECONSTRUCTION_DATE_STRUCT", ""))
-
-        if admit_date is None or recon_date is None:
-            continue
-
-        if not _is_recon_like_row(row, has_preferred_cpt.get(mrn, False)):
-            continue
-
-        score = (
-            source_priority[source],
-            recon_date,
-            admit_date
-        )
-
-        current_best = best.get(mrn)
-        if current_best is None or score < current_best["score"]:
-            best[mrn] = {
-                "recon_date": recon_date.strftime("%Y-%m-%d"),
-                "admit_date": admit_date.strftime("%Y-%m-%d"),
-                "score": score,
-                "source": source,
-                "cpt_code": clean_cell(row.get("CPT_CODE_STRUCT", "")),
-                "procedure": clean_cell(row.get("PROCEDURE_STRUCT", "")),
-                "reason_for_visit": clean_cell(row.get("REASON_FOR_VISIT_STRUCT", "")),
-            }
-
-    return best
-
-
-LEFT_RX = re.compile(r"\b(left|lt)\b|\bleft\s+breast\b|\bleft[- ]sided\b|\(left\)|\(lt\)", re.I)
+LEFT_RX  = re.compile(r"\b(left|lt)\b|\bleft\s+breast\b|\bleft[- ]sided\b|\(left\)|\(lt\)", re.I)
 RIGHT_RX = re.compile(r"\b(right|rt)\b|\bright\s+breast\b|\bright[- ]sided\b|\(right\)|\(rt\)", re.I)
 BILAT_RX = re.compile(r"\b(bilateral|bilat|both\s+breasts?)\b", re.I)
 
 HISTORY_CUE_RX = re.compile(
-    r"\b(s/p|status\s+post|history\s+of|with\s+a\s+history\s+of|prior|previous|remote|previously|underwent|treated\s+with)\b",
-    re.I
-)
+    r"\b(s/p|status\s+post|history\s+of|with\s+a\s+history\s+of|prior|previous|"
+    r"remote|previously|underwent|treated\s+with)\b", re.I)
 
 NEGATIVE_HISTORY_RX = re.compile(
-    r"\b(no\s+prior\s+breast\s+surgery|no\s+history\s+of\s+breast\s+surgery|denies\s+prior\s+breast\s+surgery|never\s+had\s+breast\s+surgery)\b",
-    re.I
-)
+    r"\b(no\s+prior\s+breast\s+surgery|no\s+history\s+of\s+breast\s+surgery|"
+    r"denies\s+prior\s+breast\s+surgery|never\s+had\s+breast\s+surgery)\b", re.I)
 
 CANCER_CONTEXT_RX = re.compile(
-    r"\b(ductal\s+carcinoma|lobular\s+carcinoma|dcis|invasive\s+ductal|breast\s+cancer|sentinel\s+lymph\s+node|slnb|alnd|radiation|chemo|xrt)\b",
-    re.I
-)
+    r"\b(ductal\s+carcinoma|lobular\s+carcinoma|dcis|invasive\s+ductal|breast\s+cancer|"
+    r"sentinel\s+lymph\s+node|slnb|alnd|radiation|chemo|xrt)\b", re.I)
 
 YEAR_RX = re.compile(r"\b(?:19|20)\d{2}\b", re.I)
 
 AUGMENT_NEGATIVE_CONTEXT_RX = re.compile(
-    r"\b(reconstruction|implant[- ]based\s+reconstruction|tissue\s+expander|expander|implant\s+exchange|exchange\s+of\s+(?:the\s+)?(?:tissue\s+expanders?|implants?)|permanent\s+(?:silicone|saline)\s+breast\s+implants?|breast\s+implant\s+reconstruction|post[- ]mastectomy|mastectomy)\b",
-    re.I
-)
+    r"\b(reconstruction|implant[- ]based\s+reconstruction|tissue\s+expander|expander|"
+    r"implant\s+exchange|exchange\s+of\s+(?:the\s+)?(?:tissue\s+expanders?|implants?)|"
+    r"permanent\s+(?:silicone|saline)\s+breast\s+implants?|breast\s+implant\s+reconstruction|"
+    r"post[- ]mastectomy|mastectomy)\b", re.I)
 
 AUGMENT_POSITIVE_CONTEXT_RX = re.compile(
-    r"\b(cosmetic|augmentation|history\s+of|prior|previous|previously|s/p|submuscular|saline|silicone|(?:19|20)\d{2})\b",
-    re.I
-)
+    r"\b(cosmetic|augmentation|history\s+of|prior|previous|previously|s/p|"
+    r"submuscular|saline|silicone|(?:19|20)\d{2})\b", re.I)
 
 LUMPECTOMY_STRICT_FP_FILTER_RX = re.compile(
-    r"\b(candidate\s+for\s+lumpectomy|not\s+(?:felt\s+to\s+be\s+)?a\s+lumpectomy\s+candidate|lumpectomy\s+vs\.?\s+mastectomy|treatment\s+options?.{0,120}\blumpectomy\b|discussion\s+of\s+lumpectomy|discussed\s+lumpectomy|recommend(?:ed)?\s+lumpectomy|planned\s+lumpectomy|scheduled\s+for\s+lumpectomy)\b",
-    re.I
-)
+    r"\b(candidate\s+for\s+lumpectomy|not\s+(?:felt\s+to\s+be\s+)?a\s+lumpectomy\s+candidate|"
+    r"lumpectomy\s+vs\.?\s+mastectomy|treatment\s+options?.{0,120}\blumpectomy\b|"
+    r"discussion\s+of\s+lumpectomy|discussed\s+lumpectomy|recommend(?:ed)?\s+lumpectomy|"
+    r"planned\s+lumpectomy|scheduled\s+for\s+lumpectomy)\b", re.I)
 
+# ============================================================
+# Laterality helpers
+# ============================================================
 
 def normalize_recon_laterality(x):
     s = clean_cell(x).lower()
@@ -548,10 +227,7 @@ def extract_laterality_from_text(text):
     has_b = BILAT_RX.search(t) is not None
     has_l = LEFT_RX.search(t) is not None
     has_r = RIGHT_RX.search(t) is not None
-
-    if has_b:
-        return "bilateral"
-    if has_l and has_r:
+    if has_b or (has_l and has_r):
         return "bilateral"
     if has_l:
         return "left"
@@ -564,34 +240,27 @@ def infer_laterality_from_field_context(field, text):
     ctx = clean_cell(text)
     if not ctx:
         return ""
-
     direct = extract_laterality_from_text(ctx)
     if direct:
         return direct
-
     if field == "PBS_Lumpectomy":
-        left_cancer = re.search(r"\bleft\b.{0,100}\b(?:breast\s+cancer|dcis|carcinoma|lumpectomy)\b", ctx, re.I)
-        right_cancer = re.search(r"\bright\b.{0,100}\b(?:breast\s+cancer|dcis|carcinoma|lumpectomy)\b", ctx, re.I)
-        left_reverse = re.search(r"\b(?:breast\s+cancer|dcis|carcinoma|lumpectomy)\b.{0,100}\bleft\b", ctx, re.I)
-        right_reverse = re.search(r"\b(?:breast\s+cancer|dcis|carcinoma|lumpectomy)\b.{0,100}\bright\b", ctx, re.I)
-
-        if (left_cancer or left_reverse) and not (right_cancer or right_reverse):
+        lc = re.search(r"\bleft\b.{0,100}\b(?:breast\s+cancer|dcis|carcinoma|lumpectomy)\b", ctx, re.I)
+        rc = re.search(r"\bright\b.{0,100}\b(?:breast\s+cancer|dcis|carcinoma|lumpectomy)\b", ctx, re.I)
+        lr = re.search(r"\b(?:breast\s+cancer|dcis|carcinoma|lumpectomy)\b.{0,100}\bleft\b", ctx, re.I)
+        rr = re.search(r"\b(?:breast\s+cancer|dcis|carcinoma|lumpectomy)\b.{0,100}\bright\b", ctx, re.I)
+        if (lc or lr) and not (rc or rr):
             return "left"
-        if (right_cancer or right_reverse) and not (left_cancer or left_reverse):
+        if (rc or rr) and not (lc or lr):
             return "right"
-
     return ""
 
 
 def laterality_relation(recon_lat, proc_lat, context_text):
     recon_lat = normalize_recon_laterality(recon_lat)
-    proc_lat = normalize_recon_laterality(proc_lat)
-
+    proc_lat  = normalize_recon_laterality(proc_lat)
     ctx = clean_cell(context_text).lower()
-
     if recon_lat == "bilateral":
         return "accept"
-
     if recon_lat in {"left", "right"}:
         if proc_lat == recon_lat:
             return "accept"
@@ -602,40 +271,11 @@ def laterality_relation(recon_lat, proc_lat, context_text):
         if "contralateral" in ctx:
             return "reject_contralateral"
         return "unknown_unilateral"
-
     return "unknown_recon"
 
-
-def is_operation_note_type(note_type, source_file):
-    s = "{0} {1}".format(clean_cell(note_type).lower(), clean_cell(source_file).lower())
-    return (
-        ("brief op" in s) or
-        ("op note" in s) or
-        ("operative" in s) or
-        ("operation" in s) or
-        ("oper report" in s)
-    )
-
-
-def is_clinic_like_note(note_type, source_file):
-    s = "{0} {1}".format(clean_cell(note_type).lower(), clean_cell(source_file).lower())
-    patterns = [
-        "progress",
-        "clinic",
-        "office",
-        "follow up",
-        "follow-up",
-        "pre-op",
-        "preop",
-        "consult",
-        "h&p",
-        "history and physical"
-    ]
-    for p in patterns:
-        if p in s:
-            return True
-    return False
-
+# ============================================================
+# Context helpers
+# ============================================================
 
 def is_historical_context(text):
     return HISTORY_CUE_RX.search(clean_cell(text)) is not None
@@ -661,120 +301,303 @@ def augmentation_true_history_context(text):
     ctx = clean_cell(text)
     if not ctx:
         return False
-
     explicit = re.search(
-        r"\b(breast\s+augmentation|augmentation\s+mammaplasty|cosmetic\s+augmentation|breast\s+implants?\s+for\s+augmentation|previous\s+submuscular\s+(?:saline|silicone)\s+breast\s+augmentation)\b",
-        ctx,
-        re.I
-    ) is not None
-
+        r"\b(breast\s+augmentation|augmentation\s+mammaplasty|cosmetic\s+augmentation|"
+        r"breast\s+implants?\s+for\s+augmentation|previous\s+submuscular\s+(?:saline|silicone)"
+        r"\s+breast\s+augmentation)\b", ctx, re.I) is not None
     if explicit:
         return True
-
     pos = AUGMENT_POSITIVE_CONTEXT_RX.search(ctx) is not None
     neg = AUGMENT_NEGATIVE_CONTEXT_RX.search(ctx) is not None
-
     return pos and not neg
 
 
 def field_specific_history_ok(field, combined_context):
     ctx = clean_cell(combined_context)
-
     if field == "PBS_Lumpectomy":
-        if is_historical_context(ctx):
-            return True
-        if has_cancer_context(ctx):
-            return True
-        if has_year_context(ctx):
-            return True
-        if re.search(r"\bunderwent\b", ctx, re.I):
-            return True
+        if is_historical_context(ctx): return True
+        if has_cancer_context(ctx):    return True
+        if has_year_context(ctx):      return True
+        if re.search(r"\bunderwent\b", ctx, re.I): return True
         return False
-
     if field == "PBS_Breast Reduction":
         return is_historical_context(ctx)
-
     if field == "PBS_Mastopexy":
         return is_historical_context(ctx)
-
     if field == "PBS_Augmentation":
         return augmentation_true_history_context(ctx)
-
     if field == "PBS_Other":
         return is_historical_context(ctx)
-
     return False
 
+# ============================================================
+# Note type helpers
+# ============================================================
+
+def is_operation_note_type(note_type, source_file):
+    s = "{0} {1}".format(clean_cell(note_type).lower(), clean_cell(source_file).lower())
+    return any(x in s for x in ["brief op", "op note", "operative", "operation", "oper report"])
+
+
+def is_clinic_like_note(note_type, source_file):
+    s = "{0} {1}".format(clean_cell(note_type).lower(), clean_cell(source_file).lower())
+    return any(x in s for x in ["progress", "clinic", "office", "follow up",
+                                  "follow-up", "pre-op", "preop", "consult",
+                                  "h&p", "history and physical"])
+
+# ============================================================
+# Candidate ranking
+# ============================================================
 
 def stage_and_rank(note_type, source_file, note_dt, recon_dt, accepted_post_hist):
-    dd = days_between(note_dt, recon_dt)
-    is_op = is_operation_note_type(note_type, source_file)
+    dd        = days_between(note_dt, recon_dt)
+    is_op     = is_operation_note_type(note_type, source_file)
     is_clinic = is_clinic_like_note(note_type, source_file)
-
     if dd is None:
         return (9, 9999, 9)
-
     if dd < 0:
-        if is_op:
-            return (0, abs(dd), 0)
-        if is_clinic:
-            return (1, abs(dd), 1)
+        if is_op:     return (0, abs(dd), 0)
+        if is_clinic: return (1, abs(dd), 1)
         return (2, abs(dd), 2)
-
     if dd >= 0 and accepted_post_hist:
-        if is_op:
-            return (3, abs(dd), 0)
-        if is_clinic:
-            return (4, abs(dd), 1)
+        if is_op:     return (3, abs(dd), 0)
+        if is_clinic: return (4, abs(dd), 1)
         return (5, abs(dd), 2)
-
     return (9, abs(dd), 9)
 
 
 def candidate_score(c):
-    conf = float(getattr(c, "confidence", 0.0) or 0.0)
-    nt = str(getattr(c, "note_type", "") or "").lower()
+    conf     = float(getattr(c, "confidence", 0.0) or 0.0)
+    nt       = str(getattr(c, "note_type", "") or "").lower()
     op_bonus = 0.05 if ("op" in nt or "operative" in nt or "operation" in nt) else 0.0
-    date_bonus = 0.01 if clean_cell(getattr(c, "note_date", "")) else 0.0
-    return conf + op_bonus + date_bonus
+    dt_bonus = 0.01 if clean_cell(getattr(c, "note_date", "")) else 0.0
+    return conf + op_bonus + dt_bonus
 
 
 def choose_better_pbs(existing, new, recon_dt):
     if existing is None:
         return new
-
     ex_rank = stage_and_rank(
-        getattr(existing, "note_type", ""),
-        getattr(existing, "_source_file", ""),
-        parse_date_safe(getattr(existing, "note_date", "")),
-        recon_dt,
-        getattr(existing, "_accepted_post_hist", False)
-    )
+        getattr(existing, "note_type", ""), getattr(existing, "_source_file", ""),
+        parse_date_safe(getattr(existing, "note_date", "")), recon_dt,
+        getattr(existing, "_accepted_post_hist", False))
     nw_rank = stage_and_rank(
-        getattr(new, "note_type", ""),
-        getattr(new, "_source_file", ""),
-        parse_date_safe(getattr(new, "note_date", "")),
-        recon_dt,
-        getattr(new, "_accepted_post_hist", False)
-    )
-
-    if nw_rank < ex_rank:
-        return new
-    if ex_rank < nw_rank:
-        return existing
-
+        getattr(new, "note_type", ""), getattr(new, "_source_file", ""),
+        parse_date_safe(getattr(new, "note_date", "")), recon_dt,
+        getattr(new, "_accepted_post_hist", False))
+    if nw_rank < ex_rank: return new
+    if ex_rank < nw_rank: return existing
     return new if candidate_score(new) > candidate_score(existing) else existing
 
+# ============================================================
+# Note loading
+# ============================================================
+
+def load_and_reconstruct_notes():
+    note_files = []
+    for g in NOTE_GLOBS:
+        note_files.extend(glob(g, recursive=True))
+    note_files = sorted(set(note_files))
+    if not note_files:
+        raise FileNotFoundError("No HPI11526 Notes CSVs found.")
+
+    all_rows = []
+    for fp in note_files:
+        df = clean_cols(read_csv_robust(fp))
+        df = normalize_mrn(df)
+        text_col = pick_col(df, ["NOTE_TEXT", "NOTE TEXT", "NOTE_TEXT_FULL", "TEXT", "NOTE"])
+        id_col   = pick_col(df, ["NOTE_ID", "NOTE ID"])
+        line_col = pick_col(df, ["LINE"], required=False)
+        type_col = pick_col(df, ["NOTE_TYPE", "NOTE TYPE"], required=False)
+        date_col = pick_col(df, ["NOTE_DATE_OF_SERVICE", "NOTE DATE OF SERVICE",
+                                  "OPERATION_DATE", "ADMIT_DATE", "HOSP_ADMSN_TIME"], required=False)
+
+        df[text_col] = df[text_col].fillna("").astype(str)
+        df[id_col]   = df[id_col].fillna("").astype(str)
+        if line_col: df[line_col] = df[line_col].fillna("").astype(str)
+        if type_col: df[type_col] = df[type_col].fillna("").astype(str)
+        if date_col: df[date_col] = df[date_col].fillna("").astype(str)
+        df["_SOURCE_FILE_"] = os.path.basename(fp)
+
+        keep = [MERGE_KEY, id_col, text_col, "_SOURCE_FILE_"]
+        if line_col: keep.append(line_col)
+        if type_col: keep.append(type_col)
+        if date_col: keep.append(date_col)
+
+        tmp = df[keep].copy().rename(columns={id_col: "NOTE_ID", text_col: "NOTE_TEXT"})
+        if line_col and line_col != "LINE":       tmp = tmp.rename(columns={line_col: "LINE"})
+        if type_col and type_col != "NOTE_TYPE":  tmp = tmp.rename(columns={type_col: "NOTE_TYPE"})
+        if date_col and date_col != "NOTE_DATE_OF_SERVICE":
+            tmp = tmp.rename(columns={date_col: "NOTE_DATE_OF_SERVICE"})
+        for col in ["LINE", "NOTE_TYPE", "NOTE_DATE_OF_SERVICE"]:
+            if col not in tmp.columns:
+                tmp[col] = ""
+        all_rows.append(tmp)
+
+    notes_raw = pd.concat(all_rows, ignore_index=True)
+
+    def join_note(group):
+        tmp = group.copy()
+        tmp["_LN_"] = tmp["LINE"].apply(to_int_safe)
+        tmp = tmp.sort_values("_LN_", na_position="last")
+        return "\n".join(tmp["NOTE_TEXT"].tolist()).strip()
+
+    reconstructed = []
+    for (mrn, nid), g in notes_raw.groupby([MERGE_KEY, "NOTE_ID"], dropna=False):
+        mrn = str(mrn).strip(); nid = str(nid).strip()
+        if not nid: continue
+        full_text = join_note(g)
+        if not full_text: continue
+        note_type = g["NOTE_TYPE"].astype(str).iloc[0] if g["NOTE_TYPE"].astype(str).str.strip().any() else g["_SOURCE_FILE_"].astype(str).iloc[0]
+        note_date = g["NOTE_DATE_OF_SERVICE"].astype(str).iloc[0] if g["NOTE_DATE_OF_SERVICE"].astype(str).str.strip().any() else ""
+        reconstructed.append({
+            MERGE_KEY: mrn, "NOTE_ID": nid, "NOTE_TYPE": note_type,
+            "NOTE_DATE": note_date, "SOURCE_FILE": g["_SOURCE_FILE_"].astype(str).iloc[0],
+            "NOTE_TEXT": full_text
+        })
+    return pd.DataFrame(reconstructed)
+
+# ============================================================
+# Structured encounter loading + anchor
+# ============================================================
+
+def load_structured_encounters():
+    rows = []
+    struct_files = []
+    for g in STRUCT_GLOBS:
+        struct_files.extend(glob(g, recursive=True))
+
+    for fp in sorted(set(struct_files)):
+        df = clean_cols(read_csv_robust(fp))
+        df = normalize_mrn(df)
+        sn = os.path.basename(fp).lower()
+
+        if "operation encounters" in sn:   src = "operation"; pri = 1
+        elif "clinic encounters" in sn:    src = "clinic";    pri = 2
+        elif "inpatient encounters" in sn: src = "inpatient"; pri = 3
+        else:                              src = "other";      pri = 9
+
+        admit_col  = pick_col(df, ["ADMIT_DATE", "Admit_Date"], required=False)
+        recon_col  = pick_col(df, ["RECONSTRUCTION_DATE", "RECONSTRUCTION DATE"], required=False)
+        cpt_col    = pick_col(df, ["CPT_CODE", "CPT CODE", "CPT"], required=False)
+        proc_col   = pick_col(df, ["PROCEDURE", "Procedure"], required=False)
+        reason_col = pick_col(df, ["REASON_FOR_VISIT", "REASON FOR VISIT"], required=False)
+        date_col   = pick_col(df, ["OPERATION_DATE", "CHECKOUT_TIME", "DISCHARGE_DATE_DT"], required=False)
+
+        out = pd.DataFrame()
+        out[MERGE_KEY]                    = df[MERGE_KEY].astype(str).str.strip()
+        out["STRUCT_SOURCE"]              = src
+        out["STRUCT_PRIORITY"]            = pri
+        out["STRUCT_DATE_RAW"]            = df[date_col].astype(str)  if date_col   else ""
+        out["ADMIT_DATE_STRUCT"]          = df[admit_col].astype(str) if admit_col  else ""
+        out["RECONSTRUCTION_DATE_STRUCT"] = df[recon_col].astype(str) if recon_col  else ""
+        out["CPT_CODE_STRUCT"]            = df[cpt_col].astype(str)   if cpt_col    else ""
+        out["PROCEDURE_STRUCT"]           = df[proc_col].astype(str)  if proc_col   else ""
+        out["REASON_FOR_VISIT_STRUCT"]    = df[reason_col].astype(str)if reason_col else ""
+        rows.append(out)
+
+    if not rows:
+        return pd.DataFrame(columns=[
+            MERGE_KEY, "STRUCT_SOURCE", "STRUCT_PRIORITY", "STRUCT_DATE_RAW",
+            "ADMIT_DATE_STRUCT", "RECONSTRUCTION_DATE_STRUCT",
+            "CPT_CODE_STRUCT", "PROCEDURE_STRUCT", "REASON_FOR_VISIT_STRUCT"])
+    return pd.concat(rows, ignore_index=True)
+
+
+def _is_recon_like_row(row, has_preferred_cpt):
+    preferred   = {"19357", "19340", "19342", "19361", "19364", "19367", "S2068"}
+    exclude     = {"19325", "19330"}
+    fallback    = {"19350", "19380"}
+    cpt    = clean_cell(row.get("CPT_CODE_STRUCT", "")).upper()
+    proc   = clean_cell(row.get("PROCEDURE_STRUCT", "")).lower()
+    reason = clean_cell(row.get("REASON_FOR_VISIT_STRUCT", "")).lower()
+    if cpt in exclude: return False
+    if cpt in preferred: return True
+    if (not has_preferred_cpt) and cpt in fallback: return True
+    text = proc + " " + reason
+    kws = ["tissue expander", "breast recon",
+           "implant on same day of mastectomy",
+           "insert or replcmnt breast implnt on sep day from mastectomy",
+           "latissimus", "diep", "tram", "flap", "free flap",
+           "expander placmnt", "reconstruct", "reconstruction"]
+    return any(kw in text for kw in kws)
+
+
+def choose_best_anchor_rows(struct_df):
+    best = {}
+    if len(struct_df) == 0:
+        return best
+    src_prio = {"clinic": 1, "operation": 2, "inpatient": 3}
+    eligible = struct_df[struct_df["STRUCT_SOURCE"].isin(src_prio)].copy()
+    if len(eligible) == 0:
+        return best
+    preferred = {"19357", "19340", "19342", "19361", "19364", "19367", "S2068"}
+    has_pref = {}
+    for mrn, g in eligible.groupby(MERGE_KEY):
+        has_pref[mrn] = any(clean_cell(v).upper() in preferred
+                            for v in g["CPT_CODE_STRUCT"].fillna("").astype(str).tolist())
+    for _, row in eligible.iterrows():
+        mrn    = clean_cell(row.get(MERGE_KEY, ""))
+        source = clean_cell(row.get("STRUCT_SOURCE", "")).lower()
+        if not mrn or source not in src_prio: continue
+        admit_dt = parse_date_safe(row.get("ADMIT_DATE_STRUCT", ""))
+        recon_dt = parse_date_safe(row.get("RECONSTRUCTION_DATE_STRUCT", ""))
+        if admit_dt is None or recon_dt is None: continue
+        if not _is_recon_like_row(row, has_pref.get(mrn, False)): continue
+        score = (src_prio[source], recon_dt, admit_dt)
+        cur = best.get(mrn)
+        if cur is None or score < cur["score"]:
+            best[mrn] = {
+                "recon_date":       recon_dt.strftime("%Y-%m-%d"),
+                "admit_date":       admit_dt.strftime("%Y-%m-%d"),
+                "score":            score,
+                "source":           source,
+                "cpt_code":         clean_cell(row.get("CPT_CODE_STRUCT", "")),
+                "procedure":        clean_cell(row.get("PROCEDURE_STRUCT", "")),
+                "reason_for_visit": clean_cell(row.get("REASON_FOR_VISIT_STRUCT", "")),
+            }
+    return best
+
+# ============================================================
+# Sectionizer
+# ============================================================
+
+HEADER_RX = re.compile(r"^\s*([A-Z][A-Z0-9 /&\-]{2,60})\s*:\s*$")
+
+def _sectionize(text):
+    if not text:
+        return {"FULL": ""}
+    lines = text.splitlines()
+    sections = {}
+    current = "FULL"
+    sections[current] = []
+    for line in lines:
+        m = HEADER_RX.match(line)
+        if m:
+            hdr = m.group(1).strip().upper()
+            current = hdr
+            if current not in sections:
+                sections[current] = []
+            continue
+        sections[current].append(line)
+    out = {}
+    for k, v in sections.items():
+        joined = "\n".join(v).strip()
+        if joined:
+            out[k] = joined
+    return out if out else {"FULL": text}
+
+# ============================================================
+# Main
+# ============================================================
 
 def main():
     print("Loading master...")
     master = clean_cols(read_csv_robust(MASTER_FILE))
     master = normalize_mrn(master)
-
     for c in PBS_FIELDS:
         if c not in master.columns:
             master[c] = pd.NA
-
     print("Master rows: {0}".format(len(master)))
 
     print("Loading notes...")
@@ -782,15 +605,16 @@ def main():
     print("Reconstructed notes: {0}".format(len(notes_df)))
 
     print("Loading structured encounters...")
-    struct_df = load_structured_encounters()
+    struct_df  = load_structured_encounters()
     anchor_map = choose_best_anchor_rows(struct_df)
     print("Recon anchors found: {0}".format(len(anchor_map)))
 
+    # Reset all PBS columns to 0
     for c in PBS_FIELDS:
         master[c] = 0
 
     evidence_rows = []
-    best_by_mrn = {}
+    best_by_mrn   = {}
 
     for _, row in notes_df.iterrows():
         mrn = clean_cell(row.get(MERGE_KEY, ""))
@@ -802,7 +626,7 @@ def main():
             continue
 
         recon_dt = parse_date_safe(anchor.get("recon_date", ""))
-        note_dt = parse_date_safe(row.get("NOTE_DATE", ""))
+        note_dt  = parse_date_safe(row.get("NOTE_DATE", ""))
         if recon_dt is None or note_dt is None:
             continue
 
@@ -810,17 +634,18 @@ def main():
         if not mask.any():
             continue
 
+        # Recon laterality: master first, then anchor procedure text
         recon_lat = ""
         if "Recon_Laterality" in master.columns:
-            recon_lat = normalize_recon_laterality(master.loc[mask, "Recon_Laterality"].astype(str).iloc[0])
-
+            recon_lat = normalize_recon_laterality(
+                master.loc[mask, "Recon_Laterality"].astype(str).iloc[0])
         if not recon_lat:
             recon_lat = extract_laterality_from_text(
-                "{0} {1}".format(anchor.get("procedure", ""), anchor.get("reason_for_visit", ""))
-            )
+                "{0} {1}".format(anchor.get("procedure", ""),
+                                 anchor.get("reason_for_visit", "")))
 
-        snote = build_sectioned_note(
-            note_text=row["NOTE_TEXT"],
+        snote = SectionedNote(
+            sections=_sectionize(row["NOTE_TEXT"]),
             note_type=row["NOTE_TYPE"],
             note_id=row["NOTE_ID"],
             note_date=row["NOTE_DATE"]
@@ -830,20 +655,13 @@ def main():
             cands = extract_pbs(snote)
         except Exception as e:
             evidence_rows.append({
-                MERGE_KEY: mrn,
-                "NOTE_ID": row["NOTE_ID"],
-                "NOTE_DATE": row["NOTE_DATE"],
-                "NOTE_TYPE": row["NOTE_TYPE"],
-                "FIELD": "EXTRACTOR_ERROR",
-                "VALUE": "",
-                "STATUS": "",
-                "CONFIDENCE": "",
-                "SECTION": "",
+                MERGE_KEY: mrn, "NOTE_ID": row["NOTE_ID"],
+                "NOTE_DATE": row["NOTE_DATE"], "NOTE_TYPE": row["NOTE_TYPE"],
+                "FIELD": "EXTRACTOR_ERROR", "VALUE": "", "STATUS": "",
+                "CONFIDENCE": "", "SECTION": "",
                 "RECON_DATE": anchor.get("recon_date", ""),
-                "RECON_LATERALITY": recon_lat,
-                "PROC_LATERALITY": "",
-                "RULE_DECISION": "extractor_failed",
-                "EVIDENCE": repr(e)
+                "RECON_LATERALITY": recon_lat, "PROC_LATERALITY": "",
+                "RULE_DECISION": "extractor_failed", "EVIDENCE": repr(e)
             })
             continue
 
@@ -857,7 +675,8 @@ def main():
 
         for c in cands:
             field = clean_cell(getattr(c, "field", ""))
-            if field not in {"PBS_Lumpectomy", "PBS_Breast Reduction", "PBS_Mastopexy", "PBS_Augmentation", "PBS_Other"}:
+            if field not in {"PBS_Lumpectomy", "PBS_Breast Reduction",
+                              "PBS_Mastopexy", "PBS_Augmentation", "PBS_Other"}:
                 continue
 
             evid = clean_cell(getattr(c, "evidence", ""))
@@ -865,20 +684,21 @@ def main():
                 continue
 
             combined_context = "{0}\n{1}".format(evid, full_note_text)
-
-            proc_lat = extract_laterality_from_text(combined_context)
+            proc_lat    = extract_laterality_from_text(combined_context)
             if (not proc_lat) and field == "PBS_Lumpectomy":
                 proc_lat = infer_laterality_from_field_context(field, combined_context)
 
             lat_decision = laterality_relation(recon_lat, proc_lat, combined_context)
-
-            neg_context = has_negative_history(combined_context)
-            day_diff = days_between(note_dt, recon_dt)
-            history_ok = field_specific_history_ok(field, combined_context)
+            neg_context  = has_negative_history(combined_context)
+            day_diff     = days_between(note_dt, recon_dt)
+            history_ok   = field_specific_history_ok(field, combined_context)
 
             accept = False
             reason = ""
 
+            # ----------------------------------------------------------
+            # Gate 1: universal rejects
+            # ----------------------------------------------------------
             if neg_context:
                 accept = False
                 reason = "reject_negative_history"
@@ -891,41 +711,58 @@ def main():
                 accept = False
                 reason = "reject_lumpectomy_planning_context"
 
+            # ----------------------------------------------------------
+            # Gate 2: non-lumpectomy PBS — skip laterality entirely.
+            # These are cosmetic/surgical history fields. The only valid
+            # reject here is an explicit contralateral mention, which
+            # would be unusual but possible (e.g. contralateral reduction).
+            # ----------------------------------------------------------
             elif field != "PBS_Lumpectomy":
-                # ---------------------------------------------------------
-                # FIX: PBS_Breast Reduction, PBS_Mastopexy, PBS_Augmentation,
-                # PBS_Other are PAST COSMETIC/SURGICAL HISTORY.
-                # Laterality of the current reconstruction is irrelevant.
-                # Only require history_ok — no laterality gating.
-                # ---------------------------------------------------------
-                if not history_ok:
+                if lat_decision == "reject_contralateral":
                     accept = False
-                    reason = "reject_no_history_context"
-                else:
+                    reason = "reject_contralateral"
+                elif history_ok:
                     accept = True
                     reason = "accept_non_lumpectomy_history"
+                else:
+                    accept = False
+                    reason = "reject_no_history_context"
 
-           elif day_diff < 0:
-                if field != "PBS_Lumpectomy":
-                    # Non-lumpectomy PBS: past cosmetic/surgical history.
-                    # Laterality is irrelevant — only require history context.
-                    if lat_decision == "reject_contralateral":
-                        accept = False
-                        reason = "reject_contralateral"
-                    elif history_ok:
+            # ----------------------------------------------------------
+            # Gate 3: PBS_Lumpectomy — full laterality logic (unchanged)
+            # ----------------------------------------------------------
+            elif day_diff < 0:
+                if lat_decision == "accept":
+                    if history_ok:
                         accept = True
                         reason = "accept_pre_recon_historical"
                     else:
+                        accept = True
+                        reason = "accept_pre_recon_lumpectomy"
+                elif lat_decision == "reject_contralateral":
+                    accept = False
+                    reason = "reject_contralateral"
+                elif lat_decision == "unknown_unilateral":
+                    inferred = infer_laterality_from_field_context(field, combined_context)
+                    if inferred and laterality_relation(recon_lat, inferred, combined_context) == "accept":
+                        accept = True
+                        reason = "accept_inferred_laterality"
+                    else:
                         accept = False
-                        reason = "reject_pre_recon_no_history"
+                        reason = "reject_unknown_laterality_unilateral"
+                else:
+                    accept = False
+                    reason = "reject_unknown_recon_laterality"
+
+            else:
+                # PBS_Lumpectomy post-recon
+                if not history_ok:
+                    accept = False
+                    reason = "reject_post_recon_not_historical"
                 else:
                     if lat_decision == "accept":
-                        if history_ok:
-                            accept = True
-                            reason = "accept_pre_recon_historical"
-                        else:
-                            accept = True
-                            reason = "accept_pre_recon_lumpectomy"
+                        accept = True
+                        reason = "accept_post_recon_historical"
                     elif lat_decision == "reject_contralateral":
                         accept = False
                         reason = "reject_contralateral"
@@ -933,73 +770,39 @@ def main():
                         inferred = infer_laterality_from_field_context(field, combined_context)
                         if inferred and laterality_relation(recon_lat, inferred, combined_context) == "accept":
                             accept = True
-                            reason = "accept_inferred_laterality"
+                            reason = "accept_post_recon_inferred_laterality"
                         else:
                             accept = False
                             reason = "reject_unknown_laterality_unilateral"
                     else:
-                        accept = False
-                        reason = "reject_unknown_recon_laterality"
-
-            else:
-                if field == "PBS_Lumpectomy":
-                    if not history_ok:
-                        accept = False
-                        reason = "reject_post_recon_not_historical"
-                    else:
-                        if lat_decision == "accept":
+                        if history_ok:
                             accept = True
-                            reason = "accept_post_recon_historical"
-                        elif lat_decision == "reject_contralateral":
-                            accept = False
-                            reason = "reject_contralateral"
-                        elif lat_decision == "unknown_unilateral":
-                            inferred = infer_laterality_from_field_context(field, combined_context)
-                            if inferred and laterality_relation(recon_lat, inferred, combined_context) == "accept":
-                                accept = True
-                                reason = "accept_post_recon_inferred_laterality"
-                            else:
-                                accept = False
-                                reason = "reject_unknown_laterality_unilateral"
+                            reason = "accept_post_recon_history_no_recon_lat"
                         else:
-                            if history_ok:
-                                accept = True
-                                reason = "accept_post_recon_history_no_recon_lat"
-                            else:
-                                accept = False
-                                reason = "reject_unknown_recon_laterality"
-                else:
-                    # Non-lumpectomy PBS post-recon: only require history context.
-                    if lat_decision == "reject_contralateral":
-                        accept = False
-                        reason = "reject_contralateral"
-                    elif history_ok:
-                        accept = True
-                        reason = "accept_post_recon_historical"
-                    else:
-                        accept = False
-                        reason = "reject_post_recon_not_historical"
+                            accept = False
+                            reason = "reject_unknown_recon_laterality"
+
             evidence_rows.append({
-                MERGE_KEY: mrn,
-                "NOTE_ID": getattr(c, "note_id", row["NOTE_ID"]),
-                "NOTE_DATE": getattr(c, "note_date", row["NOTE_DATE"]),
-                "NOTE_TYPE": getattr(c, "note_type", row["NOTE_TYPE"]),
-                "FIELD": field,
-                "VALUE": getattr(c, "value", True),
-                "STATUS": getattr(c, "status", ""),
-                "CONFIDENCE": getattr(c, "confidence", ""),
-                "SECTION": getattr(c, "section", ""),
-                "RECON_DATE": anchor.get("recon_date", ""),
+                MERGE_KEY:          mrn,
+                "NOTE_ID":          getattr(c, "note_id",    row["NOTE_ID"]),
+                "NOTE_DATE":        getattr(c, "note_date",  row["NOTE_DATE"]),
+                "NOTE_TYPE":        getattr(c, "note_type",  row["NOTE_TYPE"]),
+                "FIELD":            field,
+                "VALUE":            getattr(c, "value",      True),
+                "STATUS":           getattr(c, "status",     ""),
+                "CONFIDENCE":       getattr(c, "confidence", ""),
+                "SECTION":          getattr(c, "section",    ""),
+                "RECON_DATE":       anchor.get("recon_date", ""),
                 "RECON_LATERALITY": recon_lat,
-                "PROC_LATERALITY": proc_lat,
-                "RULE_DECISION": reason,
-                "EVIDENCE": evid
+                "PROC_LATERALITY":  proc_lat,
+                "RULE_DECISION":    reason,
+                "EVIDENCE":         evid,
             })
 
             if not accept:
                 continue
 
-            setattr(c, "_source_file", row.get("SOURCE_FILE", ""))
+            setattr(c, "_source_file",       row.get("SOURCE_FILE", ""))
             setattr(c, "_accepted_post_hist", bool(day_diff >= 0 and history_ok))
 
             existing = best_by_mrn[mrn].get(field)
@@ -1011,29 +814,29 @@ def main():
         mask = (master[MERGE_KEY].astype(str).str.strip() == mrn)
         if not mask.any():
             continue
-
         any_positive = False
-
-        for field in ["PBS_Lumpectomy", "PBS_Breast Reduction", "PBS_Mastopexy", "PBS_Augmentation", "PBS_Other"]:
+        for field in ["PBS_Lumpectomy", "PBS_Breast Reduction",
+                       "PBS_Mastopexy", "PBS_Augmentation", "PBS_Other"]:
             cand = fields.get(field)
             if cand is None:
                 continue
             master.loc[mask, field] = 1
             any_positive = True
-
         master.loc[mask, "PastBreastSurgery"] = 1 if any_positive else 0
 
-    subtype_cols = ["PBS_Lumpectomy", "PBS_Breast Reduction", "PBS_Mastopexy", "PBS_Augmentation", "PBS_Other"]
+    # Final re-derive PastBreastSurgery from subtypes
+    subtype_cols = ["PBS_Lumpectomy", "PBS_Breast Reduction",
+                    "PBS_Mastopexy", "PBS_Augmentation", "PBS_Other"]
     for idx in master.index:
-        any_positive = False
+        any_pos = False
         for c in subtype_cols:
             try:
                 if int(float(str(master.at[idx, c]).strip())) == 1:
-                    any_positive = True
+                    any_pos = True
                     break
             except Exception:
                 pass
-        master.at[idx, "PastBreastSurgery"] = 1 if any_positive else 0
+        master.at[idx, "PastBreastSurgery"] = 1 if any_pos else 0
 
     os.makedirs(os.path.dirname(OUTPUT_MASTER), exist_ok=True)
     master.to_csv(OUTPUT_MASTER, index=False)
@@ -1041,7 +844,7 @@ def main():
 
     print("\nDONE.")
     print("- Updated master: {0}".format(OUTPUT_MASTER))
-    print("- PBS evidence: {0}".format(OUTPUT_EVID))
+    print("- PBS evidence:   {0}".format(OUTPUT_EVID))
 
 
 if __name__ == "__main__":
