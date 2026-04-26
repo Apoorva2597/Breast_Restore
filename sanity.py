@@ -1,15 +1,5 @@
 import pandas as pd
-import numpy as np
-df = pd.read_csv('gold_cleaned_for_cedar.csv', dtype=str)
-print('n:', len(df))
-print('Age mean/sd:', round(pd.to_numeric(df['Age'],errors='coerce').mean(),1), round(pd.to_numeric(df['Age'],errors='coerce').std(),1))
-print('BMI mean/sd:', round(pd.to_numeric(df['BMI'],errors='coerce').mean(),1), round(pd.to_numeric(df['BMI'],errors='coerce').std(),1))
-print('Race:', df['Race'].value_counts(dropna=False).to_dict())
-print('Ethnicity:', df['Ethnicity'].value_counts(dropna=False).to_dict())
-print('Smoking Current/Former:', df['SmokingStatus'].value_counts(dropna=False).to_dict())
-print('Diabetes:', df['Diabetes'].value_counts(dropna=False).to_dict())
-print('Chemo_Before:', df['Chemo_Before'].value_counts(dropna=False).to_dict())
+df = pd.read_csv('_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv', dtype=str)
 print('Radiation_After:', df['Radiation_After'].value_counts(dropna=False).to_dict())
-print('Recon_Classification:', df['Recon_Classification'].value_counts(dropna=False).to_dict())
-print('Recon_Timing:', df['Recon_Timing'].value_counts(dropna=False).to_dict())
-print('Recon_Laterality:', df['Recon_Laterality'].value_counts(dropna=False).to_dict())
+print('Radiation_Before:', df['Radiation_Before'].value_counts(dropna=False).to_dict())
+print('Radiation:', df['Radiation'].value_counts(dropna=False).to_dict())
