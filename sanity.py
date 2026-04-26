@@ -1,1 +1,1 @@
-head -3 _outputs/master_abstraction_rule_FINAL_NO_GOLD_with_stage2_preds_complications.csv | tr ',' '\n' | head -60
+sed -i 's/df\.to_csv(out_path, index=False)/df.to_csv(out_path, index=False)\n    merged.to_csv("_outputs\/validation_merged_patient_level.csv", index=False)/' validate_abstraction.py
