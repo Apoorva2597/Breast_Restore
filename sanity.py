@@ -1,4 +1,3 @@
-python -c "
 import pandas as pd
 import numpy as np
 
@@ -90,3 +89,10 @@ for name, pc, gc in outcomes:
     print('  Manual_rate={} NLP_rate={} Kappa={} McNemar_p={}'.format(
         round(manual_rate,3), round(nlp_rate,3), k, mc))
     print('  Sens={} CI={} Spec={} CI={}'.format(
+        round(sens,3), wilson_ci(sens,tp+fn),
+        round(spec,3), wilson_ci(spec,tn+fp)))
+    print('  PPV={} CI={} NPV={} CI={} F1={}'.format(
+        round(ppv,3), wilson_ci(ppv,tp+fp),
+        round(npv,3), wilson_ci(npv,tn+fn),
+        round(f1,3)))
+    print()
