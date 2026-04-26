@@ -1,7 +1,7 @@
 import pandas as pd
-df = pd.read_csv('_outputs/master_abstraction_rule_FINAL_NO_GOLD_with_stage2_preds_complications.csv', dtype=str)
-print('Stage2_Rehospitalization value counts:')
-print(df['Stage2_Rehospitalization'].value_counts())
-print('Stage2_MinorComp value counts:')
-print(df['Stage2_MinorComp'].value_counts())
-print('RAW signal check - patients with PRED_HAS_STAGE2=1:', df[df['PRED_HAS_STAGE2'].astype(str)=='1']['Stage2_Rehospitalization'].value_counts())
+df = pd.read_csv('_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv', dtype=str)
+print('Total rows:', len(df))
+cols = ['Age','BMI','Race','Ethnicity','SmokingStatus','Diabetes','Obesity',
+        'Chemo_Before','Radiation_After','Recon_Classification','Recon_Timing','Recon_Laterality']
+for c in cols:
+    print(c, df[c].value_counts(dropna=False).head(6).to_dict())
