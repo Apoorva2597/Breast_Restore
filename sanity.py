@@ -1,5 +1,6 @@
 import pandas as pd
 df = pd.read_csv('_outputs/master_abstraction_rule_FINAL_NO_GOLD.csv', dtype=str)
-print('Radiation_After:', df['Radiation_After'].value_counts(dropna=False).to_dict())
-print('Radiation_Before:', df['Radiation_Before'].value_counts(dropna=False).to_dict())
-print('Radiation:', df['Radiation'].value_counts(dropna=False).to_dict())
+age = pd.to_numeric(df['Age'], errors='coerce')
+bmi = pd.to_numeric(df['BMI'], errors='coerce')
+print('Age:', round(age.mean(),1), round(age.std(),1))
+print('BMI:', round(bmi.mean(),1), round(bmi.std(),1))
