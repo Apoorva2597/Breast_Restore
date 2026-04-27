@@ -1,5 +1,5 @@
 import pandas as pd
-df = pd.read_csv('_outputs/complications_patch_evidence.csv', dtype=str)
+df = pd.read_csv('_outputs/rule_hit_evidence_FINAL_NO_GOLD.csv', dtype=str)
 print('Columns:', list(df.columns))
 print('Rows:', len(df))
 print()
